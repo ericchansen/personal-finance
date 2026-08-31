@@ -1,0 +1,52 @@
+# Wealthfolio — self-hosted deployment
+#
+#   cp .env.example .env
+#   pwsh ./init-env.ps1        # generates WF_SECRET_KEY + password hash
+#   docker compose up -d
+#
+# Upstream reference: https://github.com/wealthfolio/wealthfolio/blob/main/compose.yml
+# Data lives OUTSIDE this repository, at the path given by WF_DATA_DIR.
+
+services:
+  wealthfolio:
+    image: wealthfolio/wealthfolio:latest
+    container_name: wealthfolio
+    restart: unless-stopped
+
+    # Bound to loopback by default: this holds financial data and must not be
+    # exposed to the LAN without a deliberate decision. Override WF_BIND_ADDR
+    # to 0.0.0.0 only behind Tailscale or an authenticating reverse proxy.
+    ports:
+      - "${WF_BIND_ADDR:-127.0.0.1}:${WF_PORT:-8088}:8088"
+
+    volumes:
+      - "${WF_DATA_DIR:?Set WF_DATA_DIR to a path outside this repo}:/data"
+
+    environment:
+      WF_LISTEN_ADDR: "0.0.0.0:8088"
+      WF_DB_PATH: "/data/wealthfolio.db"
+
+      # Generate with: openssl rand -base64 32   (init-env.ps1 does this)
+      WF_SECRET_KEY: "${WF_SECRET_KEY:?Set WF_SECRET_KEY}"
+
+      # Argon2id PHC hash. Authentication stays ON: this application holds PII.
+      # In .env, wrap the value in single quotes so Compose does not interpolate '$'.
+      WF_AUTH_PASSWORD_HASH: "${WF_AUTH_PASSWORD_HASH:?Set WF_AUTH_PASSWORD_HASH}"
+      WF_AUTH_TOKEN_TTL_MINUTES: "${WF_AUTH_TOKEN_TTL_MINUTES:-60}"
+
+      # Must be explicit origins, not "*", whenever auth is enabled.
+      # Add the Tailscale or reverse-proxy origin here if you publish it.
+      WF_CORS_ALLOW_ORIGINS: "${WF_CORS_ALLOW_ORIGINS:-http://localhost:8088,http://127.0.0.1:8088}"
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8088/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

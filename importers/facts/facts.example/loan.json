@@ -1,0 +1,17 @@
+{
+  "type": "loan",
+  "name": "Fictional Maple Mortgage",
+  "principal": "200000.00",
+  "annualRate": "0.0500",
+  "termMonths": 360,
+  "originationDate": "2024-01-15",
+  "firstPayment": "2024-03-01",
+  "lender": "Example Community Bank",
+  "linkedTo": "Fictional Maple Cottage",
+  "payoffAmount": null,
+  "payoffDate": null,
+  "pmi": false,
+  "source": "example promissory note",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}

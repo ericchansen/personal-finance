@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "Copy this to <data-dir>/assets/holdings.json and replace with your own values.",
+    "Real values are personal data and must never be committed to this repository.",
+    "A loan's balance is derived by amortization, so only its origination terms are needed."
+  ],
+  "assets": [
+    {
+      "kind": "PROPERTY",
+      "name": "Main Residence",
+      "currency": "USD",
+      "currentValue": "500000",
+      "valueDate": "2026-01-01",
+      "purchaseDate": "2020-01-01",
+      "purchasePrice": "450000",
+      "metadata": { "sub_type": "residence" }
+    },
+    {
+      "kind": "VEHICLE",
+      "name": "Example Car",
+      "currency": "USD",
+      "currentValue": "15000",
+      "valueDate": "2026-01-01"
+    }
+  ],
+  "loans": [
+    {
+      "name": "Example Mortgage",
+      "currency": "USD",
+      "principal": "400000",
+      "annualRate": "0.055",
+      "termMonths": 360,
+      "firstPayment": "2020-02-01",
+      "linkedTo": "Main Residence",
+      "metadata": { "sub_type": "mortgage" }
+    }
+  ]
+}

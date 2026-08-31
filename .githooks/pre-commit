@@ -1,0 +1,24 @@
+#!/bin/sh
+# Block financial data and secrets from entering this public repository.
+# Enable with:  git config core.hooksPath .githooks
+
+hook_dir=$(dirname "$0")
+
+if command -v python >/dev/null 2>&1; then
+    py=python
+elif command -v python3 >/dev/null 2>&1; then
+    py=python3
+else
+    echo "data-guard: python not found; cannot verify staged files." >&2
+    echo "Install Python or bypass deliberately with --no-verify." >&2
+    exit 1
+fi
+
+"$py" "$hook_dir/scan_staged.py" || exit 1
+
+# Defer to gitleaks as a second opinion when it is installed.
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks protect --staged --redact --no-banner || exit 1
+fi
+
+exit 0

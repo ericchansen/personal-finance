@@ -1,0 +1,79 @@
+# Repository denylist — this repo is PUBLIC and must never contain financial data or PII.
+
+# --- Financial data extracts (deny by extension) ---
+*.csv
+*.tsv
+*.ofx
+*.qfx
+*.qbo
+*.qif
+*.xls
+*.xlsx
+*.xlsm
+*.pdf
+
+# --- Browser recordings (contain cookies, tokens, account numbers) ---
+*.har
+recordings/
+captures/
+.playwright-mcp/
+
+# --- Screenshots: images of a live dashboard leak balances and account names ---
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+!docs/**/diagram-*.png
+
+# --- Databases and backups ---
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.dump
+*.bak
+
+# --- Secrets and local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+credentials*
+# A SimpleFIN access URL embeds HTTP Basic credentials granting read access to
+# every connected institution. It belongs in the data directory; this is belt
+# and braces in case one is ever written here by mistake.
+access-url*
+*setup-token*
+
+# --- Local data directory (belt and braces; data should live outside the repo) ---
+data/
+finance-data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- Node ---
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Explicit allowances: documentation fixtures must be synthetic ---
+!docs/**/*.example.csv
+!tests/fixtures/**/*.csv

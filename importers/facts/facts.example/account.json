@@ -1,0 +1,15 @@
+{
+  "type": "account",
+  "id": "acct-example-checking",
+  "institution": "Example Credit Union",
+  "displayName": "Example Checking",
+  "maskedNumber": "0000",
+  "kind": "depository",
+  "opened": "2024-01-01",
+  "closed": null,
+  "excluded": false,
+  "reason": null,
+  "source": "example ledger account list",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}

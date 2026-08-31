@@ -1,0 +1,13 @@
+{
+  "type": "crypto",
+  "label": "Fictional Hardware Wallet",
+  "chain": "bitcoin",
+  "unit": "BTC",
+  "quantity": "0.01000000",
+  "publicAddress": "bc1qexampleexampleexampleexampleexample000000",
+  "xpub": null,
+  "derivationPath": "m/84'/0'/0'",
+  "source": "example wallet export",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}

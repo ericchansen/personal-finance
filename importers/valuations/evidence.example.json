@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "entityId": "vehicle:Synthetic Vehicle",
+  "date": "2026-08-27",
+  "value": "24000",
+  "currency": "USD",
+  "method": "official-trade-in-estimate",
+  "sourceFile": "raw/valuations/synthetic-vehicle-estimate.pdf"
+}

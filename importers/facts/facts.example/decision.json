@@ -1,0 +1,14 @@
+{
+  "type": "decision",
+  "id": "decision-example-duplicate",
+  "decisionType": "duplicate-account",
+  "resolution": "treat the older connection as duplicate after the handoff date",
+  "evidence": "synthetic pair matched 95% over a fictional overlap",
+  "decidedOn": "2024-06-01",
+  "affects": [
+    "acct-example-checking"
+  ],
+  "source": "example analysis note",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}

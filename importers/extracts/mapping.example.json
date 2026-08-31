@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Copy to <data-dir>/extracts/mapping.json and replace with your own accounts.",
+    "Account names are personal data and must never be committed.",
+    "'file' is relative to <data-dir>/extracts unless absolute.",
+    "Match an extract to an account by transaction overlap rather than by guessing",
+    "from the name: an account that has been renamed still holds the same history."
+  ],
+  "files": [
+    {
+      "file": "examplebank/Transactions - Example Card (0000) - 2026.ofx",
+      "account": "Example Card (...0000)"
+    },
+    {
+      "file": "examplebank/Transactions - Example Checking - 2026.csv",
+      "account": "Example Checking (...0000)"
+    }
+  ]
+}
