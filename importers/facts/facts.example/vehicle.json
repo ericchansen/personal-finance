@@ -1,0 +1,11 @@
+{
+  "type": "vehicle",
+  "name": "Fictional 2024 Example Hatchback",
+  "purchaseDate": "2024-05-20",
+  "purchasePrice": "31000.00",
+  "currentValue": "28000.00",
+  "currentValueDate": "2024-12-31",
+  "source": "example purchase agreement",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}

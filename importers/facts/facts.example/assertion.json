@@ -1,0 +1,9 @@
+{
+  "type": "assertion",
+  "accountId": "acct-example-checking",
+  "date": "2024-12-31",
+  "balance": "1234.56",
+  "source": "example bank statement",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}

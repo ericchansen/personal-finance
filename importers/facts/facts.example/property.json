@@ -1,0 +1,20 @@
+{
+  "type": "property",
+  "name": "Fictional Maple Cottage",
+  "address": "123 Example Lane, Sample City, ZZ 00000",
+  "purchaseDate": "2024-01-15",
+  "purchasePrice": "250000.00",
+  "saleDate": null,
+  "salePrice": null,
+  "netProceeds": null,
+  "appraisals": [
+    {
+      "date": "2024-01-01",
+      "value": "252000.00",
+      "type": "purchase"
+    }
+  ],
+  "source": "example closing disclosure",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}

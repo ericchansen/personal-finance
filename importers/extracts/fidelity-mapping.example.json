@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Copy this to <data-dir>/extracts/fidelity/mapping.json and replace the",
+    "values with your own. Account numbers and names are personal data and",
+    "must not be committed to this repository.",
+    "",
+    "asOf   - the date the export was downloaded. Reconciliations are dated",
+    "         here rather than today so refreshing a stale balance does not",
+    "         rewrite earlier periods.",
+    "create - create the Wealthfolio account if no account of that name exists.",
+    "espp   - the stock plan. Its balance is cash withheld from pay, not stock.",
+    "         It is still a SECURITIES account: Wealthfolio's CASH type means",
+    "         'feeds spending reports', and this money never passes through a",
+    "         tracked checking account, so reporting it there invents income.",
+    "zeroOut- accounts the export proves are empty. An aggregator that lost its",
+    "         connection keeps reporting the last balance it saw, so an account",
+    "         that has really been emptied has to be told to go to zero."
+  ],
+  "asOf": "2026-08-26",
+  "accounts": {
+    "Z00000001": {
+      "name": "Individual - TOD (...0001)",
+      "accountType": "SECURITIES",
+      "group": "Investments"
+    },
+    "00001": {
+      "name": "Example 401k",
+      "accountType": "SECURITIES",
+      "group": "Retirement",
+      "create": true
+    }
+  },
+  "espp": {
+    "name": "Example ESPP Plan",
+    "accountType": "SECURITIES",
+    "group": "Retirement",
+    "create": true
+  },
+  "zeroOut": []
+}
