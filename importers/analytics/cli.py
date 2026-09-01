@@ -7,13 +7,22 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from .diagnostics import diagnose
+from .diagnostics import diagnose, diagnose_capabilities
 from .generator import AnalyticsError, build, plan, verify
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "build", "verify", "diagnose-wealthfolio"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "plan",
+            "build",
+            "verify",
+            "diagnose-wealthfolio",
+            "diagnose-wealthfolio-capabilities",
+        ),
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -23,6 +32,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:8088")
     parser.add_argument("--upstream-version", default="")
     parser.add_argument("--upstream-revision", default="")
+    parser.add_argument("--image-reference", default="")
     parser.add_argument("--image-digest", default="")
     args = parser.parse_args(argv)
     try:
@@ -32,6 +42,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 base_url=args.base_url,
                 upstream_version=args.upstream_version,
                 upstream_revision=args.upstream_revision,
+                image_digest=args.image_digest,
+            )
+        elif args.command == "diagnose-wealthfolio-capabilities":
+            result = diagnose_capabilities(
+                args.data_dir,
+                base_url=args.base_url,
+                image_reference=args.image_reference,
                 image_digest=args.image_digest,
             )
         else:

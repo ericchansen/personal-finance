@@ -40,7 +40,94 @@ a stable decision identifier and reason. The manifest hashes every workbook,
 mapping, resolution artifact, and combined assertion source and reports mapped,
 excluded, and canonical Vanguard row counts.
 
-Canonical transaction schema version 2 adds `symbol`, signed `quantity`,
-`price`, and `external_flow`. Position basis is emitted when the complete
-history supports it; it is left blank after an external in-kind arrival whose
-original basis is not known.
+Canonical transaction schema version 3 retains the version 2 investment fields
+(`symbol`, signed `quantity`, `price`, and `external_flow`) and adds structural
+cash-flow semantics:
+
+- `transaction_kind` distinguishes consumption, income, refunds, transfers,
+  card and loan payments, saving, reconciliation, investment activity, and
+  exclusions without relying on category names.
+- `category_id` is a stable normalized identity separate from the source-facing
+  `category` label.
+- `payee_normalized` preserves a deterministic comparison value while
+  `description` retains the source text.
+- `assignment_source`, `assignment_rule_id`, and `assignment_confidence`
+  preserve categorization provenance.
+- `split_group` identifies exact monetary split lines; transfers and
+  reconciliation rows cannot also be category splits.
+
+## Reviewed transfer candidates
+
+The canonical plan and manifest contain a private `transferReview` summary.
+Candidates are proposals only: both legs must fall within the ownership dates
+of non-excluded canonical accounts, use different accounts, have exactly
+opposite `Decimal` amounts and the same currency, and occur within five calendar
+days. Existing transfer groups, reconciliation gaps, external flows, security
+activity, and zero amounts are excluded.
+Multiple exact matches are marked `ambiguous`; no candidate, ambiguous or
+otherwise, is confirmed automatically.
+
+After reviewing a proposal, add a private decision fact using the exact
+`candidateId` and `evidenceHash` emitted by the plan:
+
+```json
+{
+  "type": "decision",
+  "id": "reviewed-transfer-example",
+  "decisionType": "transfer-confirmed",
+  "candidateId": "transfer-candidate-00000000000000000000",
+  "evidenceHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "resolution": "CONFIRMED after reviewing both synthetic legs.",
+  "evidence": "Synthetic example evidence.",
+  "decidedOn": "2026-01-15",
+  "affects": ["acct-example-one", "acct-example-two"],
+  "source": "private review",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}
+```
+
+Use `transfer-rejected` for a rejected proposal. A matching rejection suppresses
+the same candidate on every rebuild. If a leg's date, amount, currency,
+description, category, source, or flow status changes, its evidence hash changes
+and the proposal returns with `status: evidence-changed`. A confirmation creates
+a stable transfer group derived from the decision ID and remains idempotent.
+Stale decisions remain visible in the summary rather than being silently used.
+
+## Exact category splits
+
+A reviewed `category-split` decision replaces one ordinary transaction with
+exact monetary child rows. It identifies one `sourceId` and at least two
+categories. Amounts are parsed and summed as `Decimal`; percentages are never
+stored. All amounts must be nonzero and have the parent's direction. Either
+provide every exact child amount or mark exactly one child as the deterministic
+residual:
+
+```json
+{
+  "type": "decision",
+  "id": "reviewed-split-example",
+  "decisionType": "category-split",
+  "sourceId": "synthetic:transaction",
+  "resolution": "Reviewed exact synthetic allocation.",
+  "evidence": "Synthetic example evidence.",
+  "decidedOn": "2026-01-15",
+  "affects": ["acct-example-one"],
+  "splits": [
+    {"amount": "-3.33", "category": "Example One", "categoryId": "example.one"},
+    {"residual": true, "category": "Example Two", "categoryId": "example.two"}
+  ],
+  "source": "private review",
+  "sourcePath": null,
+  "notes": "Synthetic example only."
+}
+```
+
+Child source IDs and the `split_group` are stable across rebuilds. The manifest
+records the parent amount and exact child total so publication verification can
+reconcile the group. Internal transfers, card payments, reconciliation,
+investment/external-flow rows, and excluded rows fail closed if a split decision
+targets them.
+
+Position basis is emitted when the complete history supports it; it is left
+blank after an external in-kind arrival whose original basis is not known.

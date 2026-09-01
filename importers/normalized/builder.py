@@ -10,8 +10,8 @@ import os
 import re
 import shutil
 import uuid
-from collections import defaultdict
-from dataclasses import asdict, dataclass, fields
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -32,7 +32,7 @@ from importers.facts.schema import (
 from importers.monarch.monarch import read_transactions
 from importers.simplefin.pipeline import read_snapshot
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OUTPUT_NAMES = ("accounts.csv", "transactions.csv", "positions.csv", "valuations.csv")
 ACCOUNT_COLUMNS = (
     "account_id", "institution", "name", "kind", "currency", "opened", "closed",
@@ -41,8 +41,53 @@ ACCOUNT_COLUMNS = (
 TRANSACTION_COLUMNS = (
     "date", "account_id", "amount", "description", "source_id", "source_file",
     "category", "transfer_group", "symbol", "quantity", "price", "external_flow",
-    "excluded", "exclusion_reason",
+    "excluded", "exclusion_reason", "transaction_kind", "category_id",
+    "payee_normalized", "assignment_source", "assignment_rule_id",
+    "assignment_confidence", "split_group",
 )
+TRANSACTION_KINDS = frozenset({
+    "expense",
+    "income",
+    "refund",
+    "internal_transfer",
+    "cc_payment",
+    "loan_payment",
+    "saving",
+    "reimbursement",
+    "reconciliation",
+    "investment",
+    "excluded",
+})
+ASSIGNMENT_SOURCES = frozenset({"", "source", "manual", "rule", "history", "ai"})
+TRANSFER_CANDIDATE_WINDOW_DAYS = 5
+TRANSFER_REVIEW_KINDS = frozenset({"transfer-confirmed", "transfer-rejected"})
+#: Normalized source-category labels that name a movement of money rather than
+#: consumption. Matching is deliberately identity- and pattern-based: an
+#: unrestricted ``"transfer" in category`` substring test also swallows genuine
+#: expenses such as "Transfer Fee", which would then lose their category and
+#: drop out of cash flow and budget history.
+TRANSFER_CATEGORY_IDENTITIES = frozenset({
+    "transfer",
+    "transfers",
+    "transfer in",
+    "transfer out",
+    "transfer in out",
+    "internal transfer",
+    "internal transfers",
+    "account transfer",
+    "bank transfer",
+    "balance transfer",
+    "wire transfer",
+    "ach transfer",
+})
+#: Labels that name the destination or source of a movement, e.g.
+#: "Transfer to Savings" or "Transfer from Checking".
+TRANSFER_CATEGORY_PREFIXES = ("transfer to ", "transfer from ", "transfer between ")
+#: Qualified movements such as "Internal Transfer" or "Balance Transfer".
+#: "Transfer Fee" does not end this way, so it stays a real expense.
+TRANSFER_CATEGORY_SUFFIXES = (" transfer", " transfers")
+CREDIT_CARD_PAYMENT_CATEGORIES = frozenset({"credit card payment", "card payment"})
+CATEGORY_SPLIT_KIND = "category-split"
 POSITION_COLUMNS = (
     "as_of", "account_id", "symbol", "quantity", "price", "market_value",
     "basis_per_unit", "source_file",
@@ -85,6 +130,13 @@ class TransactionRow:
     external_flow: bool = False
     excluded: bool = False
     exclusion_reason: str = ""
+    transaction_kind: str = ""
+    category_id: str = ""
+    payee_normalized: str = ""
+    assignment_source: str = ""
+    assignment_rule_id: str = ""
+    assignment_confidence: str = ""
+    split_group: str = ""
 
 
 @dataclass(frozen=True)
@@ -118,6 +170,8 @@ class Estate:
     source_files: set[Path]
     warnings: list[str]
     source_stats: dict[str, int]
+    transfer_review: dict[str, Any] = field(default_factory=dict)
+    split_review: dict[str, Any] = field(default_factory=dict)
 
 
 def _money(value: Decimal | int | str | None) -> str:
@@ -720,7 +774,7 @@ def _apply_decisions(estate: Estate, facts: list[Any], identity: IdentityMap) ->
     handoffs: list[tuple[str, date, str]] = []
     account_exclusions: dict[str, str] = {}
     transfer_groups: dict[str, str] = {}
-    category_overrides: dict[str, str] = {}
+    category_overrides: dict[str, tuple[str, str]] = {}
     for parsed in facts:
         fact = parsed.fact
         if not isinstance(fact, DecisionFact):
@@ -753,7 +807,7 @@ def _apply_decisions(estate: Estate, facts: list[Any], identity: IdentityMap) ->
             if not isinstance(source_ids, list) or not source_ids:
                 raise BuildError(f"{parsed.path}: category decision has no sourceIds")
             for source_id in source_ids:
-                category_overrides[str(source_id)] = category.strip()
+                category_overrides[str(source_id)] = (category.strip(), fact.id)
 
     estate.accounts = [
         AccountRow(**{
@@ -778,11 +832,501 @@ def _apply_decisions(estate: Estate, facts: list[Any], identity: IdentityMap) ->
         transfer = transfer_groups.get(row.source_id)
         if transfer:
             data["transfer_group"] = transfer
-        category = category_overrides.get(row.source_id)
-        if category:
-            data["category"] = category
+        category_override = category_overrides.get(row.source_id)
+        if category_override:
+            data["category"] = category_override[0]
+            data["assignment_source"] = "manual"
+            data["assignment_rule_id"] = category_override[1]
+            data["assignment_confidence"] = "1.00"
         changed.append(TransactionRow(**data))
     estate.transactions = changed
+
+
+def _category_id(category: str) -> str:
+    normalized = _norm(category)
+    return re.sub(r"[^a-z0-9]+", ".", normalized.casefold()).strip(".")
+
+
+def _stable_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _transfer_candidate_id(left: TransactionRow, right: TransactionRow) -> str:
+    identities = sorted(
+        (
+            {"accountId": left.account_id, "sourceId": left.source_id},
+            {"accountId": right.account_id, "sourceId": right.source_id},
+        ),
+        key=lambda item: (item["accountId"], item["sourceId"]),
+    )
+    return f"transfer-candidate-{_stable_digest(identities)[:20]}"
+
+
+def _transfer_evidence_hash(
+    outflow: TransactionRow,
+    inflow: TransactionRow,
+    currency: str,
+) -> str:
+    legs = sorted(
+        (
+            {
+                "accountId": row.account_id,
+                "sourceId": row.source_id,
+                "date": row.date,
+                "amount": _money(row.amount),
+                "currency": currency,
+                "descriptionHash": hashlib.sha256(
+                    row.description.encode("utf-8")
+                ).hexdigest(),
+                "sourceFile": row.source_file,
+                "category": row.category,
+                "externalFlow": row.external_flow,
+            }
+            for row in (outflow, inflow)
+        ),
+        key=lambda item: (item["accountId"], item["sourceId"]),
+    )
+    return _stable_digest({"legs": legs})
+
+
+def _transfer_candidates(estate: Estate) -> list[dict[str, Any]]:
+    accounts = {
+        row.account_id: row
+        for row in estate.accounts
+        if not row.excluded and row.currency.strip()
+    }
+    eligible: list[TransactionRow] = []
+    for row in estate.transactions:
+        account = accounts.get(row.account_id)
+        if account is None:
+            continue
+        if account.opened and row.date < account.opened:
+            continue
+        if account.closed and row.date > account.closed:
+            continue
+        if (
+            not row.excluded
+            and not row.external_flow
+            and not row.transfer_group
+            and not row.source_id.casefold().startswith("gap:")
+            and not row.symbol
+            and Decimal(row.amount) != 0
+        ):
+            eligible.append(row)
+    outflows: dict[tuple[str, Decimal], list[TransactionRow]] = defaultdict(list)
+    inflows: dict[tuple[str, Decimal], list[TransactionRow]] = defaultdict(list)
+    for row in eligible:
+        amount = Decimal(row.amount)
+        key = (accounts[row.account_id].currency.upper(), abs(amount))
+        (outflows if amount < 0 else inflows)[key].append(row)
+
+    raw: list[dict[str, Any]] = []
+    match_counts: Counter[tuple[str, str]] = Counter()
+    for (currency, amount), debit_rows in sorted(outflows.items()):
+        for outflow in debit_rows:
+            for inflow in inflows.get((currency, amount), []):
+                if outflow.account_id == inflow.account_id:
+                    continue
+                day_distance = abs(
+                    (
+                        date.fromisoformat(outflow.date)
+                        - date.fromisoformat(inflow.date)
+                    ).days
+                )
+                if day_distance > TRANSFER_CANDIDATE_WINDOW_DAYS:
+                    continue
+                candidate_id = _transfer_candidate_id(outflow, inflow)
+                raw.append({
+                    "candidateId": candidate_id,
+                    "evidenceHash": _transfer_evidence_hash(outflow, inflow, currency),
+                    "currency": currency,
+                    "dayDistance": day_distance,
+                    "outflow": {
+                        "accountId": outflow.account_id,
+                        "sourceId": outflow.source_id,
+                        "date": outflow.date,
+                        "amount": _money(abs(Decimal(outflow.amount))),
+                    },
+                    "inflow": {
+                        "accountId": inflow.account_id,
+                        "sourceId": inflow.source_id,
+                        "date": inflow.date,
+                        "amount": _money(abs(Decimal(inflow.amount))),
+                    },
+                    "_rows": (outflow, inflow),
+                })
+                match_counts[(outflow.account_id, outflow.source_id)] += 1
+                match_counts[(inflow.account_id, inflow.source_id)] += 1
+    for candidate in raw:
+        candidate["ambiguous"] = any(
+            match_counts[(row.account_id, row.source_id)] > 1
+            for row in candidate["_rows"]
+        )
+    return sorted(raw, key=lambda item: item["candidateId"])
+
+
+def _apply_transfer_review_decisions(estate: Estate, facts: list[Any]) -> None:
+    decisions: dict[str, tuple[Any, str]] = {}
+    for parsed in facts:
+        fact = parsed.fact
+        if not isinstance(fact, DecisionFact) or fact.kind not in TRANSFER_REVIEW_KINDS:
+            continue
+        if (
+            not fact.id.strip()
+            or fact.decided_on is None
+            or not fact.evidence.strip()
+            or not fact.resolution.strip()
+        ):
+            raise BuildError(f"{parsed.path}: transfer review decision is not fully reviewed")
+        candidate_id = parsed.data.get("candidateId")
+        evidence_hash = parsed.data.get("evidenceHash")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise BuildError(f"{parsed.path}: transfer review decision has no candidateId")
+        if (
+            not isinstance(evidence_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence_hash)
+        ):
+            raise BuildError(
+                f"{parsed.path}: transfer review decision has an invalid evidenceHash"
+            )
+        if candidate_id in decisions:
+            raise BuildError(f"duplicate transfer review decision: {candidate_id}")
+        decisions[candidate_id] = (parsed, evidence_hash)
+
+    candidates = _transfer_candidates(estate)
+    current_ids = {item["candidateId"] for item in candidates}
+    replacements: dict[tuple[str, str], str] = {}
+    proposals: list[dict[str, Any]] = []
+    confirmed: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for candidate in candidates:
+        rows = candidate.pop("_rows")
+        reviewed = decisions.get(candidate["candidateId"])
+        if not reviewed:
+            proposals.append({**candidate, "status": "proposed"})
+            continue
+        parsed, expected_hash = reviewed
+        candidate_accounts = {
+            str(candidate[leg]["accountId"]) for leg in ("outflow", "inflow")
+        }
+        if set(parsed.fact.affects) != candidate_accounts:
+            raise BuildError(
+                f"{parsed.path}: transfer review decision affects the wrong accounts"
+            )
+        if expected_hash != candidate["evidenceHash"]:
+            proposals.append({
+                **candidate,
+                "status": "evidence-changed",
+                "priorDecisionId": parsed.fact.id,
+            })
+            continue
+        summary = {
+            **candidate,
+            "decisionId": parsed.fact.id,
+        }
+        if parsed.fact.kind == "transfer-rejected":
+            rejected.append(summary)
+            continue
+        group_id = f"transfer-{_stable_digest({'decisionId': parsed.fact.id})[:20]}"
+        for row in rows:
+            key = (row.account_id, row.source_id)
+            if key in replacements:
+                raise BuildError(
+                    f"confirmed transfer decisions reuse a transaction: {row.source_id}"
+                )
+            replacements[key] = group_id
+        confirmed.append({**summary, "transferGroup": group_id})
+
+    proposals = [
+        candidate
+        for candidate in proposals
+        if {
+            (
+                str(candidate[leg].get("accountId") or ""),
+                str(candidate[leg].get("sourceId") or ""),
+            )
+            for leg in ("outflow", "inflow")
+        }.isdisjoint(replacements)
+    ]
+    if replacements:
+        estate.transactions = [
+            TransactionRow(**{
+                **asdict(row),
+                "transfer_group": replacements.get(
+                    (row.account_id, row.source_id), row.transfer_group
+                ),
+            })
+            for row in estate.transactions
+        ]
+    stale = [
+        {
+            "candidateId": candidate_id,
+            "decisionId": parsed.fact.id,
+            "status": "candidate-not-present",
+        }
+        for candidate_id, (parsed, _evidence_hash) in sorted(decisions.items())
+        if candidate_id not in current_ids
+    ]
+    estate.transfer_review = {
+        "windowDays": TRANSFER_CANDIDATE_WINDOW_DAYS,
+        "proposals": proposals,
+        "confirmed": confirmed,
+        "rejected": rejected,
+        "staleDecisions": stale,
+    }
+    estate.source_stats.update({
+        "transferCandidateProposals": len(proposals),
+        "transferConfirmedPairs": len(confirmed),
+        "transferRejectedPairs": len(rejected),
+    })
+
+
+def _is_transfer_category(normalized_category: str) -> bool:
+    """Is this normalized source category a money movement, not consumption?
+
+    Restricted to known transfer identities and the "transfer to/from X" and
+    "X transfer" patterns, so labels such as "Transfer Fee" or "Wire Transfer
+    Fee" remain ordinary expenses that keep a ``category_id``.
+    """
+    if not normalized_category:
+        return False
+    if normalized_category in TRANSFER_CATEGORY_IDENTITIES:
+        return True
+    if normalized_category.startswith(TRANSFER_CATEGORY_PREFIXES):
+        return True
+    return normalized_category.endswith(TRANSFER_CATEGORY_SUFFIXES)
+
+
+def _transaction_kind(row: TransactionRow, account_kind: str) -> str:
+    category = row.category.strip().upper()
+    normalized_category = _norm(row.category).casefold()
+    source_id = row.source_id.casefold()
+    account_kind = account_kind.upper()
+    if row.excluded:
+        return "excluded"
+    if source_id.startswith("gap:"):
+        return "reconciliation"
+    if row.transfer_group:
+        return "internal_transfer"
+    if (
+        account_kind == "CREDIT_CARD"
+        and (
+            category in {"TRANSFER_IN", "TRANSFER_OUT"}
+            or normalized_category in CREDIT_CARD_PAYMENT_CATEGORIES
+        )
+    ):
+        return "cc_payment"
+    if normalized_category in {"loan payment", "mortgage payment"} or (
+        account_kind in {"LOAN", "LIABILITY"} and category == "PAYMENT"
+    ):
+        return "loan_payment"
+    if (
+        category in {"TRANSFER_IN", "TRANSFER_OUT", "TRANSFER"}
+        or _is_transfer_category(normalized_category)
+        or normalized_category in CREDIT_CARD_PAYMENT_CATEGORIES
+    ):
+        return "saving" if row.external_flow else "internal_transfer"
+    if row.symbol or account_kind in {"SECURITIES", "CRYPTOCURRENCY"}:
+        return "saving" if row.external_flow and Decimal(row.amount) > 0 else "investment"
+    amount = Decimal(row.amount)
+    if account_kind == "CREDIT_CARD" and amount > 0:
+        return "refund"
+    return "income" if amount >= 0 else "expense"
+
+
+def _apply_transaction_semantics(estate: Estate) -> None:
+    account_kinds = {row.account_id: row.kind for row in estate.accounts}
+    enriched: list[TransactionRow] = []
+    for row in estate.transactions:
+        data = asdict(row)
+        data["transaction_kind"] = _transaction_kind(
+            row, account_kinds.get(row.account_id, "")
+        )
+        data["category_id"] = (
+            _category_id(row.category)
+            if data["transaction_kind"] in {"expense", "income", "refund", "reimbursement"}
+            else ""
+        )
+        data["payee_normalized"] = _norm(row.description)
+        if row.category and not row.assignment_source:
+            data["assignment_source"] = "source"
+        enriched.append(TransactionRow(**data))
+    estate.transactions = enriched
+
+
+def _apply_exact_splits(estate: Estate, facts: list[Any]) -> None:
+    split_facts = [
+        parsed
+        for parsed in facts
+        if isinstance(parsed.fact, DecisionFact)
+        and parsed.fact.kind == CATEGORY_SPLIT_KIND
+    ]
+    if not split_facts:
+        estate.split_review = {"groups": []}
+        return
+
+    by_target: dict[tuple[str, str], Any] = {}
+    for parsed in split_facts:
+        if (
+            not parsed.fact.id.strip()
+            or parsed.fact.decided_on is None
+            or not parsed.fact.evidence.strip()
+            or not parsed.fact.resolution.strip()
+        ):
+            raise BuildError(f"{parsed.path}: category-split decision is not fully reviewed")
+        source_ids = parsed.data.get("sourceIds")
+        if source_ids is None and parsed.data.get("sourceId"):
+            source_ids = [parsed.data["sourceId"]]
+        if not isinstance(source_ids, list) or len(source_ids) != 1:
+            raise BuildError(
+                f"{parsed.path}: category-split decision must identify one sourceId"
+            )
+        source_id = str(source_ids[0])
+        account_ids = [
+            account_id
+            for account_id in parsed.fact.affects
+            if any(row.account_id == account_id for row in estate.accounts)
+        ]
+        if len(account_ids) != 1 or len(parsed.fact.affects) != 1:
+            raise BuildError(
+                f"{parsed.path}: category-split decision must affect one owned account"
+            )
+        matches = [
+            row
+            for row in estate.transactions
+            if row.source_id == source_id
+            and (not account_ids or row.account_id in account_ids)
+        ]
+        if len(matches) != 1:
+            raise BuildError(
+                f"{parsed.path}: category-split target must resolve to one transaction"
+            )
+        target = matches[0]
+        key = (target.account_id, target.source_id)
+        if key in by_target:
+            raise BuildError(f"duplicate category-split decision for {source_id}")
+        by_target[key] = parsed
+
+    existing_keys = {(row.account_id, row.source_id) for row in estate.transactions}
+    output: list[TransactionRow] = []
+    summaries: list[dict[str, Any]] = []
+    for row in estate.transactions:
+        parsed = by_target.get((row.account_id, row.source_id))
+        if parsed is None:
+            output.append(row)
+            continue
+        if row.transfer_group or row.external_flow or row.transaction_kind not in {
+            "expense", "income", "refund", "reimbursement"
+        }:
+            raise BuildError(
+                f"{parsed.path}: transfer or reconciliation transaction cannot be category-split"
+            )
+        allocations = parsed.data.get("splits")
+        if not isinstance(allocations, list) or len(allocations) < 2:
+            raise BuildError(
+                f"{parsed.path}: category-split decision requires at least two splits"
+            )
+        parent_amount = Decimal(row.amount)
+        amounts: list[Decimal | None] = []
+        residual_indexes: list[int] = []
+        for index, allocation in enumerate(allocations):
+            if not isinstance(allocation, dict):
+                raise BuildError(f"{parsed.path}: split {index + 1} must be an object")
+            category = allocation.get("category")
+            if not isinstance(category, str) or not category.strip():
+                raise BuildError(f"{parsed.path}: split {index + 1} has no category")
+            if "residual" in allocation and not isinstance(
+                allocation["residual"], bool
+            ):
+                raise BuildError(
+                    f"{parsed.path}: split {index + 1} residual must be boolean"
+                )
+            is_residual = allocation.get("residual") is True
+            if is_residual:
+                if allocation.get("amount") not in (None, ""):
+                    raise BuildError(
+                        f"{parsed.path}: residual split {index + 1} cannot have an amount"
+                    )
+                residual_indexes.append(index)
+                amounts.append(None)
+            else:
+                if allocation.get("amount") in (None, ""):
+                    raise BuildError(f"{parsed.path}: split {index + 1} has no amount")
+                amounts.append(Decimal(_money(allocation["amount"])))
+        if len(residual_indexes) > 1:
+            raise BuildError(f"{parsed.path}: category-split has multiple residual rows")
+        explicit_total = sum(
+            (amount for amount in amounts if amount is not None), Decimal()
+        )
+        if residual_indexes:
+            amounts[residual_indexes[0]] = parent_amount - explicit_total
+        elif explicit_total != parent_amount:
+            raise BuildError(
+                f"{parsed.path}: category-split amounts do not equal the parent amount"
+            )
+        if any(
+            amount is None
+            or amount == 0
+            or (amount > 0) != (parent_amount > 0)
+            for amount in amounts
+        ):
+            raise BuildError(
+                f"{parsed.path}: category-split amounts must be nonzero and match parent direction"
+            )
+
+        group_identity = {
+            "decisionId": parsed.fact.id,
+            "accountId": row.account_id,
+            "sourceId": row.source_id,
+        }
+        group_id = f"split-{_stable_digest(group_identity)[:20]}"
+        children: list[dict[str, str]] = []
+        for index, (allocation, amount) in enumerate(zip(allocations, amounts), 1):
+            child_source_id = f"{row.source_id}:split:{index}"
+            if (row.account_id, child_source_id) in existing_keys:
+                raise BuildError(f"{parsed.path}: split child sourceId already exists")
+            category = str(allocation["category"]).strip()
+            category_id = str(
+                allocation.get("categoryId") or _category_id(category)
+            ).strip()
+            if not category_id:
+                raise BuildError(f"{parsed.path}: split {index} has no categoryId")
+            child = TransactionRow(**{
+                **asdict(row),
+                "amount": _money(amount),
+                "source_id": child_source_id,
+                "category": category,
+                "category_id": category_id,
+                "assignment_source": "manual",
+                "assignment_rule_id": parsed.fact.id,
+                "assignment_confidence": "1.00",
+                "split_group": group_id,
+            })
+            output.append(child)
+            children.append({
+                "sourceId": child_source_id,
+                "amount": child.amount,
+                "categoryId": child.category_id,
+            })
+        child_total = sum((Decimal(item["amount"]) for item in children), Decimal())
+        if child_total != parent_amount:
+            raise BuildError(f"{parsed.path}: category-split residual did not reconcile")
+        summaries.append({
+            "groupId": group_id,
+            "decisionId": parsed.fact.id,
+            "accountId": row.account_id,
+            "parentSourceId": row.source_id,
+            "date": row.date,
+            "parentAmount": _money(parent_amount),
+            "childTotal": _money(child_total),
+            "children": children,
+        })
+    estate.transactions = output
+    estate.split_review = {"groups": sorted(summaries, key=lambda item: item["groupId"])}
+    estate.source_stats["categorySplitGroups"] = len(summaries)
 
 
 def _deduplicate(estate: Estate) -> None:
@@ -796,7 +1340,8 @@ def _deduplicate(estate: Estate) -> None:
             key = (
                 row.date, row.amount, row.description, row.category, row.transfer_group,
                 row.symbol, row.quantity, row.price, row.external_flow,
-                row.excluded, row.exclusion_reason,
+                row.excluded, row.exclusion_reason, row.assignment_source,
+                row.assignment_rule_id, row.assignment_confidence, row.split_group,
             )
             by_content.setdefault(key, []).append(row)
         collision = len(by_content) > 1
@@ -926,6 +1471,9 @@ def _transaction_sort(row: TransactionRow) -> tuple[str, ...]:
 def _finish(estate: Estate, facts: list[Any], root: Path) -> Estate:
     _apply_decisions(estate, facts, IdentityMap(estate.accounts))
     _deduplicate(estate)
+    _apply_transfer_review_decisions(estate, facts)
+    _apply_transaction_semantics(estate)
+    _apply_exact_splits(estate, facts)
     _verify_assertions(estate, facts, root)
     estate.accounts.sort(key=lambda row: row.account_id)
     estate.transactions.sort(key=_transaction_sort)
@@ -986,6 +1534,8 @@ def _summary(estate: Estate, root: Path) -> dict[str, Any]:
             for path in sorted(estate.source_files, key=lambda item: _source_path(item, root))
         ],
         "sourceStats": dict(sorted(estate.source_stats.items())),
+        "transferReview": estate.transfer_review,
+        "splitReview": estate.split_review,
         "warnings": estate.warnings,
     }
 
@@ -1115,7 +1665,114 @@ def verify_publication(data_dir: str | Path) -> dict[str, Any]:
                 _money(row[key])
         if row["external_flow"] not in {"true", "false"}:
             raise BuildError("transactions.csv contains invalid external_flow")
+        if row["transaction_kind"] not in TRANSACTION_KINDS:
+            raise BuildError("transactions.csv contains invalid transaction_kind")
+        if row["assignment_source"] not in ASSIGNMENT_SOURCES:
+            raise BuildError("transactions.csv contains invalid assignment_source")
+        if row["assignment_rule_id"] and not row["assignment_source"]:
+            raise BuildError("transactions.csv assignment rule has no source")
+        if row["assignment_confidence"]:
+            confidence = Decimal(row["assignment_confidence"])
+            if confidence < 0 or confidence > 1:
+                raise BuildError(
+                    "transactions.csv assignment_confidence must be between zero and one"
+                )
+        if row["category_id"] and row["transaction_kind"] not in {
+            "expense", "income", "refund", "reimbursement"
+        }:
+            raise BuildError(
+                "transactions.csv non-consumption transaction has a category_id"
+            )
+        if row["split_group"] and row["transaction_kind"] in {
+            "internal_transfer", "cc_payment", "reconciliation", "investment"
+        }:
+            raise BuildError(
+                "transactions.csv transfer or reconciliation cannot be category-split"
+            )
         date.fromisoformat(row["date"])
+    split_groups: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows["transactions.csv"]:
+        if row["split_group"]:
+            split_groups[row["split_group"]].append(row)
+    split_review = manifest.get("splitReview", {"groups": []})
+    if not isinstance(split_review, dict) or not isinstance(
+        split_review.get("groups"), list
+    ):
+        raise BuildError("manifest splitReview has invalid shape")
+    if any(not isinstance(group, dict) for group in split_review["groups"]):
+        raise BuildError("manifest splitReview contains an invalid group")
+    split_summaries = {
+        str(group.get("groupId") or ""): group
+        for group in split_review["groups"]
+    }
+    if (
+        "" in split_summaries
+        or len(split_summaries) != len(split_review["groups"])
+    ):
+        raise BuildError("manifest splitReview contains duplicate or empty group IDs")
+    if set(split_groups) != set(split_summaries):
+        raise BuildError("manifest splitReview does not match transactions.csv")
+    for group_id, members in split_groups.items():
+        summary = split_summaries[group_id]
+        if len(members) < 2:
+            raise BuildError("transactions.csv split group has fewer than two rows")
+        if any(
+            row["transfer_group"]
+            or row["external_flow"] == "true"
+            or row["transaction_kind"]
+            not in {"expense", "income", "refund", "reimbursement"}
+            for row in members
+        ):
+            raise BuildError(
+                "transactions.csv split group has incompatible transfer semantics"
+            )
+        if any(
+            not row["category"]
+            or not row["category_id"]
+            or row["assignment_source"] != "manual"
+            or not row["assignment_rule_id"]
+            for row in members
+        ):
+            raise BuildError("transactions.csv split group has invalid category provenance")
+        if (
+            len({row["account_id"] for row in members}) != 1
+            or len({row["date"] for row in members}) != 1
+            or len({row["assignment_rule_id"] for row in members}) != 1
+            or {row["account_id"] for row in members}
+            != {str(summary.get("accountId") or "")}
+            or {row["date"] for row in members}
+            != {str(summary.get("date") or "")}
+            or {row["assignment_rule_id"] for row in members}
+            != {str(summary.get("decisionId") or "")}
+        ):
+            raise BuildError("transactions.csv split group has inconsistent identity")
+        child_total = sum((Decimal(row["amount"]) for row in members), Decimal())
+        try:
+            parent_amount = Decimal(str(summary.get("parentAmount") or ""))
+            reported_total = Decimal(str(summary.get("childTotal") or ""))
+        except InvalidOperation:
+            raise BuildError("manifest splitReview contains an invalid amount") from None
+        children = summary.get("children")
+        if not isinstance(children, list) or any(
+            not isinstance(child, dict) for child in children
+        ):
+            raise BuildError("manifest splitReview contains invalid children")
+        reported_children = {
+            str(child.get("sourceId") or ""): (
+                str(child.get("amount") or ""),
+                str(child.get("categoryId") or ""),
+            )
+            for child in children
+        }
+        actual_children = {
+            row["source_id"]: (row["amount"], row["category_id"]) for row in members
+        }
+        if (
+            child_total != parent_amount
+            or reported_total != parent_amount
+            or reported_children != actual_children
+        ):
+            raise BuildError("transactions.csv split group does not reconcile")
     for row in rows["positions.csv"]:
         if row["account_id"] not in account_ids:
             raise BuildError("positions.csv references an unknown account")

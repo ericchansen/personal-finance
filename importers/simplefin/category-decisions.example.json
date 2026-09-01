@@ -1,0 +1,95 @@
+{
+  "_comment": [
+    "Synthetic example only. Copy to <data-dir>/simplefin/category-decisions.json",
+    "and replace every value with your own reviewed rules; never commit the real",
+    "file. 'payeeHash' values are synthetic SHA-256 placeholders here, not real",
+    "merchant hashes -- generate real ones with importers.simplefin.categorization",
+    "merchant_hash(description, hash_key) against your own private hash key.",
+    "Run 'python -m importers.simplefin.categorize_cli migrate-decisions' to",
+    "propose this document from an existing schemaVersion 1 file without",
+    "modifying it."
+  ],
+  "schemaVersion": 2,
+  "categoryAliases": {
+    "Example Canonical Category": "example-category-id"
+  },
+  "rules": [
+    {
+      "id": "example-reviewed-merchant",
+      "stage": "categorize",
+      "priority": 10,
+      "enabled": true,
+      "reviewed": true,
+      "stopProcessing": true,
+      "rationale": "Example: a reviewed, stable merchant mapping.",
+      "when": {
+        "field": "payeeHash",
+        "op": "exact",
+        "value": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "actions": [
+        {
+          "type": "setCategory",
+          "taxonomyId": "spending_categories",
+          "categoryId": "example-category-id"
+        }
+      ]
+    },
+    {
+      "id": "example-exclude-internal-fee",
+      "stage": "classify",
+      "priority": 5,
+      "enabled": true,
+      "reviewed": true,
+      "stopProcessing": true,
+      "rationale": "Example: a known internal fee that should never reach spending review.",
+      "when": {
+        "all": [
+          {"field": "payee", "op": "contains", "value": "example internal fee"},
+          {"field": "amount", "op": "range", "min": "0.00", "max": "5.00"}
+        ]
+      },
+      "actions": [
+        {"type": "setTransactionKind", "value": "excluded"}
+      ]
+    },
+    {
+      "id": "example-unreviewed-candidate",
+      "stage": "categorize",
+      "priority": 20,
+      "enabled": true,
+      "reviewed": false,
+      "stopProcessing": false,
+      "rationale": "Example: a candidate rule awaiting review before it can auto-apply.",
+      "when": {
+        "field": "payee",
+        "op": "startsWith",
+        "value": "example unreviewed merchant"
+      },
+      "actions": [
+        {
+          "type": "setCategory",
+          "taxonomyId": "spending_categories",
+          "categoryId": "example-category-id"
+        }
+      ]
+    },
+    {
+      "id": "example-decorate-recurring",
+      "stage": "decorate",
+      "priority": 10,
+      "enabled": true,
+      "reviewed": true,
+      "stopProcessing": false,
+      "rationale": "Example: tag a recognized recurring charge for future review.",
+      "when": {
+        "field": "payee",
+        "op": "regex",
+        "value": "^example recurring .*"
+      },
+      "actions": [
+        {"type": "addTag", "value": "recurring"}
+      ]
+    }
+  ]
+}

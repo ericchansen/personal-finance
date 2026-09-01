@@ -7,7 +7,18 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
-from importers.normalized.builder import BuildError, build, collect, plan, verify
+from importers.normalized.builder import (
+    AccountRow,
+    BuildError,
+    Estate,
+    TransactionRow,
+    _apply_transfer_review_decisions,
+    _transaction_kind,
+    build,
+    collect,
+    plan,
+    verify,
+)
 from importers.normalized.cli import main
 
 
@@ -227,6 +238,39 @@ def input_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def add_transfer_pair(root: Path, *, second_inflow: bool = False) -> None:
+    facts_path = root / "facts" / "facts.json"
+    facts = json.loads(facts_path.read_text(encoding="utf-8"))
+    facts.append(account("acct-savings", "Example Savings"))
+    if second_inflow:
+        facts.append(account("acct-reserve", "Example Reserve"))
+    write(facts_path, facts)
+
+    monarch_path = root / "legacy" / "monarch" / "Transactions_2024.csv"
+    with monarch_path.open("a", encoding="utf-8") as output:
+        output.write(
+            "2024-01-11,Synthetic Move Out,Transfer,Example Checking,,,-10.00,,,,pair-out\n"
+            "2024-01-13,Synthetic Move In,Transfer,Example Savings,,,10.00,,,,pair-in\n"
+        )
+        if second_inflow:
+            output.write(
+                "2024-01-12,Synthetic Other In,Transfer,Example Reserve,,,10.00,,,,pair-other\n"
+            )
+    mapping_path = root / "normalized" / "monarch-account-map.json"
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    mapping["Example Savings"] = "acct-savings"
+    if second_inflow:
+        mapping["Example Reserve"] = "acct-reserve"
+    write(mapping_path, mapping)
+
+
+def add_decision(root: Path, value: dict) -> None:
+    path = root / "facts" / "facts.json"
+    facts = json.loads(path.read_text(encoding="utf-8"))
+    facts.append(value)
+    write(path, facts)
+
+
 def test_deterministic_build_and_verify(tmp_path):
     root = make_estate(tmp_path)
     first = build(root, now=datetime(2024, 2, 1, tzinfo=timezone.utc))
@@ -270,6 +314,10 @@ def test_decimal_sign_lineage_ambiguity_and_transfer(tmp_path):
     assert matching[0].source_id == "extract:stable:ofx-1"
     assert matching[0].source_file == "extracts/example/activity.qfx"
     assert matching[0].category == "Shopping"
+    assert matching[0].category_id == ""
+    assert matching[0].transaction_kind == "internal_transfer"
+    assert matching[0].payee_normalized == "merchant one"
+    assert matching[0].assignment_source == "source"
     assert matching[0].transfer_group == "reviewed-pair-1"
     assert any("cross-source-deduplicated" in warning for warning in estate.warnings)
     assert any(Decimal(row.amount) == Decimal("1.25") for row in estate.transactions)
@@ -419,6 +467,8 @@ def test_vanguard_external_in_kind_transfer_is_zero_cash_and_marked(tmp_path):
     assert transfer.amount == "0"
     assert transfer.quantity == "1.0"
     assert transfer.external_flow is True
+    assert transfer.transaction_kind == "saving"
+    assert transfer.category_id == ""
 
 
 def test_vanguard_missing_in_kind_resolution_blocks(tmp_path):
@@ -480,6 +530,7 @@ def test_vanguard_internal_recharacterization_preserves_transfer_group(tmp_path)
     assert {row.category for row in grouped} == {"TRANSFER_IN", "TRANSFER_OUT"}
     assert {row.amount for row in grouped} == {"0"}
     assert not any(row.external_flow for row in grouped)
+    assert {row.transaction_kind for row in grouped} == {"internal_transfer"}
 
 
 def test_repeated_same_source_rows_remain_ambiguous(tmp_path):
@@ -578,6 +629,110 @@ def test_reviewed_category_decision_overrides_source_category(tmp_path):
         item for item in estate.transactions if item.source_id == "monarch:mon-old"
     )
     assert row.category == "Home Costs"
+    assert row.category_id == ""
+    assert row.assignment_source == "manual"
+    assert row.assignment_rule_id == "known-category"
+    assert row.assignment_confidence == "1.00"
+
+
+def test_legacy_transfer_category_remains_structural_transfer(tmp_path):
+    root = make_estate(tmp_path)
+    facts_path = root / "facts" / "facts.json"
+    facts = [
+        fact
+        for fact in json.loads(facts_path.read_text())
+        if fact.get("id") != "known-transfer"
+    ]
+    write(facts_path, facts)
+    monarch = root / "legacy" / "monarch" / "Transactions_2024.csv"
+    monarch.write_text(
+        monarch.read_text().replace(
+            "Merchant One,Shopping", "Merchant One,Transfer to Savings"
+        ),
+        encoding="utf-8",
+    )
+
+    row = next(
+        item
+        for item in collect(root).transactions
+        if item.account_id == "acct-main"
+        and item.date == "2024-01-10"
+        and Decimal(item.amount) == Decimal("-12.34")
+    )
+
+    assert row.category == "Transfer to Savings"
+    assert row.transaction_kind == "internal_transfer"
+    assert row.category_id == ""
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "Transfer",
+        "Transfers",
+        "Transfer In",
+        "Transfer Out",
+        "Transfer to Savings",
+        "Transfer From Checking",
+        "Transfer between accounts",
+        "Internal Transfer",
+        "Balance Transfer",
+        "Wire Transfer",
+        "Credit Card Payment",
+    ],
+)
+def test_transfer_shaped_categories_stay_structural_transfers(category):
+    row = TransactionRow(
+        "2024-01-10", "acct-main", "-12.34", "SYNTHETIC PAYEE", "synthetic:1", "fixture",
+        category=category,
+    )
+    assert _transaction_kind(row, "CASH") == "internal_transfer"
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "Transfer Fee",
+        "Wire Transfer Fee",
+        "Transfer Fees",
+        "Bank Transfer Charge",
+        "Transferable Benefits",
+        "Balance Transfer Interest",
+    ],
+)
+def test_transfer_shaped_fee_categories_stay_ordinary_expenses(category):
+    """A substring match on "transfer" swallowed fees, which are consumption."""
+    row = TransactionRow(
+        "2024-01-10", "acct-main", "-12.34", "SYNTHETIC PAYEE", "synthetic:2", "fixture",
+        category=category,
+    )
+    assert _transaction_kind(row, "CASH") == "expense"
+
+
+def test_transfer_fee_on_a_card_is_not_a_card_payment():
+    row = TransactionRow(
+        "2024-01-10", "acct-card", "-12.34", "SYNTHETIC PAYEE", "synthetic:3", "fixture",
+        category="Transfer Fee",
+    )
+    assert _transaction_kind(row, "CREDIT_CARD") == "expense"
+
+
+def test_cash_side_loan_payment_is_structural_financing(tmp_path):
+    root = make_estate(tmp_path)
+    monarch = root / "legacy" / "monarch" / "Transactions_2024.csv"
+    lines = monarch.read_text(encoding="utf-8").splitlines()
+    lines.append(
+        "2024-01-25,Synthetic Lender,Loan Payment,Example Checking,,,-20.00,,,,loan-1"
+    )
+    monarch.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    row = next(
+        item for item in collect(root).transactions
+        if item.source_id == "monarch:loan-1"
+    )
+
+    assert row.transaction_kind == "loan_payment"
+    assert row.category_id == ""
 
 
 def test_manifest_source_hashes_and_raw_inputs_are_not_mutated(tmp_path):
@@ -598,3 +753,245 @@ def test_cli_plan_does_not_write_and_build_verify_succeed(tmp_path, capsys):
     assert main(["build", "--data-dir", str(root)]) == 0
     assert main(["verify", "--data-dir", str(root)]) == 0
     assert '"verified": true' in capsys.readouterr().out
+
+
+def test_transfer_rejection_suppresses_same_evidence_and_resurfaces_when_changed(tmp_path):
+    root = make_estate(tmp_path)
+    add_transfer_pair(root)
+    first = collect(root)
+    assert len(first.transfer_review["proposals"]) == 1
+    candidate = first.transfer_review["proposals"][0]
+
+    add_decision(
+        root,
+        decision(
+            "reject-pair",
+            "transfer-rejected",
+            ["acct-main", "acct-savings"],
+            "REJECTED after private review.",
+            candidateId=candidate["candidateId"],
+            evidenceHash=candidate["evidenceHash"],
+        ),
+    )
+    rejected = collect(root)
+    assert rejected.transfer_review["proposals"] == []
+    assert len(rejected.transfer_review["rejected"]) == 1
+    assert rejected.transfer_review["rejected"][0]["candidateId"] == candidate["candidateId"]
+    assert rejected.transfer_review["rejected"][0]["evidenceHash"] == candidate["evidenceHash"]
+    assert rejected.transfer_review["rejected"][0]["decisionId"] == "reject-pair"
+    assert not any(row.transfer_group for row in rejected.transactions if "pair-" in row.source_id)
+
+    monarch_path = root / "legacy" / "monarch" / "Transactions_2024.csv"
+    monarch_path.write_text(
+        monarch_path.read_text(encoding="utf-8").replace(
+            "2024-01-13,Synthetic Move In", "2024-01-14,Synthetic Move In"
+        ),
+        encoding="utf-8",
+    )
+    changed = collect(root)
+    assert len(changed.transfer_review["proposals"]) == 1
+    assert changed.transfer_review["proposals"][0]["status"] == "evidence-changed"
+    assert changed.transfer_review["proposals"][0]["candidateId"] == candidate["candidateId"]
+    assert changed.transfer_review["proposals"][0]["evidenceHash"] != candidate["evidenceHash"]
+
+
+def test_reviewed_transfer_confirmation_is_stable_and_idempotent(tmp_path):
+    root = make_estate(tmp_path)
+    add_transfer_pair(root)
+    candidate = collect(root).transfer_review["proposals"][0]
+    add_decision(
+        root,
+        decision(
+            "confirm-pair",
+            "transfer-confirmed",
+            ["acct-main", "acct-savings"],
+            "CONFIRMED after exact private review.",
+            candidateId=candidate["candidateId"],
+            evidenceHash=candidate["evidenceHash"],
+        ),
+    )
+
+    first = collect(root)
+    second = collect(root)
+    pair = [row for row in first.transactions if row.source_id in {
+        "monarch:pair-out", "monarch:pair-in"
+    }]
+    assert len(pair) == 2
+    assert len({row.transfer_group for row in pair}) == 1
+    assert {row.transaction_kind for row in pair} == {"internal_transfer"}
+    assert first.transfer_review == second.transfer_review
+    assert pair == [
+        row for row in second.transactions if row.source_id in {
+            "monarch:pair-out", "monarch:pair-in"
+        }
+    ]
+
+
+def test_confirmed_ambiguous_pair_suppresses_competing_candidates(tmp_path):
+    root = make_estate(tmp_path)
+    add_transfer_pair(root, second_inflow=True)
+    candidate = next(
+        row
+        for row in collect(root).transfer_review["proposals"]
+        if row["inflow"]["sourceId"] == "monarch:pair-in"
+    )
+    add_decision(
+        root,
+        decision(
+            "confirm-ambiguous-pair",
+            "transfer-confirmed",
+            ["acct-main", "acct-savings"],
+            "CONFIRMED exact pair after resolving ambiguity.",
+            candidateId=candidate["candidateId"],
+            evidenceHash=candidate["evidenceHash"],
+        ),
+    )
+
+    estate = collect(root)
+    assert estate.transfer_review["proposals"] == []
+    assert len(estate.transfer_review["confirmed"]) == 1
+    assert next(
+        row for row in estate.transactions if row.source_id == "monarch:pair-other"
+    ).transfer_group == ""
+
+
+def test_ambiguous_exact_amount_candidates_are_never_auto_confirmed(tmp_path):
+    root = make_estate(tmp_path)
+    add_transfer_pair(root, second_inflow=True)
+    estate = collect(root)
+    proposals = estate.transfer_review["proposals"]
+    assert len(proposals) == 2
+    assert all(row["ambiguous"] for row in proposals)
+    assert not any(
+        row.transfer_group
+        for row in estate.transactions
+        if row.source_id in {
+            "monarch:pair-out", "monarch:pair-in", "monarch:pair-other"
+        }
+    )
+
+
+def test_transfer_candidates_require_owned_distinct_accounts_currency_amount_and_window():
+    accounts = [
+        AccountRow("cash", "Synthetic", "Cash", "CASH", "USD"),
+        AccountRow("save", "Synthetic", "Save", "CASH", "USD"),
+        AccountRow("euro", "Synthetic", "Euro", "CASH", "EUR"),
+        AccountRow("excluded", "Synthetic", "Old", "CASH", "USD", excluded=True),
+        AccountRow(
+            "closed", "Synthetic", "Closed", "CASH", "USD", closed="2026-08-09"
+        ),
+    ]
+
+    def row(source_id, account_id, amount, on="2026-08-10"):
+        return TransactionRow(
+            on, account_id, amount, "Synthetic transfer evidence", source_id, "fixture"
+        )
+
+    estate = Estate(
+        accounts,
+        [
+            row("out", "cash", "-10.00"),
+            row("compatible", "save", "10.00", "2026-08-15"),
+            row("same-account", "cash", "10.00"),
+            row("wrong-amount", "save", "9.99"),
+            row("wrong-currency", "euro", "10.00"),
+            row("outside-window", "save", "10.00", "2026-08-16"),
+            row("not-owned", "excluded", "10.00"),
+            row("after-ownership", "closed", "10.00"),
+            row("gap:reconciliation", "save", "10.00"),
+        ],
+        [],
+        [],
+        set(),
+        [],
+        {},
+    )
+    _apply_transfer_review_decisions(estate, [])
+
+    assert [
+        (
+            proposal["outflow"]["sourceId"],
+            proposal["inflow"]["sourceId"],
+            proposal["dayDistance"],
+        )
+        for proposal in estate.transfer_review["proposals"]
+    ] == [("out", "compatible", 5)]
+
+
+def test_category_split_uses_exact_decimal_residual_and_stable_group(tmp_path):
+    root = make_estate(tmp_path)
+    monarch_path = root / "legacy" / "monarch" / "Transactions_2024.csv"
+    with monarch_path.open("a", encoding="utf-8") as output:
+        output.write(
+            "2024-01-09,Synthetic Split Purchase,Shopping,Example Checking,,,"
+            "-10.005,,,,split-parent\n"
+        )
+    add_decision(
+        root,
+        decision(
+            "split-purchase",
+            "category-split",
+            ["acct-main"],
+            "Reviewed exact category allocation.",
+            sourceId="monarch:split-parent",
+            splits=[
+                {"amount": "-3.333", "category": "Synthetic One", "categoryId": "one"},
+                {"residual": True, "category": "Synthetic Two", "categoryId": "two"},
+            ],
+        ),
+    )
+
+    first = collect(root)
+    second = collect(root)
+    children = [
+        row for row in first.transactions
+        if row.split_group and row.assignment_rule_id == "split-purchase"
+    ]
+    assert [Decimal(row.amount) for row in children] == [
+        Decimal("-3.333"), Decimal("-6.672")
+    ]
+    assert sum((Decimal(row.amount) for row in children), Decimal()) == Decimal("-10.005")
+    assert len({row.split_group for row in children}) == 1
+    assert children == [
+        row for row in second.transactions
+        if row.split_group and row.assignment_rule_id == "split-purchase"
+    ]
+    build(root)
+    assert verify(root)["verified"] is True
+
+
+def test_category_split_rejects_transfer_semantics(tmp_path):
+    root = make_estate(tmp_path)
+    monarch_path = root / "legacy" / "monarch" / "Transactions_2024.csv"
+    with monarch_path.open("a", encoding="utf-8") as output:
+        output.write(
+            "2024-01-08,Synthetic Transfer,Transfer,Example Checking,,,"
+            "-12.34,,,,split-transfer-parent\n"
+        )
+    add_decision(
+        root,
+        decision(
+            "mark-transfer",
+            "transfer",
+            ["acct-main"],
+            "Reviewed synthetic transfer.",
+            transferGroup="synthetic-transfer-group",
+            sourceIds=["monarch:split-transfer-parent"],
+        ),
+    )
+    add_decision(
+        root,
+        decision(
+            "split-transfer",
+            "category-split",
+            ["acct-main"],
+            "Invalid synthetic split.",
+            sourceId="monarch:split-transfer-parent",
+            splits=[
+                {"amount": "-6.17", "category": "Synthetic One"},
+                {"residual": True, "category": "Synthetic Two"},
+            ],
+        ),
+    )
+    with pytest.raises(BuildError, match="cannot be category-split"):
+        collect(root)

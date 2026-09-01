@@ -2248,3 +2248,111 @@ def test_production_authorization_requires_explicit_flags_and_exact_sha(tmp_path
         _validate_production_authorization(args, plan_path, plan)
     args.allow_production = True
     _validate_production_authorization(args, plan_path, plan)
+
+
+# ---------------------------------------------------------------------------
+# Milestone 6: `_spending_totals` no longer crashes on an unsupported endpoint
+# ---------------------------------------------------------------------------
+
+
+class _SpendingTotalsClient:
+    """A minimal fake client for `_spending_totals`, configurable so either
+    the settings read or the report read raises a genuine 404
+    `WealthfolioError`, exercising the capability-gated adapter's blocked
+    behavior instead of crashing with a raw HTTP failure."""
+
+    def __init__(
+        self, *, block_settings=False, block_report=False, failure_status=404
+    ):
+        self.block_settings = block_settings
+        self.block_report = block_report
+        self.failure_status = failure_status
+
+    def get(self, path):
+        if path == "/spending/settings":
+            if self.block_settings:
+                from importers.monarch.wealthfolio_client import WealthfolioError
+
+                raise WealthfolioError(
+                    self.failure_status, path, "spending module unavailable"
+                )
+            return {"enabled": True, "accountIds": ["live-account"]}
+        raise AssertionError(f"unexpected GET {path}")
+
+    def post(self, path, payload):
+        if path == "/spending/report":
+            if self.block_report:
+                from importers.monarch.wealthfolio_client import WealthfolioError
+
+                raise WealthfolioError(
+                    self.failure_status, path, "spending report unavailable"
+                )
+            return {"current": {"income": "0", "outflow": "12.34"}}
+        raise AssertionError(f"unexpected POST {path}")
+
+
+def test_spending_totals_returns_none_without_crashing_when_settings_unsupported():
+    plan = {"spendingWindow": {"startDate": "2026-08-01", "endDate": "2026-08-31"}}
+    client = _SpendingTotalsClient(block_settings=True)
+
+    assert simplefin_apply._spending_totals(client, plan) is None
+
+
+def test_spending_totals_returns_none_without_crashing_when_report_unsupported():
+    plan = {"spendingWindow": {"startDate": "2026-08-01", "endDate": "2026-08-31"}}
+    client = _SpendingTotalsClient(block_report=True)
+
+    assert simplefin_apply._spending_totals(client, plan) is None
+
+
+def test_spending_totals_returns_totals_when_supported():
+    plan = {"spendingWindow": {"startDate": "2026-08-01", "endDate": "2026-08-31"}}
+    client = _SpendingTotalsClient()
+
+    totals = simplefin_apply._spending_totals(client, plan)
+
+    assert totals == {"income": Decimal("0"), "spending": Decimal("12.34")}
+
+
+def test_spending_totals_returns_none_when_no_spending_window():
+    assert simplefin_apply._spending_totals(_SpendingTotalsClient(), {}) is None
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"block_settings": True},
+    {"block_report": True},
+])
+def test_spending_totals_propagates_operational_failures(kwargs):
+    plan = {"spendingWindow": {"startDate": "2026-08-01", "endDate": "2026-08-31"}}
+    client = _SpendingTotalsClient(**kwargs, failure_status=503)
+
+    with pytest.raises(simplefin_apply.SpendingCapabilityBlocked, match="is error"):
+        simplefin_apply._spending_totals(client, plan)
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {},
+        {"spendingBreakdown": []},
+        {"current": None},
+        {"current": []},
+        {"current": "12.34"},
+    ],
+)
+def test_spending_totals_refuses_a_report_without_a_current_totals_object(report):
+    """A malformed report must be a predictable refusal, not a raw KeyError."""
+
+    class _Client(_SpendingTotalsClient):
+        def post(self, path, payload):
+            assert path == "/spending/report"
+            return report
+
+    plan = {"spendingWindow": {"startDate": "2026-08-01", "endDate": "2026-08-31"}}
+
+    with pytest.raises(
+        simplefin_apply.SpendingCapabilityBlocked, match="no 'current' totals"
+    ) as blocked:
+        simplefin_apply._spending_totals(_Client(), plan)
+
+    assert blocked.value.status.status == "incompatible"

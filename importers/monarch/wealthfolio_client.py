@@ -63,8 +63,10 @@ class WealthfolioClient:
     def put(self, path: str, payload: Any) -> Any:
         return self._request("PUT", path, payload)
 
-    def delete(self, path: str) -> Any:
-        return self._request("DELETE", path)
+    def delete(self, path: str, payload: Any = None) -> Any:
+        # A few Wealthfolio routes (notably budget group deletion) require a
+        # JSON body on DELETE, exactly as its own web client sends them.
+        return self._request("DELETE", path, payload)
 
     # -- api --------------------------------------------------------------
 

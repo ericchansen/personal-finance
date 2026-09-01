@@ -53,6 +53,9 @@ Financial data is sensitive and this repository is public, so the boundary is st
 - **Recordings contain live credentials.** The recorder redacts cookies, `Authorization`
   headers, and account numbers *before* anything is written to disk.
 - **Runbooks are written generically** — no account numbers, balances, or personal URLs.
+- **No cloud model, ever.** The optional categorization agent talks only to an
+  Ollama server on loopback, with proxies explicitly disabled and redirects
+  refused. Merchant descriptions are never written to disk, cached, or logged.
 
 ## Layout
 
@@ -60,12 +63,21 @@ Financial data is sensitive and this repository is public, so the boundary is st
 deploy/wealthfolio/   Docker Compose for the Wealthfolio server
 importers/monarch/    Monarch Money CSV export -> Wealthfolio
 importers/analytics/  Canonical private analytics -> portable CSV/JSON contract
+importers/categorize/ Source-agnostic categorization of live Wealthfolio cash activity
+                      (plus an optional loopback-only Ollama suggestion agent)
 recorder/             CDP network recorder (browser extract capture)
 docs/                 Architecture notes and per-institution runbooks
 ```
 
 See [Canonical analytics](docs/canonical-analytics.md) for truthful sold-asset,
 liability, performance, metadata-review, and reporting-portfolio outputs.
+See [Spending categorization](docs/runbooks/categorization.md) for the
+source-agnostic plan, staging rehearsal, and production promotion workflow,
+including the private read-only index of Wealthfolio's own categorized history.
+See [Local model categorization](docs/runbooks/ollama-categorization.md) for the
+optional loopback-only Ollama agent that suggests categories for genuinely novel
+merchants. Merchant text goes to `127.0.0.1` and nowhere else; every artifact it
+writes is merchant-redacted.
 
 ## License
 

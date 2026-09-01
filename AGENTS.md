@@ -44,6 +44,7 @@ path outside this checkout. Layout:
 <data>/extracts/<institution>/   Raw downloads, as retrieved
 <data>/recordings/               Redacted CDP captures
 <data>/normalized/               Importer output
+<data>/ollama-agent/             Local-model suggestions, reviews, decision cache
 <data>/wealthfolio/              Wealthfolio SQLite volume
 ```
 

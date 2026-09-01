@@ -20,7 +20,11 @@ from typing import Any, Iterable
 from importers.assets.loan import balance_as_of
 from importers.facts.loader import load_facts
 from importers.facts.schema import LoanFact, PropertyFact, VehicleFact
-from importers.normalized.builder import BuildError, verify_publication
+from importers.normalized.builder import (
+    TRANSACTION_COLUMNS,
+    BuildError,
+    verify_publication,
+)
 
 from .publication import ensure_durable_directory, fsync_directory
 
@@ -67,22 +71,6 @@ ACCOUNT_COLUMNS = (
     "currency",
     "opened",
     "closed",
-    "excluded",
-    "exclusion_reason",
-)
-TRANSACTION_COLUMNS = (
-    "date",
-    "account_id",
-    "amount",
-    "description",
-    "source_id",
-    "source_file",
-    "category",
-    "transfer_group",
-    "symbol",
-    "quantity",
-    "price",
-    "external_flow",
     "excluded",
     "exclusion_reason",
 )
@@ -376,12 +364,14 @@ def _monthly_cash_flow(
             continue
         month = row["date"][:7]
         evidence[month].add(row["account_id"])
-        if (
-            row["transfer_group"]
-            or row["symbol"]
-            or row["external_flow"] == "true"
-            or "transfer" in row["category"].casefold()
-        ):
+        # transaction_kind is the structural classification computed by
+        # importers/normalized/builder.py; using it here (instead of
+        # transfer_group/symbol/external_flow/category heuristics) correctly
+        # excludes transfers, card/loan payments, saving, reconciliation, and
+        # investment activity from spending regardless of category labels.
+        if row["transaction_kind"] not in {
+            "income", "expense", "refund", "reimbursement"
+        }:
             continue
         result[month] += _decimal(row["amount"], "transaction amount")
     return result, evidence
