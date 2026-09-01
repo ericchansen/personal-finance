@@ -30,6 +30,13 @@ from importers.rebuild.safety import (
     validate_apply_target,
     validate_private_output,
 )
+from importers.simplefin.spending_adapter import (
+    CAP_REPORT_READ,
+    SUPPORTED_ENDPOINTS,
+    CapabilityStatus,
+    SpendingAdapter,
+    SpendingCapabilityBlocked,
+)
 
 from .application import (
     activity_semantic_fingerprint,
@@ -177,14 +184,41 @@ def _portfolio_value_report(
 
 
 def _spending_totals(client, plan: dict) -> dict[str, Decimal] | None:
+    """Read current Spending totals through the capability-gated adapter.
+
+    Returns None when Spending is not configured or the endpoint is absent.
+    Authentication, transport, server, and incompatible-response failures
+    remain blocking because silently skipping the sealed impact check would
+    make a staging rehearsal untrustworthy.
+    """
     window = plan.get("spendingWindow")
     if not window:
         return None
-    settings = client.get("/spending/settings") or {}
+    adapter = SpendingAdapter(client)
+    try:
+        settings = adapter.settings()
+    except SpendingCapabilityBlocked as exc:
+        if exc.status.status == "unsupported":
+            return None
+        raise
     if not settings.get("enabled") or not settings.get("accountIds"):
         return None
-    report = client.post("/spending/report", window)
-    current = report["current"]
+    try:
+        report = adapter.report(window)
+    except SpendingCapabilityBlocked as exc:
+        if exc.status.status == "unsupported":
+            return None
+        raise
+    current = report.get("current")
+    if not isinstance(current, dict):
+        raise SpendingCapabilityBlocked(
+            CapabilityStatus(
+                CAP_REPORT_READ,
+                "incompatible",
+                SUPPORTED_ENDPOINTS[CAP_REPORT_READ][1],
+                "spending report response has no 'current' totals object",
+            )
+        )
     return {
         "income": Decimal(str(current.get("income") or 0)),
         "spending": Decimal(str(current.get("outflow") or 0)),

@@ -41,6 +41,12 @@ Coverage uses calendar-month overlap with each account's open/closed interval,
 so an account opened or closed mid-month still requires evidence for the active
 part of that month.
 
+`cash_flow` includes ordinary income, expenses, refunds, and reimbursements,
+determined from the canonical `transaction_kind` rather than category labels
+or heuristics, so transfers, card/loan payments, saving, reconciliation, and
+investment activity are excluded regardless of how a transaction is
+categorized.
+
 Account values are used only in months with a canonical observation and are
 never carried into another month. Property values are interpolated only between
 observed values and are zero outside the ownership window. Fixed-rate

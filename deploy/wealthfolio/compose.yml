@@ -9,7 +9,9 @@
 
 services:
   wealthfolio:
-    image: wealthfolio/wealthfolio:latest
+    # Keep the version and multi-platform manifest digest explicit. Override the
+    # complete reference only after validating the replacement in staging.
+    image: "${WF_IMAGE:-wealthfolio/wealthfolio:3.7.0@sha256:de137d64acf712c5c71093b27ecc98ccc1dbbbf00befdb684bed531cdb40069a}"
     container_name: wealthfolio
     restart: unless-stopped
 
