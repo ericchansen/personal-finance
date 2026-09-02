@@ -7,6 +7,7 @@ and other facts that would otherwise live only in one mutable application DB.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -24,6 +25,10 @@ FACT_TYPES = {
     "assertion",
     "quote",
 }
+PLACEHOLDER_ACCOUNT_SUFFIX = re.compile(
+    r"(?:\s|\(|-)(?:\.{3,}|[x*\u2022\u25cf]{3,})(?:\s+\d{4})?\)?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -362,11 +367,16 @@ def parse_fact(data: dict[str, Any], path: Path) -> tuple[ParsedFact | None, lis
             check.issue(
                 "tracking mode must be TRANSACTIONS or HOLDINGS", "trackingMode"
             )
+        display_name = str(check.required(data, "displayName") or "")
+        if PLACEHOLDER_ACCOUNT_SUFFIX.search(display_name):
+            check.issue(
+                "display name must not end with a placeholder mask", "displayName"
+            )
         fact = AccountFact(
             **common,
             id=str(check.required(data, "id") or ""),
             institution=str(check.required(data, "institution") or ""),
-            display_name=str(check.required(data, "displayName") or ""),
+            display_name=display_name,
             masked_number=data.get("maskedNumber"),
             kind=str(check.required(data, "kind") or ""),
             opened=check.optional_date(data, "opened"),

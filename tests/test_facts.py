@@ -242,6 +242,29 @@ def test_account_tracking_mode_is_validated(tmp_path):
     assert any(error.field == "trackingMode" for error in result.errors)
 
 
+@pytest.mark.parametrize(
+    "display_name",
+    [
+        "Synthetic Retirement XXXX",
+        "Synthetic Retirement ****",
+        "Synthetic Retirement \u2022\u2022\u2022\u2022",
+        "Synthetic Retirement XXXX 1234",
+        "Synthetic Retirement (\u25cf\u25cf\u25cf\u25cf 1234)",
+    ],
+)
+def test_account_display_name_rejects_placeholder_mask(tmp_path, display_name):
+    account = json.loads(ACCOUNT)
+    account["displayName"] = display_name
+    write_fact(tmp_path, "account.json", json.dumps(account))
+
+    result = load_facts(tmp_path)
+
+    assert any(
+        error.field == "displayName" and "placeholder mask" in error.message
+        for error in result.errors
+    )
+
+
 def test_validation_collects_more_than_one_error(tmp_path):
     write_fact(tmp_path, "bad.json", '{"type": "account", "opened": "yesterday"}')
     result = load_facts(tmp_path)
