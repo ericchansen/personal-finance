@@ -20,3 +20,18 @@ def test_account_plan_renames_and_deactivates_from_canonical_identity():
     assert plan.updates[0][1]["name"] == "Canonical Card"
     assert plan.updates[0][1]["isActive"] is False
     assert plan.creates[0]["_canonicalId"] == "ledger"
+
+
+def test_account_plan_preserves_canonical_holdings_tracking_mode():
+    canonical = {
+        "retirement": CanonicalAccount(
+            "retirement",
+            "Balance-only Retirement",
+            "SECURITIES",
+            False,
+            False,
+            "HOLDINGS",
+        )
+    }
+    plan = build_account_plan([], canonical, {})
+    assert plan.creates[0]["tracking_mode"] == "HOLDINGS"

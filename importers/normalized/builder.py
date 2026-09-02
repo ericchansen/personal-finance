@@ -30,13 +30,13 @@ from importers.facts.schema import (
     VehicleFact,
 )
 from importers.monarch.monarch import read_transactions
-from importers.simplefin.pipeline import read_snapshot
+from importers.simplefin.pipeline import exclusion_error, read_snapshot
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 OUTPUT_NAMES = ("accounts.csv", "transactions.csv", "positions.csv", "valuations.csv")
 ACCOUNT_COLUMNS = (
     "account_id", "institution", "name", "kind", "currency", "opened", "closed",
-    "excluded", "exclusion_reason",
+    "excluded", "exclusion_reason", "tracking_mode",
 )
 TRANSACTION_COLUMNS = (
     "date", "account_id", "amount", "description", "source_id", "source_file",
@@ -112,6 +112,7 @@ class AccountRow:
     closed: str = ""
     excluded: bool = False
     exclusion_reason: str = ""
+    tracking_mode: str = "TRANSACTIONS"
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,7 @@ def _load_fact_rows(root: Path) -> tuple[Estate, IdentityMap, list[Any]]:
                 fact.opened.isoformat() if fact.opened else "",
                 fact.closed.isoformat() if fact.closed else "",
                 fact.excluded, fact.reason or "",
+                tracking_mode=fact.tracking_mode,
             ))
         elif isinstance(fact, AssertionFact) and fact.on and fact.balance is not None:
             valuations.append(ValuationRow(
@@ -466,6 +468,7 @@ def _load_simplefin(root: Path, estate: Estate, identity: IdentityMap) -> None:
     if errors:
         raise BuildError("latest SimpleFIN snapshot has institution errors: " + "; ".join(errors))
     mapping = mapping_doc["accounts"]
+    accounts_by_id = {account.id: account for account in accounts}
     estate.source_files.update({snapshot, mapping_path})
     source = _source_path(snapshot, root)
     for account in accounts:
@@ -488,6 +491,9 @@ def _load_simplefin(root: Path, estate: Estate, identity: IdentityMap) -> None:
         elif action == "observe":
             account_id = identity.id(str(entry.get("assertionAccountId") or ""), source)
         elif action == "exclude":
+            error = exclusion_error(account, entry, accounts_by_id, mapping)
+            if error:
+                raise BuildError(f"{source}: unsafe SimpleFIN exclusion: {error}")
             try:
                 account_id = identity.name(account.name, source)
             except BuildError:

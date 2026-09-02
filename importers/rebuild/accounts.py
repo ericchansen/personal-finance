@@ -25,6 +25,7 @@ class CanonicalAccount:
     kind: str
     closed: bool
     excluded: bool
+    tracking_mode: str = "TRANSACTIONS"
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ def load_canonical_accounts(path: Path) -> dict[str, CanonicalAccount]:
                 row["kind"],
                 bool(row["closed"]),
                 row["excluded"].casefold() == "true",
+                row.get("tracking_mode") or "TRANSACTIONS",
             )
     return result
 
@@ -148,7 +150,7 @@ def build_account_plan(
             "isActive": not target.closed and not target.excluded,
             "isDefault": account.get("isDefault", False),
             "group": account.get("group"),
-            "trackingMode": "TRANSACTIONS",
+            "trackingMode": target.tracking_mode,
         }
         if any(account.get(key) != value for key, value in desired.items()):
             updates.append((account["id"], desired))
@@ -164,6 +166,7 @@ def build_account_plan(
                 "account_type": target.kind,
                 "group": "Crypto" if target.kind == "CRYPTOCURRENCY" else None,
                 "is_active": not target.closed,
+                "tracking_mode": target.tracking_mode,
             }
         )
     return AccountPlan(tuple(updates), tuple(creates), mapped)

@@ -36,6 +36,7 @@ def fixture_root(tmp_path: Path) -> Path:
             "closed": "",
             "excluded": "false",
             "exclusion_reason": "",
+            "tracking_mode": "TRANSACTIONS",
         },
         {
             "account_id": "invest-1",
@@ -47,6 +48,7 @@ def fixture_root(tmp_path: Path) -> Path:
             "closed": "",
             "excluded": "false",
             "exclusion_reason": "",
+            "tracking_mode": "TRANSACTIONS",
         },
         {
             "account_id": "loan:Synthetic Mortgage",
@@ -58,6 +60,7 @@ def fixture_root(tmp_path: Path) -> Path:
             "closed": "2024-02-15",
             "excluded": "false",
             "exclusion_reason": "",
+            "tracking_mode": "TRANSACTIONS",
         },
     ]
     transactions = [
@@ -222,6 +225,7 @@ def fixture_root(tmp_path: Path) -> Path:
             "closed",
             "excluded",
             "exclusion_reason",
+            "tracking_mode",
         ),
         "transactions.csv": generator.TRANSACTION_COLUMNS,
         "positions.csv": (
@@ -318,7 +322,7 @@ def fixture_root(tmp_path: Path) -> Path:
     facts_path = root / "facts" / "facts.json"
     facts_path.write_text(json.dumps(facts), encoding="utf-8")
     manifest = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "sourceFiles": [
             {
                 "path": "facts/facts.json",
