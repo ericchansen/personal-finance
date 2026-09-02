@@ -5,6 +5,7 @@
   "displayName": "Example Checking",
   "maskedNumber": "0000",
   "kind": "depository",
+  "trackingMode": "TRANSACTIONS",
   "opened": "2024-01-01",
   "closed": null,
   "excluded": false,

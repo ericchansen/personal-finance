@@ -179,7 +179,10 @@ def make_estate(tmp_path: Path, assertion_balance: str = "100.25") -> Path:
                 "action": "import", "wealthfolioAccountId": "app-only-id",
                 "assertionAccountId": "acct-main",
             },
-            "source-corporate": {"action": "exclude", "decision": "synthetic-exclusion"},
+            "source-corporate": {
+                "action": "exclude",
+                "decision": "employer-corporate-card",
+            },
         },
     })
 
@@ -284,8 +287,48 @@ def test_deterministic_build_and_verify(tmp_path):
         for name in bytes_before
     }
     assert bytes_before == bytes_after
+    assert first["schemaVersion"] == 4
+    account_columns = bytes_before["accounts.csv"].splitlines()[0].decode().split(",")
+    transaction_columns = bytes_before["transactions.csv"].splitlines()[0].decode().split(",")
+    assert "tracking_mode" in account_columns
+    assert {
+        "transaction_kind",
+        "category_id",
+        "payee_normalized",
+        "assignment_source",
+        "assignment_rule_id",
+        "assignment_confidence",
+        "split_group",
+    } <= set(transaction_columns)
     assert first["buildTimestamp"] != second["buildTimestamp"]
     assert verify(root)["verified"]
+
+
+def test_canonical_build_rejects_non_dormant_exclusion(tmp_path):
+    root = make_estate(tmp_path)
+    mapping_path = root / "simplefin" / "account-map.json"
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    mapping["accounts"]["source-corporate"]["decision"] = (
+        "dormant-zero-balance-account"
+    )
+    write(mapping_path, mapping)
+
+    with pytest.raises(BuildError, match="excluded-account-not-dormant"):
+        collect(root)
+
+
+def test_canonical_build_rejects_mismatched_duplicate_exclusion(tmp_path):
+    root = make_estate(tmp_path)
+    mapping_path = root / "simplefin" / "account-map.json"
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    mapping["accounts"]["source-corporate"].update({
+        "decision": "aggregator-account-summary",
+        "duplicateOfSourceAccountId": "source-main",
+    })
+    write(mapping_path, mapping)
+
+    with pytest.raises(BuildError, match="duplicate-summary-mismatch"):
+        collect(root)
 
 
 def test_atomic_failure_preserves_previous_directory(tmp_path):

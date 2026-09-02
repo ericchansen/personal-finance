@@ -228,6 +228,20 @@ def test_duplicate_ids_are_reported(tmp_path):
     assert any("duplicate id" in error.message for error in result.errors)
 
 
+def test_account_tracking_mode_is_validated(tmp_path):
+    account = json.loads(ACCOUNT)
+    account["trackingMode"] = "holdings"
+    write_fact(tmp_path, "account.json", json.dumps(account))
+    result = load_facts(tmp_path)
+    assert result.ok
+    assert result.facts[0].fact.tracking_mode == "HOLDINGS"
+
+    account["trackingMode"] = "balance-only"
+    write_fact(tmp_path, "account.json", json.dumps(account))
+    result = load_facts(tmp_path)
+    assert any(error.field == "trackingMode" for error in result.errors)
+
+
 def test_validation_collects_more_than_one_error(tmp_path):
     write_fact(tmp_path, "bad.json", '{"type": "account", "opened": "yesterday"}')
     result = load_facts(tmp_path)

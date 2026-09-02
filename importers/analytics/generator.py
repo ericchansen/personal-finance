@@ -21,6 +21,7 @@ from importers.assets.loan import balance_as_of
 from importers.facts.loader import load_facts
 from importers.facts.schema import LoanFact, PropertyFact, VehicleFact
 from importers.normalized.builder import (
+    ACCOUNT_COLUMNS,
     TRANSACTION_COLUMNS,
     BuildError,
     verify_publication,
@@ -62,17 +63,6 @@ PERFORMANCE_COLUMNS = (
     "modified_dietz_return",
     "status",
     "reason",
-)
-ACCOUNT_COLUMNS = (
-    "account_id",
-    "institution",
-    "name",
-    "kind",
-    "currency",
-    "opened",
-    "closed",
-    "excluded",
-    "exclusion_reason",
 )
 POSITION_COLUMNS = (
     "as_of",

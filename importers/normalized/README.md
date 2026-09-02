@@ -40,8 +40,10 @@ a stable decision identifier and reason. The manifest hashes every workbook,
 mapping, resolution artifact, and combined assertion source and reports mapped,
 excluded, and canonical Vanguard row counts.
 
-Canonical transaction schema version 3 retains the version 2 investment fields
-(`symbol`, signed `quantity`, `price`, and `external_flow`) and adds structural
+Canonical schema version 4 adds `tracking_mode` to accounts so balance-only
+holdings accounts are distinct from transaction-ledger accounts. It retains the
+version 3 transaction fields, including the version 2 investment fields
+(`symbol`, signed `quantity`, `price`, and `external_flow`) and structural
 cash-flow semantics:
 
 - `transaction_kind` distinguishes consumption, income, refunds, transfers,
@@ -55,6 +57,13 @@ cash-flow semantics:
   preserve categorization provenance.
 - `split_group` identifies exact monetary split lines; transfers and
   reconciliation rows cannot also be category splits.
+
+Existing version 3 publications are intentionally not upgraded in place because
+two incompatible version 3 layouts existed. After all consumers support version
+4, rebuild from the private source facts and extracts; the builder verifies the
+new publication in a staging directory before atomically replacing the prior
+canonical directory. Until then, version 4 consumers reject the old publication
+instead of guessing which layout it uses.
 
 ## Reviewed transfer candidates
 

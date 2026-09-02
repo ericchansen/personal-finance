@@ -58,6 +58,22 @@ def account(*transactions: SimpleFinTransaction) -> SimpleFinAccount:
     )
 
 
+def source_account(
+    source_id: str,
+    *transactions: SimpleFinTransaction,
+    balance: Decimal = Decimal("87.66"),
+) -> SimpleFinAccount:
+    return SimpleFinAccount(
+        id=source_id,
+        name=f"Synthetic {source_id}",
+        org="Synthetic Bank",
+        currency="USD",
+        balance=balance,
+        balance_date=date(2026, 8, 27),
+        transactions=list(transactions),
+    )
+
+
 def plan_for(
     *transactions: SimpleFinTransaction,
     existing: list[ExistingTransaction] | None = None,
@@ -187,6 +203,96 @@ def test_corporate_card_requires_the_durable_exclusion_decision():
     result = plan_for(txn(), mapping=excluded)
     assert result["accounts"][0]["status"] == "excluded"
     assert result["accounts"][0]["decision"] == "employer-corporate-card"
+
+
+def test_dormant_zero_balance_account_can_be_excluded():
+    dormant = source_account("dormant", balance=Decimal("0"))
+    mapping = {
+        "dormant": {
+            "action": "exclude",
+            "decision": "dormant-zero-balance-account",
+        }
+    }
+    result = build_plan([dormant], [], mapping, generated_at=NOW)
+    assert result["ready"]
+    assert result["accounts"][0]["status"] == "excluded"
+
+
+@pytest.mark.parametrize(
+    ("balance", "transactions"),
+    [
+        (Decimal("1.00"), ()),
+        (Decimal("0"), (txn(),)),
+    ],
+)
+def test_dormant_exclusion_blocks_when_balance_or_activity_appears(
+    balance, transactions
+):
+    dormant = source_account("dormant", *transactions, balance=balance)
+    mapping = {
+        "dormant": {
+            "action": "exclude",
+            "decision": "dormant-zero-balance-account",
+        }
+    }
+    result = build_plan([dormant], [], mapping, generated_at=NOW)
+    assert not result["ready"]
+    assert result["blockers"][0]["code"] == "excluded-account-not-dormant"
+
+
+def test_duplicate_summary_can_be_excluded_only_with_equivalent_import_target():
+    transaction = txn()
+    summary = source_account("summary", transaction)
+    detail = source_account("detail", transaction)
+    mapping = {
+        "summary": {
+            "action": "exclude",
+            "decision": "aggregator-account-summary",
+            "duplicateOfSourceAccountId": "detail",
+        },
+        "detail": {
+            "action": "import",
+            "wealthfolioAccountId": TARGET,
+        },
+    }
+    result = build_plan(
+        [summary, detail],
+        [],
+        mapping,
+        known_account_ids={TARGET},
+        generated_at=NOW,
+    )
+    assert result["ready"]
+    assert result["accounts"][0]["status"] == "excluded"
+    assert result["accounts"][0]["duplicateOfSourceAccountId"] == "detail"
+
+
+def test_duplicate_summary_blocks_when_source_semantics_diverge():
+    summary = source_account("summary", txn())
+    detail = source_account(
+        "detail",
+        txn(description="Different synthetic activity"),
+    )
+    mapping = {
+        "summary": {
+            "action": "exclude",
+            "decision": "aggregator-account-summary",
+            "duplicateOfSourceAccountId": "detail",
+        },
+        "detail": {
+            "action": "import",
+            "wealthfolioAccountId": TARGET,
+        },
+    }
+    result = build_plan(
+        [summary, detail],
+        [],
+        mapping,
+        known_account_ids={TARGET},
+        generated_at=NOW,
+    )
+    assert not result["ready"]
+    assert result["blockers"][0]["code"] == "duplicate-summary-mismatch"
 
 
 def test_alternative_liability_can_be_monitored_without_importing_transactions():

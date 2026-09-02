@@ -27,6 +27,8 @@ MAX_HISTORY_DAYS = 90
 DEFAULT_HISTORY_DAYS = 45
 MAX_REQUESTS_PER_DAY = 24
 CORPORATE_CARD_DECISION = "employer-corporate-card"
+DORMANT_ACCOUNT_DECISION = "dormant-zero-balance-account"
+DUPLICATE_SUMMARY_DECISION = "aggregator-account-summary"
 INFLOW = {"DEPOSIT", "CREDIT", "TRANSFER_IN", "INTEREST", "DIVIDEND"}
 OUTFLOW = {"WITHDRAWAL", "TRANSFER_OUT", "FEE", "TAX", "EXPENSE"}
 
@@ -192,6 +194,54 @@ def balances_from_activities(rows: Iterable[dict[str, Any]]) -> dict[str, Decima
     return dict(balances)
 
 
+def _transaction_semantics(account: SimpleFinAccount) -> list[tuple[Any, ...]]:
+    return sorted(
+        (
+            transaction.posted,
+            transaction.amount.normalize(),
+            normalize_description(transaction.description),
+            transaction.pending,
+        )
+        for transaction in account.transactions
+    )
+
+
+def exclusion_error(
+    account: SimpleFinAccount,
+    entry: dict[str, str],
+    accounts_by_id: dict[str, SimpleFinAccount],
+    mapping: dict[str, dict[str, str]],
+) -> str | None:
+    decision = entry.get("decision")
+    if decision == CORPORATE_CARD_DECISION:
+        return None
+    if decision == DORMANT_ACCOUNT_DECISION:
+        if account.balance != 0 or account.transactions:
+            return "excluded-account-not-dormant"
+        return None
+    if decision != DUPLICATE_SUMMARY_DECISION:
+        return "invalid-exclusion-decision"
+
+    duplicate_id = entry.get("duplicateOfSourceAccountId")
+    duplicate = accounts_by_id.get(duplicate_id or "")
+    if duplicate is None or duplicate is account:
+        return "invalid-duplicate-source"
+    duplicate_mapping = mapping.get(duplicate.id, {})
+    if (
+        duplicate_mapping.get("action", "import") != "import"
+        or not duplicate_mapping.get("wealthfolioAccountId")
+    ):
+        return "invalid-duplicate-target"
+    if (
+        account.currency != duplicate.currency
+        or account.balance != duplicate.balance
+        or account.balance_date != duplicate.balance_date
+        or _transaction_semantics(account) != _transaction_semantics(duplicate)
+    ):
+        return "duplicate-summary-mismatch"
+    return None
+
+
 def build_plan(
     accounts: Iterable[SimpleFinAccount],
     errors: Iterable[str],
@@ -204,6 +254,8 @@ def build_plan(
 ) -> dict[str, Any]:
     """Create a reviewable plan; no returned operation can mutate a balance."""
     generated_at = generated_at or datetime.now(timezone.utc)
+    accounts = list(accounts)
+    accounts_by_id = {account.id: account for account in accounts}
     existing = list(existing)
     ledger_balances = ledger_balances or {}
     by_source: dict[tuple[str, str], list[ExistingTransaction]] = defaultdict(list)
@@ -244,9 +296,10 @@ def build_plan(
         action = entry.get("action", "import")
         if action == "exclude":
             decision = entry.get("decision")
-            if decision != CORPORATE_CARD_DECISION:
+            error = exclusion_error(account, entry, accounts_by_id, mapping)
+            if error:
                 blockers.append({
-                    "code": "invalid-exclusion-decision",
+                    "code": error,
                     "sourceAccountId": account.id,
                 })
                 account_plans.append({**base, "status": "blocked", "transactions": []})
@@ -254,7 +307,16 @@ def build_plan(
                 account_plans.append({
                     **base,
                     "status": "excluded",
-                    "decision": CORPORATE_CARD_DECISION,
+                    "decision": decision,
+                    **(
+                        {
+                            "duplicateOfSourceAccountId": entry[
+                                "duplicateOfSourceAccountId"
+                            ]
+                        }
+                        if decision == DUPLICATE_SUMMARY_DECISION
+                        else {}
+                    ),
                     "transactions": [],
                 })
             continue

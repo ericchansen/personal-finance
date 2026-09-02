@@ -100,6 +100,7 @@ class AccountFact(FactSource):
     closed: date | None = None
     excluded: bool = False
     reason: str | None = None
+    tracking_mode: str = "TRANSACTIONS"
 
 
 @dataclass(frozen=True)
@@ -356,6 +357,11 @@ def parse_fact(data: dict[str, Any], path: Path) -> tuple[ParsedFact | None, lis
             else f"crypto:{fact.label}"
         )
     elif fact_type == "account":
+        tracking_mode = str(data.get("trackingMode") or "TRANSACTIONS").upper()
+        if tracking_mode not in {"TRANSACTIONS", "HOLDINGS"}:
+            check.issue(
+                "tracking mode must be TRANSACTIONS or HOLDINGS", "trackingMode"
+            )
         fact = AccountFact(
             **common,
             id=str(check.required(data, "id") or ""),
@@ -367,6 +373,7 @@ def parse_fact(data: dict[str, Any], path: Path) -> tuple[ParsedFact | None, lis
             closed=check.optional_date(data, "closed"),
             excluded=bool(data.get("excluded", False)),
             reason=data.get("reason"),
+            tracking_mode=tracking_mode,
         )
         fact_id = f"account:{fact.id}"
     elif fact_type == "decision":

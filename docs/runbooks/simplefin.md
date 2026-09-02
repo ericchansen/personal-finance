@@ -80,6 +80,15 @@ IDs and values point to existing stable Wealthfolio IDs:
       "action": "exclude",
       "decision": "employer-corporate-card"
     },
+    "synthetic-summary-id": {
+      "action": "exclude",
+      "decision": "aggregator-account-summary",
+      "duplicateOfSourceAccountId": "synthetic-source-account-id"
+    },
+    "synthetic-dormant-id": {
+      "action": "exclude",
+      "decision": "dormant-zero-balance-account"
+    },
     "synthetic-loan-id": {
       "action": "monitor",
       "wealthfolioAlternativeAssetId": "synthetic-alternative-liability-id",
@@ -99,6 +108,16 @@ exclude a personal account. An unmapped source account, unknown target, or
 unrecognized exclusion blocks readiness rather than guessing.
 `assertionAccountId` is the durable account ID used by balance facts; omit it
 only when that ID is the same as the Wealthfolio ID.
+
+Use `aggregator-account-summary` only when a provider emits an umbrella account
+that duplicates an imported detail account. `duplicateOfSourceAccountId` must
+identify that imported source account, and every pull blocks if their currency,
+balance date, balance, or transaction semantics diverge.
+
+Use `dormant-zero-balance-account` for an intentionally untracked account only
+while it has both a zero balance and no transactions in the fetched window. Any
+balance or activity blocks the plan so an exclusion cannot silently hide a
+reactivated account.
 
 Use `monitor` for institution accounts represented as alternative liabilities
 in Wealthfolio, such as a mortgage or auto loan. Their balances are compared
