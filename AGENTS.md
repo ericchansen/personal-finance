@@ -57,6 +57,20 @@ path outside this checkout. Layout:
   Dedup on a stable source ID where one exists.
 - **Active vs. closed accounts.** Closed accounts must not distort net worth or cash flow.
 
+## Account names and durable decisions
+
+- The private account fact's `displayName` is the canonical user-facing name. Source and
+  aggregator names are aliases for matching only and must not overwrite it during refresh.
+- Use a concise ownership qualifier plus institution or product and account type. Append a
+  real last-four only when it is known and needed to distinguish otherwise identical
+  accounts. Never display placeholder masks, raw source IDs, or aggregator decorations.
+- Make household-specific naming, ownership, exclusion, and source-mapping decisions in the
+  external facts, decisions, and mapping files first. Future agents must inspect those
+  private decisions before planning an import or changing Wealthfolio.
+- Rebuild the private canonical publication after a fact change, then reconcile Wealthfolio
+  from the reviewed canonical plan. Do not make an ad hoc app-only rename that will drift
+  from the system of record.
+
 ## Conventions
 
 - Python 3.11+, standard library preferred; keep dependencies minimal and justified
