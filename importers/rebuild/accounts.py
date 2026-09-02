@@ -10,6 +10,11 @@ from pathlib import Path
 
 from importers.facts.loader import load_facts
 from importers.facts.schema import AccountFact
+from importers.normalized.builder import (
+    ACCOUNT_COLUMNS,
+    BuildError,
+    verify_publication,
+)
 from importers.simplefin.client import parse_accounts
 
 from .decisions import DecisionError
@@ -36,9 +41,20 @@ class AccountPlan:
 
 
 def load_canonical_accounts(path: Path) -> dict[str, CanonicalAccount]:
+    try:
+        verify_publication(path.parent.parent.parent)
+    except (BuildError, OSError, json.JSONDecodeError) as exc:
+        raise DecisionError(f"canonical verification failed: {exc}") from exc
+
     result = {}
     with path.open(encoding="utf-8-sig", newline="") as source:
-        for row in csv.DictReader(source):
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != ACCOUNT_COLUMNS:
+            raise DecisionError("accounts.csv columns do not match canonical schema")
+        for row in reader:
+            tracking_mode = row["tracking_mode"].strip()
+            if tracking_mode not in {"TRANSACTIONS", "HOLDINGS"}:
+                raise DecisionError("accounts.csv contains invalid tracking_mode")
             if row["kind"] not in WEALTHFOLIO_TYPES:
                 continue
             result[row["account_id"]] = CanonicalAccount(
@@ -47,7 +63,7 @@ def load_canonical_accounts(path: Path) -> dict[str, CanonicalAccount]:
                 row["kind"],
                 bool(row["closed"]),
                 row["excluded"].casefold() == "true",
-                row.get("tracking_mode") or "TRANSACTIONS",
+                tracking_mode,
             )
     return result
 
