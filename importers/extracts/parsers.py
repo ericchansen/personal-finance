@@ -20,10 +20,13 @@ import csv
 import hashlib
 import io
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from finance_store.identity import read_ofx_statement_window
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,11 @@ class Extract:
     balance: Decimal | None
     balance_date: date | None
     transactions: list[ExtractTransaction] = field(default_factory=list)
+    # The statement period the file declares for itself, when it declares one.
+    # This is the institution's claim about coverage; it is deliberately not
+    # derived from the transactions, which only show what arrived.
+    statement_start: date | None = None
+    statement_end: date | None = None
 
 
 def _clean(value: str | None) -> str:
@@ -89,19 +97,27 @@ def _parse_date(value: str | None) -> date | None:
 
 
 def synthesize_id(account: str, when: date, amount: Decimal, description: str) -> str:
-    """Build a deterministic id for formats that supply none.
+    """Build the deterministic base of an id for formats that supply none.
 
-    Two identical purchases on the same day at the same merchant are genuinely
-    indistinguishable in a CSV, so they collapse to one id and the second looks
-    already-imported. That under-counts, which is the safer failure: adding a
-    row counter to separate them would instead re-number every row whenever an
-    overlapping range is exported, double-counting on each import. A missing row
-    is noticeable; a silent duplicate is not.
-
-    Prefer OFX wherever it is offered, which avoids the problem entirely.
+    The parser appends an occurrence ordinal for identical rows. That preserves
+    legitimate repeated transactions while keeping their order replay-stable
+    within one immutable export. Prefer OFX wherever offered because FITID avoids
+    this unavoidable CSV identity limitation.
     """
     payload = f"{account}|{when.isoformat()}|{amount}|{description.strip().lower()}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _synthetic_occurrence_id(
+    occurrences: Counter[str],
+    account: str,
+    when: date,
+    amount: Decimal,
+    description: str,
+) -> str:
+    base = synthesize_id(account, when, amount, description)
+    occurrences[base] += 1
+    return f"{base}:{occurrences[base]}"
 
 
 # --------------------------------------------------------------------------
@@ -123,6 +139,7 @@ def parse_ofx(text: str, source: str = "") -> Extract:
     balance = _parse_amount(_ofx_tag(text, "BALAMT"))
 
     transactions: list[ExtractTransaction] = []
+    synthetic_occurrences: Counter[str] = Counter()
     for block in re.findall(r"<STMTTRN>(.*?)</STMTTRN>", text, re.IGNORECASE | re.DOTALL):
         when = _parse_date(_ofx_tag(block, "DTPOSTED"))
         amount = _parse_amount(_ofx_tag(block, "TRNAMT"))
@@ -135,11 +152,31 @@ def parse_ofx(text: str, source: str = "") -> Extract:
                 date=when,
                 amount=amount,
                 description=description,
-                source_id=fitid or synthesize_id(account_id or "", when, amount, description),
+                source_id=fitid
+                or _synthetic_occurrence_id(
+                    synthetic_occurrences,
+                    account_id or "",
+                    when,
+                    amount,
+                    description,
+                ),
                 id_is_synthetic=not fitid,
                 kind=_ofx_tag(block, "TRNTYPE"),
             )
         )
+
+    statement_start: date | None = None
+    statement_end: date | None = None
+    try:
+        window = read_ofx_statement_window(text, account_id=account_id)
+    except ValueError:
+        # An absent, incoherent, or ambiguous window is simply not a declared
+        # window.  Parsing stays permissive so a usable export is still read;
+        # the authority builder is where an unusable window is refused.
+        window = None
+    if window is not None:
+        statement_start = window.statement_start
+        statement_end = window.statement_end
 
     return Extract(
         source=source,
@@ -149,6 +186,8 @@ def parse_ofx(text: str, source: str = "") -> Extract:
         balance=balance,
         balance_date=_parse_date(_ofx_tag(text, "DTASOF")),
         transactions=transactions,
+        statement_start=statement_start,
+        statement_end=statement_end,
     )
 
 
@@ -190,6 +229,7 @@ def parse_citi_csv(text: str, source: str = "", account_id: str | None = None) -
     So the column that is *present* decides, not the column that is non-zero.
     """
     transactions: list[ExtractTransaction] = []
+    synthetic_occurrences: Counter[str] = Counter()
     for row in _rows(text):
         when = _parse_date(row.get("Date"))
         if when is None:
@@ -210,7 +250,13 @@ def parse_citi_csv(text: str, source: str = "", account_id: str | None = None) -
                 date=when,
                 amount=amount,
                 description=description,
-                source_id=synthesize_id(account_id or source, when, amount, description),
+                source_id=_synthetic_occurrence_id(
+                    synthetic_occurrences,
+                    account_id or source,
+                    when,
+                    amount,
+                    description,
+                ),
                 id_is_synthetic=True,
                 kind=row.get("Status"),
             )
@@ -229,6 +275,7 @@ def parse_ally_csv(text: str, source: str = "", account_id: str | None = None) -
     why the download order has to be recorded at the time it is taken.
     """
     transactions: list[ExtractTransaction] = []
+    synthetic_occurrences: Counter[str] = Counter()
     for row in _rows(text):
         when = _parse_date(row.get("Date"))
         amount = _parse_amount(row.get("Amount"))
@@ -240,7 +287,13 @@ def parse_ally_csv(text: str, source: str = "", account_id: str | None = None) -
                 date=when,
                 amount=amount,
                 description=description,
-                source_id=synthesize_id(account_id or source, when, amount, description),
+                source_id=_synthetic_occurrence_id(
+                    synthetic_occurrences,
+                    account_id or source,
+                    when,
+                    amount,
+                    description,
+                ),
                 id_is_synthetic=True,
                 kind=row.get("Type"),
             )
@@ -264,11 +317,11 @@ def parse_fifth_third_csv(
     Rows arrive grouped by statement period rather than in date order, so
     nothing downstream may assume the file is sorted.
 
-    There is no transaction id, so one is synthesized. Two identical amounts to
-    the same payee on the same day therefore collapse into one, which
-    under-counts rather than double-counts.
+    There is no transaction id, so one is synthesized with an occurrence ordinal
+    to preserve identical same-day repeats inside the immutable export.
     """
     transactions: list[ExtractTransaction] = []
+    synthetic_occurrences: Counter[str] = Counter()
     for row in _rows(text):
         when = _parse_date(row.get("Date"))
         amount = _parse_amount(row.get("Amount"))
@@ -283,7 +336,13 @@ def parse_fifth_third_csv(
                 date=when,
                 amount=amount,
                 description=description,
-                source_id=synthesize_id(account_id or source, when, amount, description),
+                source_id=_synthetic_occurrence_id(
+                    synthetic_occurrences,
+                    account_id or source,
+                    when,
+                    amount,
+                    description,
+                ),
                 id_is_synthetic=True,
                 kind=None,
             )

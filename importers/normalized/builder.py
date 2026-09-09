@@ -11,14 +11,15 @@ import re
 import shutil
 import uuid
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field, fields
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
-from importers.extracts import parsers
 from importers.extracts import vanguard, vanguard_activity, vanguard_history
+from importers.extracts.correspondence import parse_mapped_extracts
 from importers.facts.loader import load_facts
 from importers.facts.schema import (
     AccountFact,
@@ -31,9 +32,24 @@ from importers.facts.schema import (
 )
 from importers.monarch.monarch import read_transactions
 from importers.simplefin.pipeline import exclusion_error, read_snapshot
+from importers.rebuild.decisions import DecisionError
+from importers.rebuild.safety import validate_private_output
 
-SCHEMA_VERSION = 4
-OUTPUT_NAMES = ("accounts.csv", "transactions.csv", "positions.csv", "valuations.csv")
+from finance_store.simplefin import detect_protocol_version
+from finance_store.source_admission import (
+    AdmissionError,
+    ConnectionAdmission,
+    evaluate_connection_scopes,
+    parse_connection_decisions,
+    partition_connection_errors,
+    partitioned_evidence_from_paths,
+)
+
+SCHEMA_VERSION = 5
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CSV_OUTPUT_NAMES = ("accounts.csv", "transactions.csv", "positions.csv", "valuations.csv")
+LINEAGE_OUTPUT_NAMES = ("transaction-observations.json", "transaction-lineage.json")
+OUTPUT_NAMES = (*CSV_OUTPUT_NAMES, *LINEAGE_OUTPUT_NAMES)
 ACCOUNT_COLUMNS = (
     "account_id", "institution", "name", "kind", "currency", "opened", "closed",
     "excluded", "exclusion_reason", "tracking_mode",
@@ -99,6 +115,29 @@ VALUATION_COLUMNS = (
 
 class BuildError(RuntimeError):
     """The inputs cannot safely produce a complete canonical estate."""
+
+
+def _validate_private_root(root: Path) -> None:
+    try:
+        validate_private_output(
+            root / "normalized" / "canonical",
+            root,
+            REPO_ROOT,
+        )
+    except DecisionError:
+        raise BuildError("canonical-private-output-invalid") from None
+
+
+@contextmanager
+def _decision_state_lock(root: Path) -> Iterable[None]:
+    from importers.lineage_review.model import ReviewError
+    from importers.lineage_review.workflow import decision_state_lock
+
+    try:
+        with decision_state_lock(root, REPO_ROOT):
+            yield
+    except (DecisionError, ReviewError) as exc:
+        raise BuildError(f"lineage-review-{exc}") from None
 
 
 @dataclass(frozen=True)
@@ -173,6 +212,9 @@ class Estate:
     source_stats: dict[str, int]
     transfer_review: dict[str, Any] = field(default_factory=dict)
     split_review: dict[str, Any] = field(default_factory=dict)
+    transaction_observations: dict[str, Any] = field(default_factory=dict)
+    transaction_lineage: dict[str, Any] = field(default_factory=dict)
+    lineage_review: dict[str, Any] = field(default_factory=dict)
 
 
 def _money(value: Decimal | int | str | None) -> str:
@@ -425,6 +467,7 @@ def _load_extracts(root: Path, estate: Estate, identity: IdentityMap) -> None:
     if not isinstance(entries, list):
         raise BuildError("extracts/mapping.json must contain a files list")
     estate.source_files.add(map_path)
+    specifications = []
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("file") or not entry.get("account"):
             raise BuildError("each extracts mapping entry requires file and account")
@@ -436,11 +479,22 @@ def _load_extracts(root: Path, estate: Estate, identity: IdentityMap) -> None:
         if path.suffix.casefold() not in {".csv", ".ofx", ".qfx"}:
             raise BuildError(f"unsupported mapped extract shape: {path}")
         account_id = identity.name(str(entry["account"]), str(path))
-        try:
-            extract = parsers.parse_file(path, account_id=account_id)
-        except ValueError as exc:
-            raise BuildError(str(exc)) from None
+        specifications.append((path, entry, account_id))
+    try:
+        parsed = parse_mapped_extracts(specifications, data_root=root)
+    except ValueError as exc:
+        raise BuildError(str(exc)) from None
+    for (path, _entry, account_id), corroborated in zip(
+        specifications, parsed, strict=True
+    ):
+        extract = corroborated.extract
         estate.source_files.add(path)
+        estate.source_files.update(corroborated.supporting_files)
+        if corroborated.description_evidence:
+            estate.source_stats["bankCorroboratedDescriptions"] = (
+                estate.source_stats.get("bankCorroboratedDescriptions", 0)
+                + len(corroborated.description_evidence)
+            )
         source = _source_path(path, root)
         for txn in extract.transactions:
             prefix = "synthetic" if txn.id_is_synthetic else "stable"
@@ -455,72 +509,202 @@ def _load_extracts(root: Path, estate: Estate, identity: IdentityMap) -> None:
             ))
 
 
+def _admitted_simplefin_snapshots(
+    candidates: list[Path],
+    mapping_doc: dict[str, Any],
+) -> list[tuple[str, Path, ConnectionAdmission, tuple[str, ...], tuple[str, ...]]]:
+    """The accounts each institution may contribute, one verdict per scope.
+
+    Scopes are selected independently: an institution whose newest snapshot is
+    clean keeps advancing even while a sibling institution is failing over to
+    its last verified immutable snapshot under an explicit durable decision.
+    SimpleFIN v1 carries every institution in one file with no connection
+    object, so the unit of selection is the *account subset* belonging to one
+    organization, never the whole file — otherwise one failing institution
+    would freeze thirty healthy ones, or thirty healthy ones would paper over
+    the failure.
+    """
+
+    def view(path: Path) -> tuple[str, list[dict[str, Any]], list[str]]:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        version = detect_protocol_version(document)
+        payload = (
+            document.get("data")
+            if version == "2" and isinstance(document.get("data"), dict)
+            else document
+        )
+        rows = payload.get("accounts") if isinstance(payload, dict) else None
+        return (
+            version,
+            [row for row in (rows or []) if isinstance(row, dict)],
+            list(read_snapshot(path)[1]),
+        )
+
+    try:
+        decisions = parse_connection_decisions(mapping_doc.get("connections"))
+        evidence = partitioned_evidence_from_paths(
+            candidates,
+            fallback=datetime.now(timezone.utc),
+            view_for=view,
+        )
+        scopes = evaluate_connection_scopes(
+            evidence.grouped, decisions, as_of=datetime.now(timezone.utc)
+        )
+    except AdmissionError as exc:
+        raise BuildError(f"SimpleFIN connection evidence unusable: {exc}") from None
+    if scopes.blockers:
+        blocked = [item for item in scopes.admissions if item.blocker]
+        detail = "; ".join(
+            f"{item.connection_id}: "
+            + ("; ".join(item.current_errors) or "no clean evidence")
+            + f" ({item.blocker})"
+            for item in blocked
+        )
+        raise BuildError(f"SimpleFIN connection not admitted: {detail}")
+    admitted: list[
+        tuple[str, Path, ConnectionAdmission, tuple[str, ...], tuple[str, ...]]
+    ] = []
+    for item in scopes.admitted:
+        key = (item.connection_id, item.admitted_snapshot_sha256 or "")
+        path = evidence.paths.get(key)
+        if path is None:
+            raise BuildError(
+                f"SimpleFIN connection {item.connection_id}: admitted snapshot missing"
+            )
+        scoped_errors = next(
+            (
+                entry.errors
+                for entry in evidence.grouped.get(item.connection_id, ())
+                if entry.snapshot_sha256 == item.admitted_snapshot_sha256
+            ),
+            (),
+        )
+        admitted.append(
+            (
+                item.connection_id,
+                path,
+                item,
+                evidence.accounts.get(key, ()),
+                scoped_errors,
+            )
+        )
+    if not admitted:
+        raise BuildError("no SimpleFIN connection produced admissible evidence")
+    return admitted
+
+
 def _load_simplefin(root: Path, estate: Estate, identity: IdentityMap) -> None:
     candidates = sorted((root / "raw" / "simplefin").rglob("simplefin-*.json"))
     if not candidates:
         raise BuildError("no immutable SimpleFIN snapshot found under raw/simplefin")
-    snapshot = candidates[-1]
     mapping_path = root / "simplefin" / "account-map.json"
     mapping_doc = _load_json(mapping_path)
     if mapping_doc.get("version") != 1 or not isinstance(mapping_doc.get("accounts"), dict):
         raise BuildError("simplefin/account-map.json must have version 1 and accounts")
-    accounts, errors = read_snapshot(snapshot)
-    if errors:
-        raise BuildError("latest SimpleFIN snapshot has institution errors: " + "; ".join(errors))
     mapping = mapping_doc["accounts"]
-    accounts_by_id = {account.id: account for account in accounts}
-    estate.source_files.update({snapshot, mapping_path})
-    source = _source_path(snapshot, root)
-    for account in accounts:
-        entry = mapping.get(account.id)
-        if not isinstance(entry, dict):
-            raise BuildError(f"{source}: SimpleFIN source account is unmapped")
-        action = entry.get("action", "import")
-        if action == "import":
-            # assertionAccountId is the facts-layer identity. The Wealthfolio
-            # target is only an app routing detail and can outlive its account fact.
-            account_id = identity.id(
-                str(entry.get("assertionAccountId") or entry.get("wealthfolioAccountId") or ""),
-                source,
+    estate.source_files.add(mapping_path)
+    seen_source_accounts: dict[str, str] = {}
+    admitted_scopes = _admitted_simplefin_snapshots(candidates, mapping_doc)
+    scoped: list[tuple[str, str, Any]] = []
+    accounts_by_id: dict[str, Any] = {}
+    for connection_id, snapshot, admission, scope_accounts, scope_errors in (
+        admitted_scopes
+    ):
+        accounts, _ = read_snapshot(snapshot)
+        # Only this institution's accounts: the same file is usually also the
+        # admitted evidence for every sibling institution, each of which
+        # contributes its own subset.  Merging whole files here would load
+        # every account once per scope.
+        admissible = set(scope_accounts)
+        accounts = [account for account in accounts if account.id in admissible]
+        _, actionable = partition_connection_errors(scope_errors)
+        if actionable and admission.fresh:
+            raise BuildError(
+                f"SimpleFIN connection {connection_id} snapshot has institution errors: "
+                + "; ".join(actionable)
             )
-        elif action == "monitor":
-            account_id = identity.id(
-                str(entry.get("assertionAccountId") or entry.get("wealthfolioAlternativeAssetId") or ""),
-                source,
+        estate.source_files.add(snapshot)
+        source = _source_path(snapshot, root)
+        if admission.stale:
+            estate.warnings.append(
+                f"{source}: SimpleFIN connection {connection_id} admitted stale "
+                f"evidence ({admission.staleness_days} days old)"
             )
-        elif action == "observe":
-            account_id = identity.id(str(entry.get("assertionAccountId") or ""), source)
-        elif action == "exclude":
-            error = exclusion_error(account, entry, accounts_by_id, mapping)
-            if error:
-                raise BuildError(f"{source}: unsafe SimpleFIN exclusion: {error}")
-            try:
-                account_id = identity.name(account.name, source)
-            except BuildError:
-                account_id = identity.excluded_source(account.name, account.org, source)
-        else:
-            raise BuildError(f"{source}: unsupported SimpleFIN mapping action {action!r}")
-        if account.balance_date:
-            estate.valuations.append(ValuationRow(
-                account.balance_date.isoformat(), account_id, _money(account.balance),
-                account.currency, source, "observed",
-            ))
-        if action not in {"import", "exclude"}:
-            if account.transactions:
-                estate.warnings.append(
-                    f"{source}: {len(account.transactions)} transactions omitted for {action} account "
-                    f"{account_id}"
+        for account in accounts:
+            owner = seen_source_accounts.setdefault(account.id, connection_id)
+            if owner != connection_id:
+                raise BuildError(
+                    f"{source}: SimpleFIN source account appears in connections "
+                    f"{owner} and {connection_id}"
                 )
-            continue
-        for txn in account.transactions:
-            estate.transactions.append(_transaction(
-                identity, txn.posted, account_id, txn.amount, txn.description,
-                f"simplefin:{account.id}:{txn.id}", source, "",
-                excluded=txn.pending or action == "exclude",
-                reason="pending transaction" if txn.pending else (
-                    identity.accounts[account_id].exclusion_reason if action == "exclude" else ""
-                ),
-            ))
+            # Duplicate references resolve against admitted evidence only, so
+            # an exclusion can never be justified by an account of a snapshot
+            # no scope admitted.
+            accounts_by_id[account.id] = account
+            scoped.append((connection_id, source, account))
+    for connection_id, source, account in scoped:
+        _load_simplefin_account(
+            account, mapping, accounts_by_id, estate, identity, source
+        )
+
+
+def _load_simplefin_account(
+    account: Any,
+    mapping: dict[str, Any],
+    accounts_by_id: dict[str, Any],
+    estate: Estate,
+    identity: IdentityMap,
+    source: str,
+) -> None:
+    entry = mapping.get(account.id)
+    if not isinstance(entry, dict):
+        raise BuildError(f"{source}: SimpleFIN source account is unmapped")
+    action = entry.get("action", "import")
+    if action == "import":
+        # assertionAccountId is the facts-layer identity. The Wealthfolio
+        # target is only an app routing detail and can outlive its account fact.
+        account_id = identity.id(
+            str(entry.get("assertionAccountId") or entry.get("wealthfolioAccountId") or ""),
+            source,
+        )
+    elif action == "monitor":
+        account_id = identity.id(
+            str(entry.get("assertionAccountId") or entry.get("wealthfolioAlternativeAssetId") or ""),
+            source,
+        )
+    elif action == "observe":
+        account_id = identity.id(str(entry.get("assertionAccountId") or ""), source)
+    elif action == "exclude":
+        error = exclusion_error(account, entry, accounts_by_id, mapping)
+        if error:
+            raise BuildError(f"{source}: unsafe SimpleFIN exclusion: {error}")
+        try:
+            account_id = identity.name(account.name, source)
+        except BuildError:
+            account_id = identity.excluded_source(account.name, account.org, source)
+    else:
+        raise BuildError(f"{source}: unsupported SimpleFIN mapping action {action!r}")
+    if account.balance_date:
+        estate.valuations.append(ValuationRow(
+            account.balance_date.isoformat(), account_id, _money(account.balance),
+            account.currency, source, "observed",
+        ))
+    if action not in {"import", "exclude"}:
+        if account.transactions:
+            estate.warnings.append(
+                f"{source}: {len(account.transactions)} transactions omitted for {action} account "
+                f"{account_id}"
+            )
+        return
+    for txn in account.transactions:
+        estate.transactions.append(_transaction(
+            identity, txn.posted, account_id, txn.amount, txn.description,
+            f"simplefin:{account.id}:{txn.id}", source, "",
+            excluded=txn.pending or action == "exclude",
+            reason="pending transaction" if txn.pending else (
+                identity.accounts[account_id].exclusion_reason if action == "exclude" else ""
+            ),
+        ))
 
 
 def _load_ledger(root: Path, estate: Estate, identity: IdentityMap) -> None:
@@ -1351,25 +1535,30 @@ def _deduplicate(estate: Estate) -> None:
             )
             by_content.setdefault(key, []).append(row)
         collision = len(by_content) > 1
+        claim_hash = _stable_digest(
+            {"accountId": account_id, "sourceId": source_id}
+        )
         if collision:
             estate.warnings.append(
-                f"conflicting-source-id: {account_id} {source_id}; retained "
-                f"{len(by_content)} distinct rows with deterministic suffixes"
+                f"conflicting-source-id: claim={claim_hash} "
+                f"retained={len(by_content)}"
             )
         for content, copies in sorted(by_content.items(), key=lambda item: item[0]):
             kept = copies[0]
             if collision:
-                suffix = hashlib.sha256(
-                    json.dumps(content, separators=(",", ":"), default=str).encode()
-                ).hexdigest()[:16]
+                from importers.lineage_review.canonical import (
+                    source_collision_suffix,
+                )
+
+                suffix = source_collision_suffix(asdict(kept))
                 kept = TransactionRow(**{
                     **asdict(kept), "source_id": f"{source_id}:collision:{suffix}"
                 })
             selected.append(kept)
-            for duplicate in copies[1:]:
+            if len(copies) > 1:
                 estate.warnings.append(
-                    f"duplicate-source-id: {account_id} {source_id}; "
-                    f"kept {kept.source_file}, also seen in {duplicate.source_file}"
+                    f"duplicate-source-replay: claim={claim_hash} "
+                    f"observations={len(copies)} canonical=1"
                 )
     estate.transactions = selected
 
@@ -1380,71 +1569,35 @@ def _deduplicate(estate: Estate) -> None:
             row.symbol, row.quantity, row.price,
         )
         fingerprints.setdefault(key, []).append(row)
-    canonical: list[TransactionRow] = []
     for rows in fingerprints.values():
-        if len(rows) == 1:
-            canonical.extend(rows)
+        if len(rows) < 2:
             continue
-
         by_file: dict[str, list[TransactionRow]] = defaultdict(list)
         for row in rows:
             by_file[row.source_file].append(row)
-        # Two identical rows inside one source may be two real same-day
-        # purchases. Only collapse when every source contributed at most one
-        # row, so the cross-source match is one-to-one rather than guessed.
-        if len(by_file) < 2 or any(len(copies) > 1 for copies in by_file.values()):
-            sample = sorted(rows, key=_transaction_sort)[0]
-            estate.warnings.append(
-                f"ambiguous-cross-source-duplicate: {sample.account_id} {sample.date} "
-                f"{sample.amount}; retained {len(rows)} rows"
-            )
-            canonical.extend(rows)
+        if len(by_file) < 2:
             continue
-
-        preferred = min(rows, key=lambda row: (_source_priority(row), _transaction_sort(row)))
-        monarch_category = next(
-            (
-                row.category
-                for row in rows
-                if row.source_id.startswith("monarch:") and row.category
-            ),
-            "",
+        candidate_hash = _stable_digest(
+            sorted(
+                [
+                    {
+                        "accountId": row.account_id,
+                        "sourceId": row.source_id,
+                        "sourceFile": row.source_file,
+                    }
+                    for row in rows
+                ],
+                key=lambda item: (
+                    item["accountId"],
+                    item["sourceId"],
+                    item["sourceFile"],
+                ),
+            )
         )
-        transfer_group = next((row.transfer_group for row in rows if row.transfer_group), "")
-        kept = TransactionRow(
-            **{
-                **asdict(preferred),
-                # Direct files and SimpleFIN have stronger identity but often
-                # no spending category. Preserve Monarch's category as
-                # enrichment without retaining its duplicate money movement.
-                "category": monarch_category or preferred.category,
-                "transfer_group": transfer_group or preferred.transfer_group,
-            }
-        )
-        canonical.append(kept)
         estate.warnings.append(
-            f"cross-source-deduplicated: {kept.account_id} {kept.date} "
-            f"{kept.amount}; kept {kept.source_file}, matched "
-            f"{','.join(sorted(path for path in by_file if path != kept.source_file))}"
+            f"unresolved-cross-source-candidate: group={candidate_hash} "
+            f"observations={len(rows)}"
         )
-    estate.transactions = canonical
-
-
-def _source_priority(row: TransactionRow) -> int:
-    """Prefer the strongest identity when one transaction appears in sources."""
-    if row.source_id.startswith("extract:stable:"):
-        return 0
-    if row.source_id.startswith("simplefin:"):
-        return 1
-    if row.source_id.startswith("extract:synthetic:"):
-        return 2
-    if row.source_id.startswith("ledger:"):
-        return 2
-    if row.source_id.startswith("vanguard-history:"):
-        return 0
-    if row.source_id.startswith("monarch:"):
-        return 3
-    return 4
 
 
 def _verify_assertions(estate: Estate, facts: list[Any], root: Path) -> None:
@@ -1476,13 +1629,50 @@ def _transaction_sort(row: TransactionRow) -> tuple[str, ...]:
 
 def _finish(estate: Estate, facts: list[Any], root: Path) -> Estate:
     _apply_decisions(estate, facts, IdentityMap(estate.accounts))
+    source_observations = list(estate.transactions)
     _deduplicate(estate)
     _apply_transfer_review_decisions(estate, facts)
+    from importers.lineage_review.canonical import project
+    from importers.lineage_review.model import ReviewError
+
+    try:
+        source_artifact_hashes = {
+            _source_path(path, root): _sha256(path)
+            for path in estate.source_files
+        }
+        lineage = project(
+            root,
+            estate.transactions,
+            source_observations,
+            facts,
+            repo_root=Path(__file__).resolve().parents[2],
+            legacy_transfer_review=estate.transfer_review,
+            source_artifact_hashes=source_artifact_hashes,
+        )
+    except ReviewError as exc:
+        raise BuildError(f"lineage-review-{exc}") from None
+    estate.transactions = [
+        TransactionRow(**row) for row in lineage["rows"]
+    ]
+    estate.transaction_observations = lineage["observations"]
+    estate.transaction_lineage = lineage["lineage"]
+    estate.lineage_review = lineage["summary"]
+    estate.source_files.update(lineage["sourcePaths"])
     _apply_transaction_semantics(estate)
     _apply_exact_splits(estate, facts)
     _verify_assertions(estate, facts, root)
     estate.accounts.sort(key=lambda row: row.account_id)
     estate.transactions.sort(key=_transaction_sort)
+    from importers.lineage_review.canonical import bind_transaction_rows
+
+    try:
+        estate.transaction_lineage = bind_transaction_rows(
+            estate.transaction_lineage,
+            estate.transaction_observations,
+            estate.transactions,
+        )
+    except ReviewError as exc:
+        raise BuildError(f"lineage-review-{exc}") from None
     estate.positions.sort(key=lambda row: (
         row.as_of, row.account_id, row.symbol, row.source_file, row.quantity,
     ))
@@ -1523,6 +1713,24 @@ def _data_documents(estate: Estate) -> dict[str, bytes]:
         "transactions.csv": _csv_bytes(estate.transactions, TRANSACTION_COLUMNS),
         "positions.csv": _csv_bytes(estate.positions, POSITION_COLUMNS),
         "valuations.csv": _csv_bytes(estate.valuations, VALUATION_COLUMNS),
+        "transaction-observations.json": (
+            json.dumps(
+                estate.transaction_observations,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
+        "transaction-lineage.json": (
+            json.dumps(
+                estate.transaction_lineage,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
     }
 
 
@@ -1542,12 +1750,14 @@ def _summary(estate: Estate, root: Path) -> dict[str, Any]:
         "sourceStats": dict(sorted(estate.source_stats.items())),
         "transferReview": estate.transfer_review,
         "splitReview": estate.split_review,
+        "lineageReview": estate.lineage_review,
         "warnings": estate.warnings,
     }
 
 
 def plan(data_dir: str | Path) -> dict[str, Any]:
     root = Path(data_dir)
+    _validate_private_root(root)
     return _summary(collect(root), root)
 
 
@@ -1556,6 +1766,17 @@ def build(
     before_swap: Any | None = None,
 ) -> dict[str, Any]:
     root = Path(data_dir)
+    _validate_private_root(root)
+    with _decision_state_lock(root):
+        return _build_locked(root, now=now, before_swap=before_swap)
+
+
+def _build_locked(
+    root: Path,
+    *,
+    now: datetime | None,
+    before_swap: Any | None,
+) -> dict[str, Any]:
     estate = collect(root)
     documents = _data_documents(estate)
     canonical = root / "normalized" / "canonical"
@@ -1610,13 +1831,16 @@ def _read_csv(path: Path, columns: tuple[str, ...]) -> list[dict[str, str]]:
 def verify_publication(data_dir: str | Path) -> dict[str, Any]:
     """Verify the published canonical manifest, sources, and data files."""
     root = Path(data_dir)
+    _validate_private_root(root)
     canonical = root / "normalized" / "canonical"
     manifest_path = canonical / "manifest.json"
     manifest = _load_json(manifest_path)
     if not isinstance(manifest, dict):
         raise BuildError("manifest must be an object")
-    if manifest.get("schemaVersion") != SCHEMA_VERSION:
+    publication_version = manifest.get("schemaVersion")
+    if publication_version not in {4, SCHEMA_VERSION}:
         raise BuildError("manifest schema version is unsupported")
+    legacy_version = publication_version == 4
     source_files = manifest.get("sourceFiles")
     if not isinstance(source_files, list):
         raise BuildError("manifest sourceFiles must be a list")
@@ -1641,7 +1865,8 @@ def verify_publication(data_dir: str | Path) -> dict[str, Any]:
         "valuations.csv": VALUATION_COLUMNS,
     }
     data_files = manifest.get("dataFiles")
-    if not isinstance(data_files, dict) or set(data_files) != set(schemas):
+    expected_outputs = set(CSV_OUTPUT_NAMES if legacy_version else OUTPUT_NAMES)
+    if not isinstance(data_files, dict) or set(data_files) != expected_outputs:
         raise BuildError("manifest dataFiles does not match the canonical schema")
     rows: dict[str, list[dict[str, str]]] = {}
     for name, columns in schemas.items():
@@ -1650,12 +1875,17 @@ def verify_publication(data_dir: str | Path) -> dict[str, Any]:
         if not path.exists() or _sha256(path) != expected:
             raise BuildError(f"canonical data hash mismatch: {name}")
         rows[name] = _read_csv(path, columns)
+    if not legacy_version:
+        for name in LINEAGE_OUTPUT_NAMES:
+            path = canonical / name
+            if not path.is_file() or _sha256(path) != data_files.get(name):
+                raise BuildError(f"canonical data hash mismatch: {name}")
     expected_counts = manifest.get("rowCounts")
     if not isinstance(expected_counts, dict) or set(expected_counts) != {
-        name.removesuffix(".csv") for name in OUTPUT_NAMES
+        name.removesuffix(".csv") for name in CSV_OUTPUT_NAMES
     }:
         raise BuildError("manifest rowCounts does not match the canonical schema")
-    for name in OUTPUT_NAMES:
+    for name in CSV_OUTPUT_NAMES:
         key = name.removesuffix(".csv")
         if len(rows[name]) != expected_counts.get(key):
             raise BuildError(f"row count mismatch: {name}")
@@ -1789,9 +2019,36 @@ def verify_publication(data_dir: str | Path) -> dict[str, Any]:
     for row in rows["valuations.csv"]:
         date.fromisoformat(row["date"])
         _money(row["value"])
+    if not legacy_version:
+        from importers.lineage_review.canonical import validate_documents
+        from importers.lineage_review.model import ReviewError
+
+        observations = _load_json(canonical / "transaction-observations.json")
+        lineage = _load_json(canonical / "transaction-lineage.json")
+        try:
+            validate_documents(
+                observations,
+                lineage,
+                rows["transactions.csv"],
+            )
+        except ReviewError as exc:
+            raise BuildError(f"lineage-review-{exc}") from None
+        if manifest.get("lineageReview") != {
+            "schemaVersion": lineage["schemaVersion"],
+            "queuePublicationId": lineage.get("queuePublicationId"),
+            "decisionPublicationId": lineage.get("decisionPublicationId"),
+            "baselinePublicationId": lineage.get("baselinePublicationId"),
+            "forensicPublicationId": lineage.get("forensicPublicationId"),
+            "candidateGraphHash": lineage.get("candidateGraphHash"),
+            "identityPolicy": lineage.get("identityPolicy"),
+            "counts": lineage.get("counts"),
+        }:
+            raise BuildError(
+                "manifest lineageReview does not match lineage publication"
+            )
     return {
         "verified": True,
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": publication_version,
         "rowCounts": expected_counts,
         "warnings": manifest.get("warnings", []),
     }
@@ -1799,9 +2056,23 @@ def verify_publication(data_dir: str | Path) -> dict[str, Any]:
 
 def verify(data_dir: str | Path) -> dict[str, Any]:
     root = Path(data_dir)
+    _validate_private_root(root)
+    with _decision_state_lock(root):
+        return _verify_locked(root)
+
+
+def _verify_locked(root: Path) -> dict[str, Any]:
     canonical = root / "normalized" / "canonical"
     result = verify_publication(root)
+    if result["schemaVersion"] != SCHEMA_VERSION:
+        raise BuildError(
+            f"canonical publication schema {result['schemaVersion']} requires rebuild"
+        )
     recomputed = collect(root)
+    manifest = _load_json(canonical / "manifest.json")
+    expected_summary = _summary(recomputed, root)
+    if any(manifest.get(key) != value for key, value in expected_summary.items()):
+        raise BuildError("canonical manifest differs from recomputed provenance")
     documents = _data_documents(recomputed)
     for name, content in documents.items():
         if (canonical / name).read_bytes() != content:

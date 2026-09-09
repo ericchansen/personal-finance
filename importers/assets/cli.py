@@ -129,7 +129,9 @@ def main() -> int:
         print("\ndry run; nothing sent")
         return 0
 
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(
+        args.base_url, writer_data_dir=data_dir
+    )
     if not client.health():
         raise SystemExit(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(read_password(data_dir))

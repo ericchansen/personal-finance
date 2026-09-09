@@ -33,7 +33,8 @@ ALLOWED_PATTERNS = (
 # Extensions worth scanning the contents of.
 TEXT_SUFFIXES = {
     ".py", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".yml", ".yaml",
-    ".md", ".toml", ".ini", ".cfg", ".sh", ".ps1", ".txt", ".env", "",
+    ".md", ".toml", ".ini", ".cfg", ".sh", ".ps1", ".txt", ".env", ".sql",
+    ".example", "",
 }
 
 SECRET_RULES: list[tuple[str, re.Pattern[str]]] = [

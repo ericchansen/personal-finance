@@ -1,0 +1,72 @@
+name: personal-finance-postgres-shadow-authority-restore-rehearsal
+
+x-postgres-image: &postgres-image
+  image: "${POSTGRES_IMAGE:-postgres:17.11-bookworm@sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0}"
+
+services:
+  rehearsal-db:
+    <<: *postgres-image
+    container_name: personal-finance-postgres-shadow-authority-restore-rehearsal-db
+    environment:
+      POSTGRES_DB: finance_shadow_restore_rehearsal
+      POSTGRES_USER: finance_shadow_restore_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_rehearsal_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --data-checksums"
+    secrets:
+      - postgres_rehearsal_password
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks:
+      - postgres_shadow_rehearsal_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+  restore-rehearsal:
+    <<: *postgres-image
+    depends_on:
+      rehearsal-db:
+        condition: service_healthy
+    environment:
+      PGHOST: rehearsal-db
+      PGPORT: "5432"
+      PGDATABASE: finance_shadow_restore_rehearsal
+      PGUSER: finance_shadow_restore_admin
+      PGPASSWORD_FILE: /run/secrets/postgres_rehearsal_password
+      LOADER_PASSWORD_FILE: /run/secrets/postgres_rehearsal_password
+      AGENT_PASSWORD_FILE: /run/secrets/postgres_rehearsal_password
+      BACKUP_PASSWORD_FILE: /run/secrets/postgres_rehearsal_password
+      BACKUP_BASENAME: "${BACKUP_BASENAME:?Set BACKUP_BASENAME to a verified backup basename}"
+      FINANCE_SHADOW_ENVIRONMENT: "${FINANCE_SHADOW_ENVIRONMENT:-shadow-authority-v1}"
+    secrets:
+      - postgres_rehearsal_password
+    volumes:
+      - "./scripts:/scripts:ro"
+      - "./migrations:/migrations:ro"
+      - type: bind
+        source: "${POSTGRES_BACKUP_DIR:?Set POSTGRES_BACKUP_DIR outside the repository}"
+        target: /backups
+        read_only: true
+    networks:
+      - postgres_shadow_rehearsal_internal
+    entrypoint: ["/bin/sh", "/scripts/restore-rehearsal.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+secrets:
+  postgres_rehearsal_password:
+    file: "${POSTGRES_REHEARSAL_PASSWORD_FILE:?Set POSTGRES_REHEARSAL_PASSWORD_FILE to an external secret}"
+
+networks:
+  postgres_shadow_rehearsal_internal:
+    name: personal-finance-postgres-shadow-authority-restore-rehearsal-internal
+    internal: true

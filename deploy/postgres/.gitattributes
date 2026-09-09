@@ -1,0 +1,4 @@
+**/*.sh text eol=lf
+migrations/000[5-9]_*.sql text eol=lf
+migrations/00[1-9][0-9]_*.sql text eol=lf
+integration/*.sql text eol=lf

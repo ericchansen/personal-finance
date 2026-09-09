@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/private-lineage-review-decision.schema.json",
+  "title": "Private lineage review decision import",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "environmentFingerprint",
+    "baselinePublicationId",
+    "forensicPublicationId",
+    "candidateGraphHash",
+    "queueInputHash",
+    "evidenceFiles",
+    "decisions"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "kind": {"const": "lineage-review-decisions"},
+    "environmentFingerprint": {"$ref": "#/$defs/hash"},
+    "baselinePublicationId": {"$ref": "#/$defs/hash"},
+    "forensicPublicationId": {"$ref": "#/$defs/hash"},
+    "candidateGraphHash": {"$ref": "#/$defs/hash"},
+    "queueInputHash": {"$ref": "#/$defs/hash"},
+    "evidenceFiles": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidenceFile"}
+    },
+    "decisions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/decision"}
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activityRef", "fingerprint"],
+      "properties": {
+        "activityRef": {"$ref": "#/$defs/hash"},
+        "fingerprint": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "evidenceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "kind",
+        "size",
+        "coversCandidateGroupIds"
+      ],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/hash"},
+        "kind": {
+          "enum": [
+            "backup-manifest",
+            "review-evidence",
+            "rollback-plan",
+            "rollback-receipt"
+          ]
+        },
+        "size": {"type": "integer", "minimum": 0},
+        "coversCandidateGroupIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/hash"}
+        }
+      }
+    },
+    "receiptBinding": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["applicationPlanSha256", "receiptSha256"],
+      "properties": {
+        "applicationPlanSha256": {"$ref": "#/$defs/hash"},
+        "receiptSha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "reconciliationBinding": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["fingerprints"],
+      "properties": {
+        "fingerprints": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/hash"}
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "decisionId",
+        "candidateGroupId",
+        "decisionType",
+        "reviewer",
+        "decidedAt",
+        "rationale",
+        "environmentFingerprint",
+        "baselinePublicationId",
+        "forensicPublicationId",
+        "candidateGraphHash",
+        "candidateGroupHash",
+        "cardinality",
+        "reasonCodes",
+        "sourceFamilyCounts",
+        "memberActivityFingerprints",
+        "evidenceHashes",
+        "expectedDependentStateFingerprints",
+        "rollbackEvidenceHashes"
+      ],
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "decisionId": {
+          "type": "string",
+          "pattern": "^lineage-decision-[0-9a-f]{24}$"
+        },
+        "candidateGroupId": {"$ref": "#/$defs/hash"},
+        "decisionType": {
+          "enum": [
+            "same-economic-event",
+            "distinct-events",
+            "linked-transfer",
+            "account-handoff-reissue",
+            "defer-insufficient-evidence",
+            "source-error-mirror",
+            "receipt-binding-resolution"
+          ]
+        },
+        "reviewer": {"type": "string", "minLength": 3},
+        "decidedAt": {"type": "string", "format": "date-time"},
+        "rationale": {"type": "string", "minLength": 20},
+        "environmentFingerprint": {"$ref": "#/$defs/hash"},
+        "baselinePublicationId": {"$ref": "#/$defs/hash"},
+        "forensicPublicationId": {"$ref": "#/$defs/hash"},
+        "candidateGraphHash": {"$ref": "#/$defs/hash"},
+        "candidateGroupHash": {"$ref": "#/$defs/hash"},
+        "cardinality": {
+          "enum": ["one-to-one", "one-to-many", "many-to-many", "receipt-binding"]
+        },
+        "reasonCodes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-z0-9-]+$"}
+        },
+        "sourceFamilyCounts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "memberActivityFingerprints": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/fingerprint"}
+        },
+        "evidenceHashes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/hash"}
+        },
+        "expectedDependentStateFingerprints": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/fingerprint"}
+        },
+        "rollbackEvidenceHashes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/hash"}
+        },
+        "survivorActivityRef": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "linkedActivityRefs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/hash"}
+        },
+        "receiptBinding": {"$ref": "#/$defs/receiptBinding"},
+        "reconciliationBinding": {
+          "$ref": "#/$defs/reconciliationBinding"
+        }
+      }
+    }
+  }
+}

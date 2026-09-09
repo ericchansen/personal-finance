@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from io import BytesIO
@@ -372,6 +373,17 @@ def test_fetch_persists_exact_immutable_dated_raw_json(tmp_path):
     assert path.parent == tmp_path / "raw" / "simplefin" / "2026-08-27"
     assert path.read_bytes() == body
     assert payload == {"accounts": [], "errors": []}
+    metadata_path = path.with_name(
+        f"request-{path.stem.removeprefix('simplefin-')}.json"
+    )
+    assert json.loads(metadata_path.read_text(encoding="utf-8")) == {
+        "schemaVersion": 1,
+        "protocolVersion": 1,
+        "snapshotSha256": hashlib.sha256(body).hexdigest(),
+        "requestedStart": "2026-05-30",
+        "requestedEnd": "2026-08-27",
+        "pendingIncluded": True,
+    }
 
 
 def test_history_above_90_days_is_rejected_before_network_access(tmp_path):

@@ -19,18 +19,32 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "monarch"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from client import SimpleFinError, claim_access_url, fetch, parse_accounts  # noqa: E402
-from pipeline import (  # noqa: E402
+from importers.monarch.wealthfolio_client import WealthfolioClient  # noqa: E402
+from importers.simplefin.client import (  # noqa: E402
+    SimpleFinError,
+    claim_access_url,
+    fetch,
+    parse_accounts,
+)
+from importers.simplefin.collection_status import (  # noqa: E402
+    build_failure_receipt,
+    build_receipt,
+    write_receipt,
+)
+from finance_store.simplefin import detect_protocol_version  # noqa: E402
+from importers.simplefin.pipeline import (  # noqa: E402
     DEFAULT_HISTORY_DAYS,
     MAX_HISTORY_DAYS,
     PipelineError,
@@ -41,7 +55,6 @@ from pipeline import (  # noqa: E402
     load_mapping,
     write_plan,
 )
-from wealthfolio_client import WealthfolioClient  # noqa: E402
 
 
 def access_path(data_dir: Path) -> Path:
@@ -157,9 +170,14 @@ def cmd_pull_plan(args) -> int:
         read_access_url(data_dir),
         days=args.days,
     )
+    detected_version = detect_protocol_version(payload)
+    if detected_version != getattr(args, "protocol_version", "1"):
+        raise PipelineError(
+            "SimpleFIN response protocol version does not match the pinned version"
+        )
     accounts, errors = parse_accounts(payload)
 
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     ledger_error = None
     activities = []
     alternative_holdings = []
@@ -209,6 +227,65 @@ def cmd_pull_plan(args) -> int:
     return 0 if plan["ready"] else 2
 
 
+def cmd_pull_snapshot(args) -> int:
+    """Fetch immutable source evidence without reading or writing Wealthfolio."""
+    data_dir = Path(args.data_dir)
+    observed_at = datetime.now(timezone.utc)
+    release_commit = os.environ.get("FINANCE_RELEASE_COMMIT", "")
+    snapshot = None
+    try:
+        snapshot, payload = fetch_snapshot(
+            data_dir,
+            read_access_url(data_dir),
+            days=args.days,
+        )
+        detected_version = detect_protocol_version(payload)
+        if detected_version != getattr(args, "protocol_version", "1"):
+            raise PipelineError(
+                "SimpleFIN response protocol version does not match the pinned version"
+            )
+        accounts, errors = parse_accounts(payload)
+        receipt = build_receipt(
+            data_dir,
+            snapshot,
+            payload,
+            requested_days=args.days,
+            observed_at=observed_at,
+            release_commit=release_commit,
+        )
+    except (SimpleFinError, PipelineError, ValueError) as exc:
+        failure = build_failure_receipt(
+            requested_days=args.days,
+            observed_at=observed_at,
+            release_commit=release_commit,
+            error_code=type(exc).__name__,
+            snapshot=snapshot,
+        )
+        receipt_path = write_receipt(data_dir, failure)
+        raise PipelineError(
+            f"source collection failed; receipt retained at {receipt_path}"
+        ) from None
+    receipt_path = write_receipt(data_dir, receipt)
+    print(
+        json.dumps(
+            {
+                "accountCount": len(accounts),
+                "institutionErrorCount": len(errors),
+                "inputSetHash": receipt["inputSetHash"],
+                "missingExpectedAccountCount": receipt["inventory"][
+                    "missingExpectedCount"
+                ],
+                "receiptHash": receipt["receiptHash"],
+                "receiptPath": str(receipt_path),
+                "requestWindowDays": args.days,
+                "snapshotSha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="D:/documents/finance-data")
@@ -239,6 +316,20 @@ def main(argv: list[str] | None = None) -> int:
     pull.add_argument("--days", type=int, default=DEFAULT_HISTORY_DAYS)
     pull.add_argument("--base-url", default="http://127.0.0.1:8088")
     pull.set_defaults(func=cmd_pull_plan)
+
+    snapshot = sub.add_parser(
+        "pull-snapshot",
+        help="fetch immutable source evidence without reading Wealthfolio",
+    )
+    snapshot.add_argument("--data-dir", default=argparse.SUPPRESS)
+    snapshot.add_argument("--days", type=int, default=DEFAULT_HISTORY_DAYS)
+    snapshot.add_argument(
+        "--protocol-version",
+        choices=("1", "2"),
+        default="1",
+        help="required response protocol version",
+    )
+    snapshot.set_defaults(func=cmd_pull_snapshot)
 
     args = parser.parse_args(argv)
     try:

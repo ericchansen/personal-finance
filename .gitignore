@@ -30,6 +30,8 @@ captures/
 *.db
 *.sqlite
 *.sqlite3
+*.duckdb
+*.parquet
 *.db-journal
 *.dump
 *.bak

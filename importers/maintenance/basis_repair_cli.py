@@ -629,7 +629,7 @@ def apply_aggregate_plan(
 
 
 def connect(base_url: str, data_dir: Path) -> WealthfolioClient:
-    client = WealthfolioClient(base_url)
+    client = WealthfolioClient(base_url, writer_data_dir=data_dir)
     if not client.health():
         raise BasisRepairError(f"Wealthfolio is unhealthy at {base_url}")
     client.login(password(data_dir))

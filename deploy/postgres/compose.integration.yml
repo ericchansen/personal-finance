@@ -1,0 +1,178 @@
+name: personal-finance-postgres-shadow-authority-integration
+
+x-postgres-image: &postgres-image
+  image: "${POSTGRES_IMAGE:-postgres:17.11-bookworm@sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0}"
+
+services:
+  integration-db:
+    <<: *postgres-image
+    container_name: personal-finance-postgres-shadow-authority-integration-db
+    environment:
+      POSTGRES_DB: finance_shadow_integration
+      POSTGRES_USER: finance_shadow_integration_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_test_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --data-checksums"
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - ssl=off
+    secrets:
+      - postgres_test_password
+    ports:
+      - "${POSTGRES_TEST_BIND_ADDR:-127.0.0.1}:${POSTGRES_TEST_PORT:-55433}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks:
+      - postgres_shadow_integration_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+  migrate-test:
+    <<: *postgres-image
+    depends_on:
+      integration-db:
+        condition: service_healthy
+    environment:
+      PGHOST: integration-db
+      PGPORT: "5432"
+      PGDATABASE: finance_shadow_integration
+      PGUSER: finance_shadow_integration_admin
+      PGPASSWORD_FILE: /run/secrets/postgres_test_password
+      FINANCE_SHADOW_ENVIRONMENT: synthetic-shadow-integration
+    secrets:
+      - postgres_test_password
+    volumes:
+      - "./migrations:/migrations:ro"
+      - "./scripts:/scripts:ro"
+    networks:
+      - postgres_shadow_integration_internal
+    entrypoint: ["/bin/sh", "/scripts/migrate.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  migration-replay-test:
+    <<: *postgres-image
+    depends_on:
+      migrate-test:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: integration-db
+      PGPORT: "5432"
+      PGDATABASE: finance_shadow_integration
+      PGUSER: finance_shadow_integration_admin
+      PGPASSWORD_FILE: /run/secrets/postgres_test_password
+      FINANCE_SHADOW_ENVIRONMENT: synthetic-shadow-integration
+    secrets:
+      - postgres_test_password
+    volumes:
+      - "./migrations:/migrations:ro"
+      - "./scripts:/scripts:ro"
+    networks:
+      - postgres_shadow_integration_internal
+    entrypoint: ["/bin/sh", "/scripts/migrate.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  provision-test-logins:
+    <<: *postgres-image
+    depends_on:
+      migration-replay-test:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: integration-db
+      PGPORT: "5432"
+      PGDATABASE: finance_shadow_integration
+      PGUSER: finance_shadow_integration_admin
+      PGPASSWORD_FILE: /run/secrets/postgres_test_password
+      LOADER_PASSWORD_FILE: /run/secrets/postgres_test_password
+      AGENT_PASSWORD_FILE: /run/secrets/postgres_test_password
+      BACKUP_PASSWORD_FILE: /run/secrets/postgres_test_password
+    secrets:
+      - postgres_test_password
+    volumes:
+      - "./scripts:/scripts:ro"
+    networks:
+      - postgres_shadow_integration_internal
+    entrypoint: ["/bin/sh", "/scripts/provision-logins.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  integration-test:
+    <<: *postgres-image
+    depends_on:
+      provision-test-logins:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: integration-db
+      PGPORT: "5432"
+      PGDATABASE: finance_shadow_integration
+      PGUSER: finance_shadow_integration_admin
+      PGPASSWORD_FILE: /run/secrets/postgres_test_password
+    secrets:
+      - postgres_test_password
+    volumes:
+      - "./integration:/integration:ro"
+      - "./scripts:/scripts:ro"
+    networks:
+      - postgres_shadow_integration_internal
+    entrypoint: ["/bin/sh", "/scripts/psql-file.sh", "/integration/schema_test.sql"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  roundtrip-test:
+    <<: *postgres-image
+    depends_on:
+      integration-test:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: integration-db
+      PGPORT: "5432"
+      PGDATABASE: finance_shadow_integration
+      PGUSER: finance_shadow_integration_admin
+      PGPASSWORD_FILE: /run/secrets/postgres_test_password
+    secrets:
+      - postgres_test_password
+    volumes:
+      - "./integration:/integration:ro"
+      - "./scripts:/scripts:ro"
+    networks:
+      - postgres_shadow_integration_internal
+    entrypoint: ["/bin/sh", "/integration/roundtrip_test.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+secrets:
+  postgres_test_password:
+    file: "${POSTGRES_TEST_PASSWORD_FILE:?Set POSTGRES_TEST_PASSWORD_FILE to a synthetic external secret}"
+
+networks:
+  postgres_shadow_integration_internal:
+    name: personal-finance-postgres-shadow-authority-integration-internal

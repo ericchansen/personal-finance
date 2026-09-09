@@ -85,7 +85,8 @@ def test_ofx_synthesizes_an_id_when_fitid_is_missing():
     text = OFX.replace("<FITID>TXN-0001", "")
     t = parsers.parse_ofx(text).transactions[0]
     assert t.id_is_synthetic
-    assert len(t.source_id) == 32
+    assert len(t.source_id.removesuffix(":1")) == 32
+    assert t.source_id.endswith(":1")
 
 
 def test_ofx_skips_unparseable_transactions():
@@ -228,13 +229,21 @@ def test_synthetic_id_varies_with_each_input(field, value):
     assert parsers.synthesize_id(**base) != parsers.synthesize_id(**changed)
 
 
-def test_identical_same_day_purchases_collapse():
-    """A documented limitation: a CSV cannot distinguish two identical
-    purchases on one day, so the second is treated as already imported.
-    Under-counting is the safer failure; a silent duplicate is worse."""
-    first = parsers.synthesize_id("a", date(2026, 1, 15), Decimal("-5"), "Coffee")
-    second = parsers.synthesize_id("a", date(2026, 1, 15), Decimal("-5"), "Coffee")
-    assert first == second
+def test_identical_same_day_csv_rows_keep_replay_stable_occurrences():
+    text = (
+        "Date, Time, Amount, Type, Description\n"
+        "01/15/2026, 08:00 AM,-5.00,DEBIT,Coffee\n"
+        "01/15/2026, 09:00 AM,-5.00,DEBIT,Coffee\n"
+    )
+
+    first = parsers.parse_ally_csv(text, account_id="acct")
+    replay = parsers.parse_ally_csv(text, account_id="acct")
+    identifiers = [row.source_id for row in first.transactions]
+
+    assert len(set(identifiers)) == 2
+    assert identifiers[0].endswith(":1")
+    assert identifiers[1].endswith(":2")
+    assert identifiers == [row.source_id for row in replay.transactions]
 
 
 # --------------------------------------------------------------------------

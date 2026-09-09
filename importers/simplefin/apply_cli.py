@@ -1633,7 +1633,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-plan-sha")
     parser.add_argument("--wait-seconds", type=int, default=120)
     args = parser.parse_args(argv)
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     try:
         client.login(_password())
         if args.command == "plan":

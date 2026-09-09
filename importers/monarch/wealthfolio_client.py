@@ -10,10 +10,17 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
+
+if __package__:
+    from .mutation_guard import require_wealthfolio_mutations
+else:  # Direct script execution adds this directory to sys.path.
+    from mutation_guard import require_wealthfolio_mutations
 
 
 class WealthfolioError(RuntimeError):
@@ -25,10 +32,21 @@ class WealthfolioError(RuntimeError):
 
 
 class WealthfolioClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:8088", timeout: int = 120):
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8088",
+        timeout: int = 120,
+        *,
+        writer_data_dir: str | Path | None = None,
+    ):
         self.base = base_url.rstrip("/")
         self.api = f"{self.base}/api/v1"
         self.timeout = timeout
+        self.writer_data_dir = (
+            Path(writer_data_dir).resolve()
+            if writer_data_dir is not None
+            else None
+        )
         self._jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self._jar)
@@ -37,6 +55,12 @@ class WealthfolioClient:
     # -- plumbing ---------------------------------------------------------
 
     def _request(self, method: str, path: str, payload: Any = None) -> Any:
+        require_wealthfolio_mutations(
+            method,
+            path,
+            base_url=self.base,
+            data_dir=self.writer_data_dir,
+        )
         body = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(self.api + path, data=body, method=method)
         req.add_header("Content-Type", "application/json")
@@ -53,6 +77,21 @@ class WealthfolioClient:
             return json.loads(raw)
         except json.JSONDecodeError:
             return raw
+
+    def _request_bytes(self, method: str, path: str) -> bytes:
+        require_wealthfolio_mutations(
+            method,
+            path,
+            base_url=self.base,
+            data_dir=self.writer_data_dir,
+        )
+        req = urllib.request.Request(self.api + path, method=method)
+        req.add_header("Origin", self.base)
+        try:
+            with self._opener.open(req, timeout=self.timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            raise WealthfolioError(exc.code, path, exc.read().decode(errors="replace")) from None
 
     def get(self, path: str) -> Any:
         return self._request("GET", path)
@@ -165,3 +204,11 @@ class WealthfolioClient:
 
     def list_backups(self) -> list[dict]:
         return self.get("/utilities/database/backups") or []
+
+    def download_backup(self, filename: str) -> bytes:
+        if not re.fullmatch(r"wealthfolio_backup_\d{8}_\d{6}\.db", filename):
+            raise ValueError("invalid Wealthfolio backup filename")
+        encoded = urllib.parse.quote(filename, safe="")
+        return self._request_bytes(
+            "GET", f"/utilities/database/backups/{encoded}/download"
+        )

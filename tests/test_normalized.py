@@ -18,6 +18,7 @@ from importers.normalized.builder import (
     collect,
     plan,
     verify,
+    verify_publication,
 )
 from importers.normalized.cli import main
 
@@ -237,7 +238,9 @@ def input_hashes(root: Path) -> dict[str, str]:
     return {
         str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in root.rglob("*")
-        if path.is_file() and "canonical" not in path.parts
+        if path.is_file()
+        and "canonical" not in path.parts
+        and ".lineage-state" not in path.parts
     }
 
 
@@ -279,7 +282,14 @@ def test_deterministic_build_and_verify(tmp_path):
     first = build(root, now=datetime(2024, 2, 1, tzinfo=timezone.utc))
     bytes_before = {
         name: (root / "normalized" / "canonical" / name).read_bytes()
-        for name in ("accounts.csv", "transactions.csv", "positions.csv", "valuations.csv")
+        for name in (
+            "accounts.csv",
+            "transactions.csv",
+            "positions.csv",
+            "valuations.csv",
+            "transaction-observations.json",
+            "transaction-lineage.json",
+        )
     }
     second = build(root, now=datetime(2025, 2, 1, tzinfo=timezone.utc))
     bytes_after = {
@@ -287,7 +297,7 @@ def test_deterministic_build_and_verify(tmp_path):
         for name in bytes_before
     }
     assert bytes_before == bytes_after
-    assert first["schemaVersion"] == 4
+    assert first["schemaVersion"] == 5
     account_columns = bytes_before["accounts.csv"].splitlines()[0].decode().split(",")
     transaction_columns = bytes_before["transactions.csv"].splitlines()[0].decode().split(",")
     assert "tracking_mode" in account_columns
@@ -302,6 +312,23 @@ def test_deterministic_build_and_verify(tmp_path):
     } <= set(transaction_columns)
     assert first["buildTimestamp"] != second["buildTimestamp"]
     assert verify(root)["verified"]
+
+
+def test_full_verify_recomputes_manifest_source_provenance(tmp_path):
+    root = make_estate(tmp_path)
+    build(root, now=datetime(2024, 2, 1, tzinfo=timezone.utc))
+    manifest_path = root / "normalized" / "canonical" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sourceFiles"] = manifest["sourceFiles"][1:]
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    assert verify_publication(root)["verified"] is True
+    with pytest.raises(BuildError, match="recomputed provenance"):
+        verify(root)
 
 
 def test_canonical_build_rejects_non_dormant_exclusion(tmp_path):
@@ -345,7 +372,55 @@ def test_atomic_failure_preserves_previous_directory(tmp_path):
     assert {path.name: path.read_bytes() for path in canonical.iterdir()} == before
 
 
-def test_decimal_sign_lineage_ambiguity_and_transfer(tmp_path):
+def test_canonical_build_rejects_output_inside_public_checkout():
+    with pytest.raises(BuildError, match="canonical-private-output-invalid"):
+        build(Path(__file__).parents[1])
+
+
+def test_canonical_build_holds_lineage_decision_lock(tmp_path):
+    root = make_estate(tmp_path)
+    lock_root = root / "audit" / ".lineage-state"
+    from importers.lineage_review import workflow
+
+    with workflow._decision_import_lock(lock_root):
+        with pytest.raises(
+            BuildError, match="lineage-review-decision-import-in-progress"
+        ):
+            build(root)
+
+
+def test_lineage_hash_binds_exact_published_transactions(tmp_path):
+    root = make_estate(tmp_path)
+    build(root)
+    canonical = root / "normalized" / "canonical"
+    transactions = canonical / "transactions.csv"
+    transactions.write_text(
+        transactions.read_text(encoding="utf-8").replace(
+            "extract:stable:ofx-1",
+            "extract:stable:tampered",
+            1,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    manifest_path = canonical / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["dataFiles"]["transactions.csv"] = hashlib.sha256(
+        transactions.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(
+        BuildError, match="canonical-lineage-publication-invalid"
+    ):
+        verify_publication(root)
+
+
+def test_unproved_cross_source_candidate_preserves_each_source_semantics(tmp_path):
     root = make_estate(tmp_path)
     estate = collect(root)
     matching = [
@@ -353,17 +428,63 @@ def test_decimal_sign_lineage_ambiguity_and_transfer(tmp_path):
         if row.account_id == "acct-main" and row.date == "2024-01-10"
         and Decimal(row.amount) == Decimal("-12.34")
     ]
-    assert len(matching) == 1
-    assert matching[0].source_id == "extract:stable:ofx-1"
-    assert matching[0].source_file == "extracts/example/activity.qfx"
-    assert matching[0].category == "Shopping"
-    assert matching[0].category_id == ""
-    assert matching[0].transaction_kind == "internal_transfer"
-    assert matching[0].payee_normalized == "merchant one"
-    assert matching[0].assignment_source == "source"
-    assert matching[0].transfer_group == "reviewed-pair-1"
-    assert any("cross-source-deduplicated" in warning for warning in estate.warnings)
+    assert len(matching) == 2
+    extracted = next(row for row in matching if row.source_id.startswith("extract:"))
+    legacy = next(row for row in matching if row.source_id.startswith("monarch:"))
+    assert extracted.source_file == "extracts/example/activity.qfx"
+    assert extracted.transaction_kind == "expense"
+    assert not extracted.transfer_group
+    assert legacy.category == "Shopping"
+    assert legacy.transaction_kind == "internal_transfer"
+    assert legacy.payee_normalized == "merchant one"
+    assert legacy.assignment_source == "source"
+    assert legacy.transfer_group == "reviewed-pair-1"
+    assert estate.lineage_review["identityPolicy"][
+        "safeAutomaticResolutions"
+    ] == 0
+    assert estate.transaction_observations["observationCount"] >= len(
+        estate.transactions
+    )
+    observation_source_ids = {
+        item["transaction"]["source_id"]
+        for item in estate.transaction_observations["observations"]
+    }
+    assert {"extract:stable:ofx-1", "monarch:mon-1"} <= observation_source_ids
+    assert estate.transaction_lineage["decisionProjections"] == []
     assert any(Decimal(row.amount) == Decimal("1.25") for row in estate.transactions)
+
+
+def test_schema_v5_lineage_binds_source_authority_without_declared_coverage(tmp_path):
+    root = make_estate(tmp_path)
+    estate = collect(root)
+
+    identity = estate.lineage_review["identityPolicy"]
+    authority = identity["sourceAuthority"]
+    assert authority["declared"] is False
+    assert authority["policyVersion"] == "canonical-source-authority-v3"
+    assert authority["intervalCount"] == 0
+    assert authority["provenIntervalCount"] == 0
+    assert authority["reconciledIntervalCount"] == 0
+    assert authority["authoritativeIntervalCount"] == 0
+    assert authority["intervals"] == []
+    assert authority["earliestEffectiveFrom"] is None
+    assert authority["latestEffectiveThrough"] is None
+    assert identity["sourceSuppressedClaims"] == 0
+    assert identity["authorityCoveredClaims"] == 0
+    assert identity["authorityAmbiguousGroups"] == 0
+    assert set(identity["residualByClass"]) == {
+        "distinct",
+        "source-suppressed",
+        "transfer",
+        "correction",
+        "reversal",
+        "unresolved",
+    }
+    assert all(value >= 0 for value in identity["residualByClass"].values())
+
+    for decision in estate.transaction_lineage["decisionProjections"]:
+        assert decision["residualClassification"] in identity["residualByClass"]
+        assert decision["sourceAuthorityPolicyHash"] is None
 
 
 def test_vanguard_full_history_precedes_combined_csv_overlap(tmp_path):
@@ -594,7 +715,7 @@ def test_repeated_same_source_rows_remain_ambiguous(tmp_path):
     ]
     assert len(matching) == 3
     assert any(
-        "ambiguous-cross-source-duplicate" in warning
+        "unresolved-cross-source-candidate" in warning
         for warning in estate.warnings
     )
 
@@ -701,6 +822,7 @@ def test_legacy_transfer_category_remains_structural_transfer(tmp_path):
         if item.account_id == "acct-main"
         and item.date == "2024-01-10"
         and Decimal(item.amount) == Decimal("-12.34")
+        and item.source_id.startswith("monarch:")
     )
 
     assert row.category == "Transfer to Savings"

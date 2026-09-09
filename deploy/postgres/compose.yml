@@ -1,0 +1,264 @@
+name: personal-finance-postgres-shadow-authority
+
+x-postgres-image: &postgres-image
+  image: "${POSTGRES_IMAGE:-postgres:17.11-bookworm@sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0}"
+
+services:
+  shadow-db:
+    <<: *postgres-image
+    container_name: personal-finance-postgres-shadow-authority-db
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-55432}:5432"
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-finance_shadow_authority}"
+      POSTGRES_USER: "${POSTGRES_USER:-finance_shadow_bootstrap}"
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --data-checksums"
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - ssl=off
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+    secrets:
+      - postgres_admin_password
+    volumes:
+      - postgres_shadow_authority_data:/var/lib/postgresql/data
+    networks:
+      - postgres_shadow_authority_internal
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -q -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" &&
+          psql --no-psqlrc -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+          --tuples-only --no-align --command='SELECT 1' >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 60s
+    shm_size: 256mb
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    <<: *postgres-image
+    profiles: ["tools"]
+    depends_on:
+      shadow-db:
+        condition: service_healthy
+    environment:
+      PGHOST: shadow-db
+      PGPORT: "5432"
+      PGDATABASE: "${POSTGRES_DB:-finance_shadow_authority}"
+      PGUSER: "${POSTGRES_USER:-finance_shadow_bootstrap}"
+      PGPASSWORD_FILE: /run/secrets/postgres_admin_password
+      FINANCE_SHADOW_ENVIRONMENT: "${FINANCE_SHADOW_ENVIRONMENT:-shadow-authority-v1}"
+      POSTGRES_MIGRATION_BACKUP: "${POSTGRES_MIGRATION_BACKUP:-}"
+      FINANCE_SHADOW_LEGACY_QUIESCED: "${FINANCE_SHADOW_LEGACY_QUIESCED:-}"
+    secrets:
+      - postgres_admin_password
+    volumes:
+      - "./migrations:/migrations:ro"
+      - "./scripts:/scripts:ro"
+      - type: bind
+        source: "${POSTGRES_BACKUP_DIR:?Set POSTGRES_BACKUP_DIR outside the repository}"
+        target: /backups
+    networks:
+      - postgres_shadow_authority_internal
+    entrypoint: ["/bin/sh", "/scripts/migrate.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  provision-logins:
+    <<: *postgres-image
+    profiles: ["tools"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: shadow-db
+      PGPORT: "5432"
+      PGDATABASE: "${POSTGRES_DB:-finance_shadow_authority}"
+      PGUSER: "${POSTGRES_USER:-finance_shadow_bootstrap}"
+      PGPASSWORD_FILE: /run/secrets/postgres_admin_password
+      LOADER_PASSWORD_FILE: /run/secrets/postgres_loader_password
+      AGENT_PASSWORD_FILE: /run/secrets/postgres_agent_password
+      BACKUP_PASSWORD_FILE: /run/secrets/postgres_backup_password
+    secrets:
+      - postgres_admin_password
+      - postgres_loader_password
+      - postgres_agent_password
+      - postgres_backup_password
+    volumes:
+      - "./scripts:/scripts:ro"
+    networks:
+      - postgres_shadow_authority_internal
+    entrypoint: ["/bin/sh", "/scripts/provision-logins.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  backup:
+    <<: *postgres-image
+    profiles: ["ops"]
+    environment:
+      PGHOST: shadow-db
+      PGPORT: "5432"
+      PGDATABASE: "${POSTGRES_DB:-finance_shadow_authority}"
+      PGUSER: finance_shadow_backup_login
+      PGPASSWORD_FILE: /run/secrets/postgres_backup_password
+      BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-30}"
+      BACKUP_MINIMUM_COUNT: "${BACKUP_MINIMUM_COUNT:-1}"
+    secrets:
+      - postgres_backup_password
+    depends_on:
+      shadow-db:
+        condition: service_healthy
+    volumes:
+      - "./scripts:/scripts:ro"
+      - type: bind
+        source: "${POSTGRES_BACKUP_DIR:?Set POSTGRES_BACKUP_DIR outside the repository}"
+        target: /backups
+    networks:
+      - postgres_shadow_authority_internal
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  backup-legacy:
+    <<: *postgres-image
+    profiles: ["tools"]
+    environment:
+      PGHOST: shadow-db
+      PGPORT: "5432"
+      PGDATABASE: "${POSTGRES_DB:-finance_shadow_authority}"
+      PGUSER: "${POSTGRES_USER:-finance_shadow_bootstrap}"
+      PGPASSWORD_FILE: /run/secrets/postgres_admin_password
+      FINANCE_SHADOW_LEGACY_QUIESCED: "${FINANCE_SHADOW_LEGACY_QUIESCED:-}"
+      BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-30}"
+      BACKUP_MINIMUM_COUNT: "${BACKUP_MINIMUM_COUNT:-1}"
+    secrets:
+      - postgres_admin_password
+    depends_on:
+      shadow-db:
+        condition: service_healthy
+    volumes:
+      - "./scripts:/scripts:ro"
+      - type: bind
+        source: "${POSTGRES_BACKUP_DIR:?Set POSTGRES_BACKUP_DIR outside the repository}"
+        target: /backups
+    networks:
+      - postgres_shadow_authority_internal
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  verify-backup:
+    <<: *postgres-image
+    profiles: ["ops"]
+    depends_on:
+      shadow-db:
+        condition: service_healthy
+    environment:
+      BACKUP_BASENAME: "${BACKUP_BASENAME:-}"
+      PGHOST: shadow-db
+      PGPORT: "5432"
+      PGDATABASE: "${POSTGRES_DB:-finance_shadow_authority}"
+      PGUSER: finance_shadow_backup_login
+      PGPASSWORD_FILE: /run/secrets/postgres_backup_password
+    secrets:
+      - postgres_backup_password
+    volumes:
+      - "./scripts:/scripts:ro"
+      - type: bind
+        source: "${POSTGRES_BACKUP_DIR:?Set POSTGRES_BACKUP_DIR outside the repository}"
+        target: /backups
+        read_only: true
+    networks:
+      - postgres_shadow_authority_internal
+    entrypoint: ["/bin/sh", "/scripts/verify-backup.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  verify-retention:
+    <<: *postgres-image
+    profiles: ["ops"]
+    depends_on:
+      shadow-db:
+        condition: service_healthy
+    environment:
+      BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-30}"
+      BACKUP_MINIMUM_COUNT: "${BACKUP_MINIMUM_COUNT:-1}"
+      PGHOST: shadow-db
+      PGPORT: "5432"
+      PGDATABASE: "${POSTGRES_DB:-finance_shadow_authority}"
+      PGUSER: finance_shadow_backup_login
+      PGPASSWORD_FILE: /run/secrets/postgres_backup_password
+    secrets:
+      - postgres_backup_password
+    volumes:
+      - "./scripts:/scripts:ro"
+      - type: bind
+        source: "${POSTGRES_BACKUP_DIR:?Set POSTGRES_BACKUP_DIR outside the repository}"
+        target: /backups
+        read_only: true
+    networks:
+      - postgres_shadow_authority_internal
+    entrypoint: ["/bin/sh", "/scripts/verify-retention.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+secrets:
+  postgres_admin_password:
+    file: "${POSTGRES_ADMIN_PASSWORD_FILE:?Set POSTGRES_ADMIN_PASSWORD_FILE outside the repository}"
+  postgres_loader_password:
+    file: "${POSTGRES_LOADER_PASSWORD_FILE:?Set POSTGRES_LOADER_PASSWORD_FILE outside the repository}"
+  postgres_agent_password:
+    file: "${POSTGRES_AGENT_PASSWORD_FILE:?Set POSTGRES_AGENT_PASSWORD_FILE outside the repository}"
+  postgres_backup_password:
+    file: "${POSTGRES_BACKUP_PASSWORD_FILE:?Set POSTGRES_BACKUP_PASSWORD_FILE outside the repository}"
+
+volumes:
+  postgres_shadow_authority_data:
+    name: personal-finance-postgres-shadow-authority-data
+
+networks:
+  postgres_shadow_authority_internal:
+    name: personal-finance-postgres-shadow-authority-internal

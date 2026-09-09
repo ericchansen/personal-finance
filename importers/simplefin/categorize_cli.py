@@ -565,7 +565,14 @@ def main(argv: list[str] | None = None) -> int:
             _require_loopback_promotion_url(args.base_url, "category")
         if args.command == "budget-promote":
             _require_loopback_promotion_url(args.base_url, "budget")
-        client = WealthfolioClient(args.base_url)
+        writer_data_dir = (
+            args.staging_data_dir
+            if args.command == "rehearse"
+            else args.data_dir
+        )
+        client = WealthfolioClient(
+            args.base_url, writer_data_dir=writer_data_dir
+        )
         if args.command == "rehearse":
             validate_data_dir(args.staging_data_dir)
         client.login(read_wealthfolio_password(args.data_dir))

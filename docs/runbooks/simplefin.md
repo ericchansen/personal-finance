@@ -1,10 +1,10 @@
-# SimpleFIN — safe scheduled transaction plans
+# SimpleFIN — immutable source collection
 
 SimpleFIN is read-only, but its access URL is a credential for every connected
-institution. It must remain outside this public repository. The pipeline fetches 45 inclusive calendar days by default (the Bridge's live
-recommendation), permits at most 90, saves the response unchanged, and creates
-a review plan. The scheduled pipeline **never applies the plan to Wealthfolio**.
-Application is a separate, explicitly authorized promotion workflow.
+institution. It must remain outside this public repository. The source collector
+fetches up to 90 inclusive calendar days and saves the response unchanged.
+Scheduled collection never reads or writes Wealthfolio. PostgreSQL admission and
+canonical projection are separate, fail-closed workflows.
 
 Spending categorization is also separate. It reads the private canonical
 history and the original Monarch statement field locally, writes a
@@ -56,6 +56,9 @@ raw\simplefin\YYYY-MM-DD\
 normalized\simplefin\
   plan-YYYY-MM-DD-HHMMSS-ffffff.json
   assertions-YYYY-MM-DD-HHMMSS-ffffff.json
+automation\source-collection\
+  current.json              # watermark for the latest attempt
+  runs\<receipt-hash>.json  # safe aggregate input and health manifest
 ```
 
 Raw snapshots are exclusively created and marked read-only. Never move any of
@@ -131,6 +134,51 @@ not worth creating in Wealthfolio. Its transactions are retained in the raw
 snapshot but never planned for import.
 
 ## Pull and plan
+
+The production collector only captures immutable source evidence:
+
+```powershell
+python importers\simplefin\cli.py pull-snapshot `
+  --data-dir D:\documents\finance-data `
+  --days 90 `
+  --protocol-version 1
+```
+
+Its JSON output contains only the snapshot hash and aggregate account/error
+counts. Each run also writes a content-addressed receipt binding the immutable
+response, request sidecar, release commit, expected-account inventory hash,
+observed inventory hash, request watermark, and per-scope error counts. Failed
+transport, protocol, or parsing attempts write a safe failure receipt; they do
+not claim a successful snapshot. Institution errors remain in the immutable
+source response for the connection-scoped authority policy to resolve or block.
+An old clean snapshot remains valid historical evidence but is reported stale;
+clean does not mean current.
+
+Scheduled collection must run from the stable release described in
+[`supported-release.md`](supported-release.md), never directly from a worktree.
+
+### Connection scopes
+
+Each snapshot's `request-*.json` sidecar declares the `connectionId` it was
+pulled under; snapshots without one keep the `default` scope. Every scope is
+admitted **independently**: a connection whose newest snapshot is clean (or
+carries only provider advisories) keeps advancing even while a sibling
+connection is failing over to older evidence. No snapshot is ever selected
+globally, so one failing institution can neither freeze a healthy connection
+nor stand in for it.
+
+A connection whose newest snapshot carries an actionable error is blocked on
+its own — reported as `simplefin-connection-blocked:<connectionId>` — unless
+`simplefin/account-map.json` carries a `connections` entry approving its last
+verified immutable snapshot. That decision is scoped: an approval filed under
+one connection id cannot admit another
+(`simplefin-connection-decision-scope-mismatch`). Admitted fallback evidence is
+marked stale, and the staleness is reported rather than hidden. When the
+connection recovers, its fresh clean snapshot supersedes the fallback
+automatically and the error history is retained, never erased.
+
+The legacy comparison planner remains read-only and is useful only for historical
+diagnostics:
 
 Set `WEALTHFOLIO_PASSWORD` for an unattended run, or place it in the existing
 private Wealthfolio password file. Then run:
@@ -806,7 +854,9 @@ Do **not** install it until the user confirms the schedule, execution identity,
 data directory, and password availability. After confirmation, remove
 `-WhatIf`; optional parameters include `-At '06:00'`, `-TaskName`, and
 `-Python`. The task runs daily, ignores overlapping instances, and invokes only
-`pull-plan`. It has no apply or Wealthfolio mutation path.
+`pull-snapshot`. It has no Wealthfolio client or mutation path. Schedule the
+PostgreSQL authority workflow after this collector so the immutable snapshot is
+admitted, reconciled, and included in a projection plan.
 
 Inspect Task Scheduler history and the newest private plan after the first
 confirmed run. Exit code `2` means the snapshot was preserved but the plan has

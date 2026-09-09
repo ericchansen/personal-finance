@@ -7,6 +7,7 @@ financial data and are therefore written only below ``FINANCE_DATA``.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import unicodedata
@@ -113,12 +114,13 @@ def fetch_snapshot(
         raise PipelineError(f"days must be between 1 and {MAX_HISTORY_DAYS}")
     now = now or datetime.now(timezone.utc)
     path = _snapshot_path(data_dir, now)
+    request_start = now.date() - timedelta(days=days - 1)
     request = _request(
         build_url(
             access_url,
             # The protocol's bounds are inclusive, so 90 days starts 89 days
             # before today.
-            start=now.date() - timedelta(days=days - 1),
+            start=request_start,
             pending=True,
         )
     )
@@ -142,6 +144,41 @@ def fetch_snapshot(
         path.unlink(missing_ok=True)
         raise
     path.chmod(0o444)
+    metadata_path = path.with_name(
+        f"request-{path.stem.removeprefix('simplefin-')}.json"
+    )
+    metadata = {
+        "schemaVersion": 1,
+        "protocolVersion": (
+            2
+            if "errlist" in payload
+            or "connections" in payload
+            or any(
+                isinstance(account, dict) and account.get("conn_id")
+                for account in (payload.get("accounts") or [])
+            )
+            else 1
+        ),
+        "snapshotSha256": hashlib.sha256(body).hexdigest(),
+        "requestedStart": request_start.isoformat(),
+        "requestedEnd": now.date().isoformat(),
+        "pendingIncluded": True,
+    }
+    metadata_bytes = (
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    descriptor = os.open(
+        metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(metadata_bytes)
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        metadata_path.unlink(missing_ok=True)
+        raise
+    metadata_path.chmod(0o444)
     return path, payload
 
 

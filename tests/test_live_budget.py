@@ -713,7 +713,11 @@ def cli(monkeypatch):
     """Wire the CLI to a synthetic server instead of a real Wealthfolio."""
     server = SyntheticWealthfolio()
 
-    monkeypatch.setattr(cli_module, "WealthfolioClient", lambda base_url: server)
+    monkeypatch.setattr(
+        cli_module,
+        "WealthfolioClient",
+        lambda base_url, **kwargs: server,
+    )
     monkeypatch.setattr(cli_module, "read_wealthfolio_password", lambda data_dir: "synthetic")
     monkeypatch.setattr(server, "login", lambda password: None, raising=False)
     monkeypatch.setattr(cli_module, "instance_fingerprint", lambda client, base_url: ENVIRONMENT)
