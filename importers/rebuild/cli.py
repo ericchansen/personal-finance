@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     password = os.environ.get("WEALTHFOLIO_PASSWORD")
     if not password:
         parser.error("WEALTHFOLIO_PASSWORD is required")
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     if not client.health():
         parser.error(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(password)

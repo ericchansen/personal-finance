@@ -147,7 +147,9 @@ def cmd_plan(args) -> int:
     data_dir = Path(args.data_dir)
     client = None
     if not args.offline:
-        client = WealthfolioClient(args.base_url)
+        client = WealthfolioClient(
+            args.base_url, writer_data_dir=args.data_dir
+        )
         if client.health():
             client.login(read_password(data_dir))
         else:
@@ -173,7 +175,7 @@ def cmd_plan(args) -> int:
 
 def cmd_apply(args) -> int:
     data_dir = Path(args.data_dir)
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     if not client.health():
         raise SystemExit(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(read_password(data_dir))

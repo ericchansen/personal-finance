@@ -8,7 +8,7 @@ and other facts that would otherwise live only in one mutable application DB.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path

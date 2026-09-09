@@ -118,7 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(
+        args.base_url, writer_data_dir=args.data_dir
+    )
     if not client.health():
         raise SystemExit(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(

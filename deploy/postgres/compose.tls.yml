@@ -1,0 +1,79 @@
+services:
+  tls-prepare:
+    image: "${POSTGRES_IMAGE:-postgres:17.11-bookworm@sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0}"
+    user: "0:0"
+    volumes:
+      - type: bind
+        source: "${POSTGRES_TLS_CERT_FILE:?Set POSTGRES_TLS_CERT_FILE outside the repository}"
+        target: /input/server.crt
+        read_only: true
+      - type: bind
+        source: "${POSTGRES_TLS_KEY_FILE:?Set POSTGRES_TLS_KEY_FILE outside the repository}"
+        target: /input/server.key
+        read_only: true
+      - "./tls/pg_hba.conf:/input/pg_hba.conf:ro"
+      - postgres_shadow_authority_tls:/runtime
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - >-
+        install -o postgres -g postgres -m 0644 /input/server.crt /runtime/server.crt;
+        install -o postgres -g postgres -m 0600 /input/server.key /runtime/server.key;
+        install -o postgres -g postgres -m 0600 /input/pg_hba.conf /runtime/pg_hba.conf
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  shadow-db:
+    depends_on:
+      tls-prepare:
+        condition: service_completed_successfully
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - ssl=on
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - ssl_cert_file=/run/postgres-tls/server.crt
+      - -c
+      - ssl_key_file=/run/postgres-tls/server.key
+      - -c
+      - hba_file=/run/postgres-tls/pg_hba.conf
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+    volumes:
+      - postgres_shadow_authority_tls:/run/postgres-tls:ro
+
+  migrate:
+    environment:
+      PGSSLMODE: require
+
+  provision-logins:
+    environment:
+      PGSSLMODE: require
+
+  backup:
+    environment:
+      PGSSLMODE: require
+
+  backup-legacy:
+    environment:
+      PGSSLMODE: require
+
+  verify-backup:
+    environment:
+      PGSSLMODE: require
+
+  verify-retention:
+    environment:
+      PGSSLMODE: require
+
+volumes:
+  postgres_shadow_authority_tls:
+    name: personal-finance-postgres-shadow-authority-tls

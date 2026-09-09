@@ -23,7 +23,6 @@ import os
 import re
 import sys
 from collections import Counter
-from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -250,7 +249,7 @@ def cmd_apply(args) -> int:
     overrides = load_overrides(legacy / "account-overrides.json")
     profiles = monarch.build_profiles(transactions, balances, overrides=overrides)
 
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     if not client.health():
         raise SystemExit(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(read_password(data_dir))
@@ -382,7 +381,7 @@ def cmd_link(args) -> int:
         print("dry run; nothing sent")
         return 0
 
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     if not client.health():
         raise SystemExit(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(read_password(data_dir))
@@ -450,7 +449,7 @@ def cmd_balances(args) -> int:
         print("dry run; nothing sent")
         return 0
 
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     if not client.health():
         raise SystemExit(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(read_password(data_dir))
@@ -524,7 +523,7 @@ def cmd_external(args) -> int:
         print("dry run; nothing sent")
         return 0
 
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     if not client.health():
         raise SystemExit(f"Wealthfolio is not reachable at {args.base_url}")
     client.login(read_password(data_dir))

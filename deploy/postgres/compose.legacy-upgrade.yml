@@ -1,0 +1,6 @@
+services:
+  shadow-db:
+    volumes:
+      - type: bind
+        source: "${POSTGRES_LEGACY_DATA_DIR:?Set POSTGRES_LEGACY_DATA_DIR to the candidate data directory}"
+        target: /var/lib/postgresql/data

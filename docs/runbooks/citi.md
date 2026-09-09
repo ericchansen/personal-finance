@@ -23,8 +23,9 @@ file and a 2026-01-01-to-date file. Overlapping ranges are safe: OFX dedupes on
 
 ## Prefer OFX over CSV
 
-Citi offers both for the same data. **OFX is strictly better** and should be
-taken whenever offered:
+Citi offers both for the same data. **Prefer OFX for stable transaction identity,
+and keep the matching CSV when available**: it can retain description text that
+the OFX export truncates.
 
 |  | OFX | CSV |
 |---|---|---|
@@ -33,10 +34,9 @@ taken whenever offered:
 | Balance | `BALAMT` + `DTASOF` | none |
 | Account type | `ACCTTYPE` | none |
 
-Without a transaction id, imports must dedupe on a synthesized key of date,
-amount and description. Two identical same-day purchases from the same merchant
-then collapse into one. That under-counts, which is the safer failure, but it is
-still a real loss of fidelity that OFX avoids entirely.
+Without a transaction id, imports use a synthesized key plus an occurrence ordinal
+to preserve identical rows within an export. Cross-export identity remains less
+reliable than a stable `FITID`; do not treat identical descriptions as unique IDs.
 
 OFX also identifies its own account, so a mis-filed download can be recovered.
 A Citi CSV cannot.
@@ -62,8 +62,9 @@ products**: cards may use `XXXXXXXXXXXX1234` (twelve X's), while savings may use
 apart but not to reconstruct a number. Match on the last four, not on the whole
 string.
 
-⚠️ **`DTEND` is not trustworthy.** An export can carry an end date before its
-start date. Take the range from the transactions themselves, not the header.
+⚠️ **Validate the statement window.** An export can carry an end date before its
+start date. An invalid header cannot establish complete coverage. The minimum and
+maximum transaction dates describe observed rows, not the missing coverage claim.
 
 ## CSV shape
 
@@ -108,6 +109,55 @@ Savings rows also carry a trailing comma, producing an extra empty field.
 
 When both formats cover the same account and date range, compare their
 transaction counts and totals before accepting an import.
+
+## Source-bound description correspondence
+
+The shared canonical/shadow extract reader supports an explicit
+`descriptionEvidence` declaration on an existing OFX mapping entry:
+
+```json
+{
+  "rule": "citi-ofx-name-27-v2",
+  "path": "synthetic/paired-export.csv",
+  "primarySha256": "<SHA-256 of the exact OFX bytes>",
+  "supportingSha256": "<SHA-256 of the exact CSV bytes>"
+}
+```
+
+The declaration scopes both exports to the existing mapped account; a neighboring
+filename is never discovered or trusted automatically. Both byte hashes, strict
+row inventories, and the complete date/signed-amount multiset must agree. The
+reader expands only a unique date/amount occurrence whose OFX name equals the
+first 27 characters of the CSV description (ignoring trailing padding). It keeps
+the original `FITID`, date, amount, and raw file unchanged. Repeated or mismatched
+buckets remain unexpanded rather than guessing correspondence.
+
+Version 2 also separates the issuer's exact terminal
+`null XXXXXXXXXXXX1234` shape into `paymentInstrumentMask` evidence instead of
+treating it as part of the merchant description. The full CSV description and
+original OFX name remain in evidence. Other suffixes, references, and unmasked
+numbers are not removed. The mask is a payment-instrument hint, not a new account
+mapping or proof of the cardholder's identity. This makes a full descriptor
+comparison possible without using a shared merchant phone number as a
+transaction reference. Version 1 declarations retain their original behavior.
+
+The current rule requires one primary account, an explicit USD `CURDEF`, posted/cleared
+CSV rows, and unambiguous debit/credit columns. It does not infer a currency or
+silently omit malformed or pending rows to make the files match.
+
+Both artifacts enter the source manifest. The shadow records original and expanded
+descriptions with the rule and source hashes. The CSV is supporting evidence, not
+another imported transaction set. This source-side fixed-width restoration is
+different from matching an aggregator by a generic merchant prefix or phone number.
+It does not, by itself, certify every cross-provider duplicate.
+
+When mapped OFX files overlap, the shared reader applies the same verified
+enrichment to exact replays of the complete raw occurrence in the same mapped and
+source account. This happens before canonical deduplication; enriching only one
+copy must not manufacture two conflicting identities from one `FITID`. Changed
+raw content and different accounts do not inherit the evidence. Contradictory
+supporting descriptions fail explicitly, and a supporting CSV cannot also be
+imported as a second transaction set.
 
 ## What to do next
 

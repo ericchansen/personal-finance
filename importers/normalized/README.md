@@ -10,15 +10,20 @@ python -m importers.normalized.cli verify --data-dir D:\documents\finance-data
 ```
 
 `plan` parses and validates every supported input without writing. `build`
-writes `normalized/canonical/{accounts,transactions,positions,valuations}.csv`
-with an atomic directory replacement, plus `manifest.json`. `verify` checks
-source and output hashes, schemas, references, numeric/date invariants, and a
+writes `normalized/canonical/{accounts,transactions,positions,valuations}.csv`,
+`transaction-observations.json`, and `transaction-lineage.json` with an atomic
+directory replacement, plus `manifest.json`. `verify` checks source and output
+hashes, schemas, references, numeric/date invariants, lineage bindings, and a
 fresh byte-for-byte recomputation.
 
-The CSV files are deterministic. The manifest intentionally is not: its build
+The data files are deterministic. The manifest intentionally is not: its build
 timestamp records when the atomic snapshot was published. Source paths and
 hashes preserve lineage. Cross-source lookalikes are retained and reported as
-ambiguities unless a durable fact makes an explicit decision.
+ambiguities unless a verified private lineage decision selects a canonical
+survivor or link. Stable same-source replays remain idempotent, while every
+source observation is retained in `transaction-observations.json`.
+Byte-equivalent stable-ID replays from overlapping source files share one
+canonical identity while retaining each file-specific observation.
 
 Account identity is isolated in `IdentityMap`. Canonical IDs currently preserve
 account IDs established by facts (including existing app UUIDs) so that this
@@ -40,9 +45,11 @@ a stable decision identifier and reason. The manifest hashes every workbook,
 mapping, resolution artifact, and combined assertion source and reports mapped,
 excluded, and canonical Vanguard row counts.
 
-Canonical schema version 4 adds `tracking_mode` to accounts so balance-only
-holdings accounts are distinct from transaction-ledger accounts. It retains the
-version 3 transaction fields, including the version 2 investment fields
+Canonical schema version 5 adds immutable transaction-observation and
+transaction-lineage publications. It retains schema version 4's
+`tracking_mode` so balance-only holdings accounts are distinct from
+transaction-ledger accounts, plus the version 3 transaction fields and version
+2 investment fields
 (`symbol`, signed `quantity`, `price`, and `external_flow`) and structural
 cash-flow semantics:
 
@@ -58,6 +65,12 @@ cash-flow semantics:
 - `split_group` identifies exact monetary split lines; transfers and
   reconciliation rows cannot also be category splits.
 
+Existing version 4 publications remain verifiable as sealed forensic inputs,
+but a canonical `verify` recomputation requires rebuilding them into version 5.
+Canonical output is downstream of evidence baselines and lineage decisions; it
+is deliberately excluded from subsequent baseline inventories so publishing a
+reviewed canonical projection cannot invalidate the evidence that authorized
+it.
 Existing version 3 publications are intentionally not upgraded in place because
 two incompatible version 3 layouts existed. After all consumers support version
 4, rebuild from the private source facts and extracts; the builder verifies the

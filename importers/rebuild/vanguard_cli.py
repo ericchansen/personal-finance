@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     password = os.environ.get("WEALTHFOLIO_PASSWORD")
     if not password:
         parser.error("WEALTHFOLIO_PASSWORD is required")
-    client = WealthfolioClient(args.base_url)
+    client = WealthfolioClient(args.base_url, writer_data_dir=args.data_dir)
     client.login(password)
     account_map = json.loads(
         (args.data_dir / "canonical-account-map.json").read_text(encoding="utf-8")

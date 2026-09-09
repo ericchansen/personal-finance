@@ -1,0 +1,40 @@
+name: personal-finance-wealthfolio-rebuild
+
+services:
+  wealthfolio-rebuild:
+    image: "${WF_REBUILD_IMAGE:-wealthfolio/wealthfolio:3.7.0@sha256:de137d64acf712c5c71093b27ecc98ccc1dbbbf00befdb684bed531cdb40069a}"
+    container_name: personal-finance-wealthfolio-rebuild
+    restart: "no"
+    ports:
+      - "${WF_REBUILD_BIND_ADDR:-127.0.0.1}:${WF_REBUILD_PORT:-18091}:8088"
+    volumes:
+      - "${WF_REBUILD_DATA_DIR:?Set WF_REBUILD_DATA_DIR to an external candidate directory}:/data"
+    environment:
+      WF_LISTEN_ADDR: "0.0.0.0:8088"
+      WF_DB_PATH: "/data/wealthfolio-rebuild.db"
+      WF_SECRET_KEY: "${WF_REBUILD_SECRET_KEY:?Set WF_REBUILD_SECRET_KEY}"
+      WF_AUTH_REQUIRED: "true"
+      WF_AUTH_PASSWORD_HASH: "${WF_REBUILD_AUTH_PASSWORD_HASH:?Set WF_REBUILD_AUTH_PASSWORD_HASH}"
+      WF_AUTH_TOKEN_TTL_MINUTES: "30"
+      WF_CORS_ALLOW_ORIGINS: "${WF_REBUILD_CORS_ALLOW_ORIGINS:-http://localhost:18091,http://127.0.0.1:18091}"
+      WEALTHFOLIO_REBUILD_CANDIDATE: "wealthfolio-clean-rebuild-v1"
+    labels:
+      io.github.ericchansen.personal-finance.role: "clean-rebuild-candidate"
+      io.github.ericchansen.personal-finance.environment: "wealthfolio-clean-rebuild-v1"
+    healthcheck:
+      test:
+        ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8088/api/v1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

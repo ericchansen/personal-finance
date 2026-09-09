@@ -1,24 +1,42 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
-    [string]$TaskName = 'Personal Finance - SimpleFIN plan',
+    [string]$TaskName = 'Personal Finance - SimpleFIN source collection',
     [string]$DataDir = 'D:\documents\finance-data',
+    [string]$ReleaseRoot = 'D:\documents\finance-runtime\personal-finance',
     [string]$At = '06:00',
-    [string]$Python = 'python'
+    [string]$PowerShell = 'powershell.exe',
+    [ValidateRange(1, 90)]
+    [int]$Days = 90
 )
 
 $ErrorActionPreference = 'Stop'
-$cli = Join-Path $PSScriptRoot 'cli.py'
-$pythonExe = (Get-Command $Python -ErrorAction Stop).Source
-$arguments = "`"$cli`" pull-plan --data-dir `"$DataDir`""
-$action = New-ScheduledTaskAction -Execute $pythonExe -Argument $arguments `
-    -WorkingDirectory $PSScriptRoot
+$releaseRootPath = [IO.Path]::GetFullPath($ReleaseRoot)
+$launcher = Join-Path $releaseRootPath 'run-source-collector.ps1'
+$pointer = Join-Path $releaseRootPath 'current.json'
+if (
+    -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $pointer -PathType Leaf)
+) {
+    throw 'Install a stable release before registering the collector task.'
+}
+$powerShellExe = (Get-Command $PowerShell -ErrorAction Stop).Source
+$arguments = @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', "`"$launcher`"",
+    '-ReleaseRoot', "`"$releaseRootPath`"",
+    '-DataDir', "`"$([IO.Path]::GetFullPath($DataDir))`"",
+    '-Days', $Days
+)
+$action = New-ScheduledTaskAction -Execute $powerShellExe `
+    -Argument ($arguments -join ' ') -WorkingDirectory $releaseRootPath
 $trigger = New-ScheduledTaskTrigger -Daily -At $At
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
     -MultipleInstances IgnoreNew
 
-if ($PSCmdlet.ShouldProcess($TaskName, 'Install daily SimpleFIN plan-only task')) {
+if ($PSCmdlet.ShouldProcess($TaskName, 'Install daily source-only SimpleFIN task')) {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Settings $settings -Description 'Fetch immutable SimpleFIN snapshot and write a dry-run import/drift plan.' `
+        -Settings $settings -Description 'Fetch immutable SimpleFIN source evidence for PostgreSQL authority ingestion.' `
         -Force | Out-Null
     Write-Host "Installed scheduled task '$TaskName'."
 }
