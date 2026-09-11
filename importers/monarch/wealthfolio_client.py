@@ -9,13 +9,16 @@ Only the endpoints this importer uses are wrapped. Standard library only.
 from __future__ import annotations
 
 import http.cookiejar
+import ipaddress
 import json
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 if __package__:
     from .mutation_guard import require_wealthfolio_mutations
@@ -31,6 +34,23 @@ class WealthfolioError(RuntimeError):
         self.body = body
 
 
+def source_day_timestamp(value: date, zone: tzinfo = timezone.utc) -> str:
+    """Keep the source day identical in UTC accounting and the local UI."""
+    start = max(
+        datetime.combine(value, time.min, timezone.utc),
+        datetime.combine(value, time.min, zone).astimezone(timezone.utc),
+    )
+    end = min(
+        datetime.combine(value + timedelta(days=1), time.min, timezone.utc),
+        datetime.combine(value + timedelta(days=1), time.min, zone).astimezone(timezone.utc),
+    )
+    noon = datetime.combine(value, time(12), zone).astimezone(timezone.utc)
+    anchor = noon if start <= noon < end else start + (end - start) / 2
+    if anchor.date() != value or anchor.astimezone(zone).date() != value:
+        raise ValueError("source day cannot be represented in the display timezone")
+    return anchor.isoformat().replace("+00:00", "Z")
+
+
 class WealthfolioClient:
     def __init__(
         self,
@@ -38,8 +58,14 @@ class WealthfolioClient:
         timeout: int = 120,
         *,
         writer_data_dir: str | Path | None = None,
+        local_sync: bool = False,
     ):
         self.base = base_url.rstrip("/")
+        if local_sync:
+            host = urllib.parse.urlsplit(self.base).hostname
+            if host != "localhost" and not ipaddress.ip_address(host).is_loopback:
+                raise ValueError("local sync requires a loopback Wealthfolio URL")
+        self.local_sync = local_sync
         self.api = f"{self.base}/api/v1"
         self.timeout = timeout
         self.writer_data_dir = (
@@ -55,12 +81,13 @@ class WealthfolioClient:
     # -- plumbing ---------------------------------------------------------
 
     def _request(self, method: str, path: str, payload: Any = None) -> Any:
-        require_wealthfolio_mutations(
-            method,
-            path,
-            base_url=self.base,
-            data_dir=self.writer_data_dir,
-        )
+        if not self.local_sync:
+            require_wealthfolio_mutations(
+                method,
+                path,
+                base_url=self.base,
+                data_dir=self.writer_data_dir,
+            )
         body = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(self.api + path, data=body, method=method)
         req.add_header("Content-Type", "application/json")
@@ -79,12 +106,13 @@ class WealthfolioClient:
             return raw
 
     def _request_bytes(self, method: str, path: str) -> bytes:
-        require_wealthfolio_mutations(
-            method,
-            path,
-            base_url=self.base,
-            data_dir=self.writer_data_dir,
-        )
+        if not self.local_sync:
+            require_wealthfolio_mutations(
+                method,
+                path,
+                base_url=self.base,
+                data_dir=self.writer_data_dir,
+            )
         req = urllib.request.Request(self.api + path, method=method)
         req.add_header("Origin", self.base)
         try:
@@ -125,6 +153,9 @@ class WealthfolioClient:
 
     def list_accounts(self) -> list[dict]:
         return self.get("/accounts") or []
+
+    def display_timezone(self) -> ZoneInfo:
+        return ZoneInfo(self.get("/settings")["timezone"])
 
     def create_account(
         self,

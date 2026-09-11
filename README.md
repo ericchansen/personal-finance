@@ -9,6 +9,18 @@ deployment, importers for financial data extracts, and a browser-based extract r
 
 ## Supported workflows
 
+### Everyday local SimpleFIN sync
+
+For a local experiment, use the [direct SimpleFIN sync](docs/runbooks/local-simplefin.md). One Python command fetches SimpleFIN and updates the running Wealthfolio app. It uses the existing private account map and Wealthfolio's own source IDs; no PostgreSQL, release installation, approval artifacts, or clone/rebuild workflow is required.
+
+```powershell
+python -m importers.simplefin.local_sync --data-dir "<your-finance-data>"
+```
+
+### Older evidence and repair workflows
+
+These tools remain available for historical imports and specialized repairs. They are not prerequisites for the local sync.
+
 - **Collect evidence:** scheduled SimpleFIN snapshots and institution exports stay immutable
   outside the repository. Source collection never writes Wealthfolio.
 - **Resolve identity:** source-scoped occurrences, revisions, provenance, exclusions, and
