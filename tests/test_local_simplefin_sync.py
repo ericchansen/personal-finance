@@ -276,9 +276,28 @@ def test_missing_position_list_is_reported_value_not_fabricated_cash_or_trade():
     assert "averageCost" not in snapshot["holdings"][0]
 
 
+@pytest.mark.parametrize(("holdings", "balance"), [(None, "100"), ([], "100"), (None, "0")])
+def test_missing_position_data_does_not_replace_known_securities(holdings, balance):
+    observed = SimpleFinAccount("s", "Broker", "Synthetic", "USD", Decimal(balance), date(2026, 2, 1), holdings=holdings)
+    current = [{"holdingType": "security", "instrument": {"id": "known-asset"}, "quantity": "2"}]
+    with pytest.raises(ValueError, match="existing holdings were not replaced"):
+        plan_holdings(observed, {**ACCOUNT, "name": "Synthetic Broker"}, current)
+
+
+def test_existing_balance_only_position_can_be_refreshed_without_claiming_real_holdings():
+    account = {**ACCOUNT, "name": "Synthetic Pension"}
+    snapshot, _ = plan_holdings(source(), account, [])
+    current = [{
+        "holdingType": "security", "instrument": {"id": snapshot["holdings"][0]["assetId"]},
+        "quantity": "1",
+    }]
+    assert plan_holdings(source(), account, current)[0] == snapshot
+
+
 def test_zero_balance_empty_positions_clears_snapshot_without_zero_price_quote():
     observed = SimpleFinAccount("s", "Empty", "Synthetic", "USD", Decimal(0), date(2026, 2, 1), holdings=[])
-    snapshot, quotes = plan_holdings(observed, {**ACCOUNT, "name": "Empty"}, [])
+    current = [{"holdingType": "security", "instrument": {"id": "known-asset"}, "quantity": "2"}]
+    snapshot, quotes = plan_holdings(observed, {**ACCOUNT, "name": "Empty"}, current)
     assert snapshot["holdings"] == quotes == []
     assert snapshot["cashBalances"] == {"USD": "0.00"}
 
