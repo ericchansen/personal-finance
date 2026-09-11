@@ -235,6 +235,15 @@ def plan_balance(source: SimpleFinAccount, account: dict, activities: list[dict]
 
 
 def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict]):
+    aggregate_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "simplefin-total:" + source.id))
+    if not source.holdings and (source.holdings is None or source.balance != 0):
+        if any(
+            row.get("holdingType") == "security"
+            and money(row.get("quantity") or 0) != 0
+            and (row.get("instrument") or {}).get("id") != aggregate_id
+            for row in current
+        ):
+            raise ValueError("source positions are unavailable; existing holdings were not replaced")
     holdings, quotes = [], []
     investment_value = Decimal(0)
     for position in source.holdings or []:
@@ -280,7 +289,7 @@ def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict]):
         })
         investment_value += value
     if not source.holdings and source.balance > 0:
-        asset_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "simplefin-total:" + source.id))
+        asset_id = aggregate_id
         holdings.append({
             "assetId": asset_id, "symbol": "SF-" + asset_id[:8],
             "name": account["name"] + " - reported value (positions unavailable)",

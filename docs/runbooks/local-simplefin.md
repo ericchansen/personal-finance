@@ -51,7 +51,7 @@ The original SimpleFIN parser discarded `holdings`. The local sync imports the p
 
 Each provider position has its own stable, manually priced asset. The account-qualified symbol is intentional: providers round share counts and can report different implied prices for the same ticker in two accounts. Reusing one global quote changes the other account's value. Independent position prices preserve both the reported quantities and account totals.
 
-Known average cost is retained and provider purchase prices are used when supplied. Missing cost basis remains unknown; account values are not a claim of complete tax basis or reliable investment-performance history. If SimpleFIN supplies only an account total, it is labeled as a reported-value position, not presented as cash or a fabricated security purchase.
+Known average cost is retained and provider purchase prices are used when supplied. Missing cost basis remains unknown; account values are not a claim of complete tax basis or reliable investment-performance history. If SimpleFIN supplies only an account total and there are no known securities, it is labeled as a reported-value position, not presented as cash or a fabricated security purchase. Missing position data never replaces known securities with that aggregate: the account reports an error and retains its previous holdings. An explicitly empty position list with a zero balance can clear an empty account.
 
 An existing loan maps through `wealthfolioAlternativeAssetId`. Source debt updates its native liability valuation using the actual observation date. A failed bank connection keeps its last reported value and produces a warning; reconnect it in SimpleFIN to obtain fresh data.
 
