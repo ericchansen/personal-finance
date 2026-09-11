@@ -63,6 +63,7 @@ class SimpleFinAccount:
     balance_date: date | None
     available_balance: Decimal | None = None
     transactions: list[SimpleFinTransaction] = field(default_factory=list)
+    holdings: list[dict] | None = None
 
     @property
     def is_currency(self) -> bool:
@@ -192,6 +193,7 @@ def parse_accounts(payload: dict) -> tuple[list[SimpleFinAccount], list[str]]:
                 balance_date=_date(raw.get("balance-date")),
                 available_balance=_decimal(available) if available is not None else None,
                 transactions=sorted(transactions, key=lambda t: t.posted),
+                holdings=raw.get("holdings"),
             )
         )
     return accounts, errors
