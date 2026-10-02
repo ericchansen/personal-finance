@@ -14,22 +14,26 @@ Bridge dashboard. This is a secret: anyone holding it can read every connected
 account. It belongs in the data directory, never the repository.
 
 The Bridge caps requests at roughly 24 per day and serves about 90 days of
-history, so this supplements the downloaded extracts rather than replacing
-them. Anything older than the window still comes from files.
+history; anything older must already be in Wealthfolio.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 CLAIM_TIMEOUT = 60
 FETCH_TIMEOUT = 180
+MAX_HISTORY_DAYS = 90
+DEFAULT_HISTORY_DAYS = 45
+MAX_REQUESTS_PER_DAY = 24
 
 # The Bridge sits behind Cloudflare, which rejects urllib's default
 # ``Python-urllib/3.x`` User-Agent with error 1010 before the request ever
@@ -219,6 +223,84 @@ def build_url(access_url: str, start: date | None = None, end: date | None = Non
         # Cheap request: skips transactions entirely, useful for assertions.
         params.append("balances-only=1")
     return url + ("?" + "&".join(params) if params else "")
+
+
+def access_path(data_dir: Path) -> Path:
+    return data_dir / "simplefin" / "access-url.txt"
+
+
+def read_access_url(data_dir: Path) -> str:
+    path = access_path(data_dir)
+    if not path.exists():
+        raise SimpleFinError(
+            f"no access URL at {path}; run: python -m importers.simplefin.cli claim --token <setup-token>"
+        )
+    return path.read_text(encoding="utf-8").strip()
+
+
+def load_mapping(data_dir: Path) -> dict[str, dict]:
+    """Load the private, source-id keyed account map."""
+    path = data_dir / "simplefin" / "account-map.json"
+    if not path.exists():
+        raise SimpleFinError(f"missing private account mapping: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SimpleFinError(f"could not read private account mapping: {exc}") from None
+    accounts = payload.get("accounts")
+    if payload.get("version") != 1 or not isinstance(accounts, dict):
+        raise SimpleFinError("account-map.json must have version 1 and an accounts object")
+    return accounts
+
+
+def _snapshot_path(data_dir: Path, now: datetime) -> Path:
+    folder = data_dir / "raw" / "simplefin" / now.date().isoformat()
+    folder.mkdir(parents=True, exist_ok=True)
+    # Exclusively created slots enforce the Bridge's daily quota even when runs
+    # race. A slot stays used after a failed request, which may also cost quota.
+    for slot in range(1, MAX_REQUESTS_PER_DAY + 1):
+        try:
+            os.close(os.open(folder / f"request-{slot:02d}", os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+        except FileExistsError:
+            continue
+        return folder / f"simplefin-{now.strftime('%H%M%S-%f')}.json"
+    raise SimpleFinError("daily SimpleFIN request limit reached; no request was made")
+
+
+def fetch_snapshot(
+    data_dir: Path,
+    access_url: str,
+    *,
+    days: int = DEFAULT_HISTORY_DAYS,
+    now: datetime | None = None,
+    opener=urllib.request.urlopen,
+) -> tuple[Path, dict]:
+    """Fetch once and keep the unmodified response as a read-only file for replay."""
+    if not 1 <= days <= MAX_HISTORY_DAYS:
+        raise SimpleFinError(f"days must be between 1 and {MAX_HISTORY_DAYS}")
+    now = now or datetime.now(timezone.utc)
+    path = _snapshot_path(data_dir, now)
+    # The protocol's bounds are inclusive, so 90 days starts 89 days before today.
+    url = build_url(access_url, start=now.date() - timedelta(days=days - 1), pending=True)
+    try:
+        with opener(_request(url), timeout=FETCH_TIMEOUT) as response:
+            body = response.read()
+        payload = json.loads(body.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - report transport/JSON uniformly
+        raise SimpleFinError(f"SimpleFIN fetch failed: {exc}") from None
+    if not isinstance(payload, dict):
+        raise SimpleFinError("SimpleFIN response must be a JSON object")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(body)
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    path.chmod(0o444)
+    return path, payload
 
 
 def fetch(access_url: str, start: date | None = None, end: date | None = None,

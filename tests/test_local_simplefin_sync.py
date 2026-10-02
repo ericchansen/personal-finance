@@ -5,12 +5,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from importers.monarch.wealthfolio_client import WealthfolioClient, source_day_timestamp
 from importers.simplefin.client import SimpleFinAccount, SimpleFinTransaction
 from importers.simplefin.local_sync import (
     activity_amount, cash_type, plan_balance, plan_holdings, plan_transactions,
     read_accounts, save_changes, sync, transfer_pairs, update_payload, verify_balances,
 )
+from importers.simplefin.wealthfolio_client import WealthfolioClient, source_day_timestamp
 
 
 ZONE = ZoneInfo("America/Chicago")
@@ -163,11 +163,15 @@ def test_conflicting_provider_ids_are_reported():
         read_accounts(payload)
 
 
-def test_local_client_is_explicit_and_loopback_only():
-    assert not WealthfolioClient().local_sync
-    assert WealthfolioClient(local_sync=True).local_sync
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8088", "http://localhost:8088", "http://[::1]:8088"])
+def test_client_accepts_loopback(url):
+    WealthfolioClient(url)
+
+
+@pytest.mark.parametrize("url", ["https://example.com", "http://192.168.1.10:8088"])
+def test_client_refuses_non_loopback(url):
     with pytest.raises(ValueError):
-        WealthfolioClient("https://example.com", local_sync=True)
+        WealthfolioClient(url)
 
 
 def test_posted_income_and_spending_are_not_marked_as_external_reconciliation():
