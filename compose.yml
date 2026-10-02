@@ -1,0 +1,67 @@
+# Wealthfolio plus the daily SimpleFIN sync.
+#
+#   pwsh deploy/init-env.ps1 -DataDir <finance-data>       # once
+#   docker compose --env-file <finance-data>/compose.env up -d --build
+#
+# compose.env holds secrets and lives in the private data directory, never here.
+# Required: FINANCE_DATA, TZ, WF_SECRET_KEY, WF_AUTH_PASSWORD_HASH, WEALTHFOLIO_PASSWORD.
+# Optional: WF_IMAGE, WF_BIND_ADDR, WF_PORT, WF_CORS_ALLOW_ORIGINS, SYNC_AT, SYNC_PING_URL.
+name: wealthfolio
+
+services:
+  wealthfolio:
+    # Keep the version and multi-platform digest explicit. Override only after
+    # the integration test passes against the replacement.
+    image: "${WF_IMAGE:-wealthfolio/wealthfolio:3.7.0@sha256:de137d64acf712c5c71093b27ecc98ccc1dbbbf00befdb684bed531cdb40069a}"
+    container_name: wealthfolio
+    restart: unless-stopped
+    # Loopback by default: this holds financial data. Publish on 0.0.0.0 only
+    # behind Tailscale or an authenticating reverse proxy.
+    ports:
+      - "${WF_BIND_ADDR:-127.0.0.1}:${WF_PORT:-8088}:8088"
+    volumes:
+      - "${FINANCE_DATA:?Set FINANCE_DATA in compose.env}/wealthfolio:/data"
+    environment:
+      WF_LISTEN_ADDR: "0.0.0.0:8088"
+      WF_DB_PATH: "/data/wealthfolio.db"
+      WF_SECRET_KEY: "${WF_SECRET_KEY:?Set WF_SECRET_KEY}"
+      # Argon2id PHC hash; single-quote it in compose.env so '$' is not interpolated.
+      WF_AUTH_PASSWORD_HASH: "${WF_AUTH_PASSWORD_HASH:?Set WF_AUTH_PASSWORD_HASH}"
+      WF_AUTH_TOKEN_TTL_MINUTES: "${WF_AUTH_TOKEN_TTL_MINUTES:-60}"
+      # Explicit origins, never "*", while authentication is enabled.
+      WF_CORS_ALLOW_ORIGINS: "${WF_CORS_ALLOW_ORIGINS:-http://localhost:8088,http://127.0.0.1:8088}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8088/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  sync:
+    build: .
+    container_name: wealthfolio-sync
+    restart: unless-stopped
+    # Share Wealthfolio's network so the sync reaches it on loopback only.
+    network_mode: "service:wealthfolio"
+    depends_on:
+      wealthfolio:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - "${FINANCE_DATA}:/finance"
+    environment:
+      TZ: "${TZ:?Set TZ (IANA name) in compose.env}"
+      WEALTHFOLIO_PASSWORD: "${WEALTHFOLIO_PASSWORD:?Set WEALTHFOLIO_PASSWORD}"
+      SYNC_AT: "${SYNC_AT:-06:00}"
+      SYNC_PING_URL: "${SYNC_PING_URL:-}"
+    healthcheck:
+      test: ["CMD", "python", "-m", "importers.simplefin.schedule", "--check"]
+      interval: 1h
+      timeout: 10s
+      start_period: 10m
+    logging: *logging

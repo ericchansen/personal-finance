@@ -17,7 +17,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -30,19 +29,12 @@ class WealthfolioError(RuntimeError):
         self.body = body
 
 
-def read_password(data_dir: Path) -> str:
+def read_password() -> str:
+    """The login password comes from compose.env; a terminal may type it instead."""
     if os.environ.get("WEALTHFOLIO_PASSWORD"):
         return os.environ["WEALTHFOLIO_PASSWORD"]
-    path = data_dir / "wealthfolio" / "ADMIN-PASSWORD.txt"
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            candidate = line.strip()
-            if candidate and " " not in candidate and not candidate.startswith(
-                ("Wealthfolio", "Move", "Only", "generated")
-            ):
-                return candidate
     if not sys.stdin.isatty():
-        raise ValueError("WEALTHFOLIO_PASSWORD is required for an unattended run")
+        raise ValueError("set WEALTHFOLIO_PASSWORD for an unattended run")
     return getpass.getpass("Wealthfolio password: ")
 
 

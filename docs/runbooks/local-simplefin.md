@@ -1,25 +1,35 @@
 # Local SimpleFIN sync
 
-Run Wealthfolio, keep the SimpleFIN access URL and Wealthfolio password in the existing private data directory, and run:
+The sync runs in the `sync` container of `compose.yml`, beside Wealthfolio. It fetches SimpleFIN once a day and updates the app through its local API. It needs no database or service beyond Wealthfolio itself.
+
+Run the commands below from this repository after defining this PowerShell shorthand. Inside the container the data directory is `/finance`.
 
 ```powershell
-python -m importers.simplefin.local_sync --data-dir "<your-finance-data>"
+function dc { docker compose --env-file "<your-finance-data>/compose.env" @args }
 ```
-
-This is a direct local importer. It needs no database or service beyond Wealthfolio itself.
 
 ## Setup
 
-Use Python 3.11 or newer. On Windows, install the IANA timezone database with `python -m pip install tzdata` (also included in `requirements.txt`). The sync otherwise uses the Python standard library.
+1. Create the private settings file and start the stack:
 
-Connect SimpleFIN once with a setup token from the SimpleFIN Bridge. Claiming consumes the token and stores the access URL in `<data>\simplefin\access-url.txt`:
+   ```powershell
+   pwsh deploy/init-env.ps1 -DataDir "<your-finance-data>"
+   dc up -d --build
+   ```
 
-```powershell
-python -m importers.simplefin.cli --data-dir "<your-finance-data>" claim --token "<setup-token>"
-python -m importers.simplefin.cli --data-dir "<your-finance-data>" accounts
-```
+2. Connect SimpleFIN once with a setup token from the SimpleFIN Bridge. Claiming consumes the token and stores the access URL in `<data>\simplefin\access-url.txt`:
 
-The Wealthfolio password comes from `WEALTHFOLIO_PASSWORD` or the `ADMIN-PASSWORD.txt` that `deploy\wealthfolio\init-env.ps1` writes to `<data>\wealthfolio\`.
+   ```powershell
+   dc run --rm --no-deps sync python -m importers.simplefin.cli claim --token "<setup-token>"
+   dc run --rm --no-deps sync python -m importers.simplefin.cli accounts
+   ```
+
+3. Create `<data>\simplefin\account-map.json` as described below, preview with a dry run, then run the first real sync by hand. The daily schedule starts only after that first sync, so a new mapping is always previewed before anything is written:
+
+   ```powershell
+   dc run --rm sync python -m importers.simplefin.local_sync --dry-run
+   dc run --rm sync python -m importers.simplefin.local_sync
+   ```
 
 Create `<data>\simplefin\account-map.json` (version 1), keyed by SimpleFIN account ID. Every source account needs an entry; an unmapped account is reported as an error. Use `"action": "exclude"` for accounts that should not sync. Keep household-specific configuration out of this public repository.
 
@@ -69,23 +79,25 @@ The command waits for actual native balances to agree with the source, including
 Preview without changing the app:
 
 ```powershell
-python -m importers.simplefin.local_sync --data-dir "<your-finance-data>" --dry-run
+dc run --rm sync python -m importers.simplefin.local_sync --dry-run
 ```
 
 Replay a saved response without making another SimpleFIN request:
 
 ```powershell
-python -m importers.simplefin.local_sync --data-dir "<your-finance-data>" --snapshot "<saved-response.json>"
+dc run --rm sync python -m importers.simplefin.local_sync --snapshot "/finance/raw/simplefin/<date>/<saved-response>.json"
 ```
 
-The private `simplefin\local-last-sync.json` records the result. `local-preview.json` is separate, so previews do not overwrite the last real run. An account-level failure produces a nonzero exit status.
+The private `simplefin\local-last-sync.json` records the result. `local-preview.json` is separate, so previews do not overwrite the last real run. An account-level failure produces a nonzero exit status. The module also runs on any Python 3.11+ with `FINANCE_DATA` and `WEALTHFOLIO_PASSWORD` set.
 
-## Run daily on Windows
+## Schedule and alerts
 
-Keep only one daily writer; remove any older finance tasks first. Then install:
+The `sync` container runs the sync at the first check after `SYNC_AT` (default `06:00` in `TZ`), once a day, after the first manual sync. It checks every five minutes, so a computer that slept through the scheduled time catches up when it wakes. A crash retries hourly, replaying the day's saved SimpleFIN response instead of requesting another, and retries stop requesting new data after half of SimpleFIN's 24 daily requests. A run that finishes with account errors waits for the next day. The sync signs in to Wealthfolio before requesting SimpleFIN data, so an unavailable app costs no requests. These limits are kept in the data directory, so they survive container restarts.
 
-```powershell
-.\importers\simplefin\install-local-task.ps1 -DataDir "<your-finance-data>"
-```
+Docker marks `wealthfolio-sync` unhealthy when the last sync is more than 26 hours old or reported errors. Check it with `docker ps` or `dc logs sync`.
 
-The task runs directly from this checkout, ignores overlapping starts, and runs a missed invocation when the computer becomes available. Keep the checkout at that path. No service, container, or additional database is needed for the importer.
+For an alert that also fires when the computer or Docker is off, create a check at [healthchecks.io](https://healthchecks.io) (or a self-hosted Healthchecks) with a one-day period, and set `SYNC_PING_URL` in `compose.env` to its ping URL. Each run sends only its exit status: `0` is success, anything else is a failure. A missing ping alerts after the grace period. Apply the change with `dc up -d`.
+
+## Upgrade or move
+
+Everything private lives in the data directory: `compose.env`, the SimpleFIN files, and Wealthfolio's database. To move machines, copy that directory and run `dc up -d --build` from a checkout of this repository. To update the code, pull and run the same command.

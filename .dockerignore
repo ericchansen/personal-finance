@@ -1,0 +1,4 @@
+*
+!importers/
+!requirements.txt
+**/__pycache__
