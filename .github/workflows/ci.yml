@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pytest argon2-cffi
+      - name: Scan for data and secrets
+        run: python .githooks/scan_staged.py --all
+      - name: Validate compose and build the sync image
+        env:
+          FINANCE_DATA: /tmp/finance
+          TZ: UTC
+          WF_SECRET_KEY: ci-placeholder
+          WF_AUTH_PASSWORD_HASH: ci-placeholder
+          WEALTHFOLIO_PASSWORD: ci-placeholder
+        run: docker compose config --quiet && docker compose build sync
+      - name: Test, including the pinned Wealthfolio image
+        env:
+          WEALTHFOLIO_IT: "1"
+        run: python -m pytest -q
