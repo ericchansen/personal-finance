@@ -6,15 +6,24 @@ Run Wealthfolio, keep the SimpleFIN access URL and Wealthfolio password in the e
 python -m importers.simplefin.local_sync --data-dir "<your-finance-data>"
 ```
 
-This is a direct local importer. It does not require PostgreSQL, canonical publications, approval files, backups, or a release installation. The existing guarded commands are unchanged; this command explicitly uses the local API client.
+This is a direct local importer. It needs no database or service beyond Wealthfolio itself.
 
 ## Setup
 
-Use Python 3.11 or newer. On Windows, install the IANA timezone database with `python -m pip install tzdata` (also included in `requirements.txt`). The direct sync otherwise uses the Python standard library.
+Use Python 3.11 or newer. On Windows, install the IANA timezone database with `python -m pip install tzdata` (also included in `requirements.txt`). The sync otherwise uses the Python standard library.
 
-Use `<data>\simplefin\account-map.json`, the same version-1 map used by the collector. Each source account must have an explicit disposition. Keep household-specific configuration out of this public repository.
+Connect SimpleFIN once with a setup token from the SimpleFIN Bridge. Claiming consumes the token and stores the access URL in `<data>\simplefin\access-url.txt`:
 
-For cash and credit-card entries, `wealthfolioAccountId` names the existing app account. Set `historyThrough` to the last calendar day owned by the old historical importer. SimpleFIN owns posted transactions after that date; do not keep another importer writing that same period.
+```powershell
+python -m importers.simplefin.cli --data-dir "<your-finance-data>" claim --token "<setup-token>"
+python -m importers.simplefin.cli --data-dir "<your-finance-data>" accounts
+```
+
+The Wealthfolio password comes from `WEALTHFOLIO_PASSWORD` or the `ADMIN-PASSWORD.txt` that `deploy\wealthfolio\init-env.ps1` writes to `<data>\wealthfolio\`.
+
+Create `<data>\simplefin\account-map.json` (version 1), keyed by SimpleFIN account ID. Every source account needs an entry; an unmapped account is reported as an error. Use `"action": "exclude"` for accounts that should not sync. Keep household-specific configuration out of this public repository.
+
+For cash and credit-card entries, `wealthfolioAccountId` names the existing app account. Set `historyThrough` to the last calendar day already covered by earlier imports. SimpleFIN owns posted transactions after that date; do not keep another importer writing that same period.
 
 ```json
 {
@@ -33,7 +42,7 @@ For an empty account, choose a date before the first transaction you want. Simpl
 
 If a previous importer already delivered transactions after the boundary, add `existingActivities` to that account entry: an object mapping each exact SimpleFIN transaction ID to its existing Wealthfolio activity ID. This is a one-time mapping, not fuzzy merchant matching. Legacy `simplefin:<app-account-id>:<transaction-id>` keys are recognized automatically.
 
-The importer keeps the app's existing account names. Set names from the private account facts when first creating accounts; do not copy aggregator decorations into the app.
+The importer keeps the app's existing account names. Name accounts in Wealthfolio when creating them; do not copy aggregator decorations into the app.
 
 ## Routine behavior
 
@@ -73,7 +82,7 @@ The private `simplefin\local-last-sync.json` records the result. `local-preview.
 
 ## Run daily on Windows
 
-Disable the old SimpleFIN collector and incremental writer tasks first. Keep only one daily writer:
+Keep only one daily writer; remove any older finance tasks first. Then install:
 
 ```powershell
 .\importers\simplefin\install-local-task.ps1 -DataDir "<your-finance-data>"

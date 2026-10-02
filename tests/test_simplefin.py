@@ -6,6 +6,7 @@ from io import BytesIO
 
 import pytest
 
+from importers.simplefin import cli
 from importers.simplefin.client import (
     SimpleFinError,
     build_url,
@@ -342,3 +343,12 @@ def test_mapping_file_shape_is_validated(tmp_path):
 def test_missing_access_url_explains_how_to_claim(tmp_path):
     with pytest.raises(SimpleFinError, match="claim --token"):
         read_access_url(tmp_path)
+
+
+def test_claim_stores_the_access_url_and_refuses_to_overwrite_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "claim_access_url", lambda token: ACCESS)
+    argv = ["--data-dir", str(tmp_path), "claim", "--token", TOKEN]
+    assert cli.main(argv) == 0
+    assert read_access_url(tmp_path) == ACCESS
+    with pytest.raises(SystemExit, match="already exists"):
+        cli.main(argv)

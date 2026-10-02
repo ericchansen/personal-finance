@@ -16,65 +16,64 @@ Never:
 - Paste real transaction rows, balances, or account numbers into code, tests, docs, or
   commit messages
 - Write real account numbers into runbooks — describe navigation generically
-- Hardcode credentials; use environment variables or the Wealthfolio addon `secrets` API
+- Hardcode credentials; use environment variables or files in the data directory
 
 Test fixtures must be **synthetic**. Invent plausible-looking data; never trim a real export.
 
 ## Architecture
 
 We **consume Wealthfolio unforked** as an upstream Docker image. It owns the ledger, net
-worth, cash flow, budgets, charts, and the FIRE simulator. We do not reimplement any of that.
-
-Where Wealthfolio needs extending, we write an **addon** against
-`@wealthfolio/addon-sdk` — a separate module, never a patch to upstream.
+worth, cash flow, spending categories, budgets, charts, and the FIRE simulator. We do not
+reimplement any of that. Prefer Wealthfolio's own features (for example its spending rules)
+over new code here.
 
 ```
 deploy/wealthfolio/   Docker Compose for the Wealthfolio server
-importers/            Extract -> Wealthfolio normalization
-recorder/             CDP network recorder
-docs/runbooks/        Per-institution extract instructions (PII-free)
+importers/simplefin/  SimpleFIN client, setup CLI, and the daily local sync
+docs/runbooks/        Sync runbook (PII-free)
 ```
+
+The daily task runs `python -m importers.simplefin.local_sync`; keep that module path stable.
+Code removed from earlier designs is preserved at the git tag `archive/evidence-pipeline`;
+restore pieces from there only when a concrete need appears.
 
 ## Data lives outside the repo
 
-The data directory is configured by `WEALTHFOLIO_DATA` / `FINANCE_DATA` and defaults to a
-path outside this checkout. Layout:
+The data directory is passed as `--data-dir` or `FINANCE_DATA` and lives outside this
+checkout. Layout:
 
 ```
-<data>/extracts/<institution>/   Raw downloads, as retrieved
-<data>/recordings/               Redacted CDP captures
-<data>/normalized/               Importer output
-<data>/ollama-agent/             Local-model suggestions, reviews, decision cache
-<data>/wealthfolio/              Wealthfolio SQLite volume
+<data>/simplefin/access-url.txt        SimpleFIN credential (secret)
+<data>/simplefin/account-map.json      Private source-account -> Wealthfolio mapping
+<data>/simplefin/local-last-sync.json  Result of the last real sync
+<data>/simplefin/local-preview.json    Result of the last --dry-run
+<data>/raw/simplefin/<date>/           Immutable SimpleFIN responses, replayable with --snapshot
+<data>/wealthfolio/                    Wealthfolio SQLite volume and generated admin password
 ```
 
 ## Data-quality invariants
 
-- **Trust cutoff.** Aggregator exports may carry *stale, forward-filled* balances that look
-  real. Every account has a trust-cutoff date; balances after it must be discarded, not
-  imported. This is enforced in code, not by memory.
-- **Idempotent imports.** Re-importing an overlapping date range must never double-count.
-  Dedup on a stable source ID where one exists.
-- **Active vs. closed accounts.** Closed accounts must not distort net worth or cash flow.
+- **History boundary.** Each cash or card mapping has `historyThrough`, the last day owned by
+  earlier imports. The sync only creates activity after it, so sources never overlap.
+- **Idempotent imports.** Activities carry stable, account-scoped provider IDs. Replaying an
+  overlapping window must never double-count.
+- **No invented money.** Never fabricate income, spending, trades, or securities to force a
+  balance. Report the mismatch instead.
+- **Active vs. closed accounts.** Inactive or excluded accounts are skipped and must not
+  distort net worth or cash flow.
 
-## Account names and durable decisions
+## Account names and private decisions
 
-- The private account fact's `displayName` is the canonical user-facing name. Source and
-  aggregator names are aliases for matching only and must not overwrite it during refresh.
-- Use a concise ownership qualifier plus institution or product and account type. Append a
-  real last-four only when it is known and needed to distinguish otherwise identical
-  accounts. Never display placeholder masks, raw source IDs, or aggregator decorations.
-- Make household-specific naming, ownership, exclusion, and source-mapping decisions in the
-  external facts, decisions, and mapping files first. Future agents must inspect those
-  private decisions before planning an import or changing Wealthfolio.
-- Rebuild the private canonical publication after a fact change, then reconcile Wealthfolio
-  from the reviewed canonical plan. Do not make an ad hoc app-only rename that will drift
-  from the system of record.
+- The account name in Wealthfolio is the user-facing name; the sync never renames accounts.
+  Use a concise ownership qualifier plus institution or product and account type. Append a
+  real last-four only when needed to distinguish otherwise identical accounts. Never display
+  placeholder masks, raw source IDs, or aggregator decorations.
+- Household-specific mapping, exclusion, and history-boundary decisions live in the private
+  `account-map.json`. Inspect it before changing how an account is imported.
 
 ## Conventions
 
 - Python 3.11+, standard library preferred; keep dependencies minimal and justified
-- Filenames follow the existing convention: `Institution - Document Type - YYYY-MM-DD.ext`
 - Commits are conventional (`feat:`, `fix:`, `docs:`, `chore:`) and self-contained
 
 ## Before pushing

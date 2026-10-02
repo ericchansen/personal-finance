@@ -1,4 +1,4 @@
-"""SimpleFIN -> local Wealthfolio, without the canonical/release pipeline."""
+"""Sync SimpleFIN into a local Wealthfolio."""
 
 from __future__ import annotations
 
