@@ -580,6 +580,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     root = Path(args.data_dir).resolve()
     mapping = load_mapping(root)
+    # Fail before spending a SimpleFIN request when Wealthfolio is unavailable.
+    client = WealthfolioClient(args.base_url)
+    client.login(read_password())
     if args.snapshot:
         snapshot_path = args.snapshot.resolve()
         payload = json.loads(args.snapshot.read_text(encoding="utf-8"))
@@ -588,14 +591,16 @@ def main(argv=None) -> int:
     last_path = root / "simplefin" / "local-last-sync.json"
     if not args.dry_run and last_path.exists():
         previous = json.loads(last_path.read_text(encoding="utf-8")).get("snapshotPath")
-        if previous and Path(previous).exists() and snapshot_path.stat().st_mtime < Path(previous).stat().st_mtime:
+        previous = root / previous if previous else None
+        if previous and previous.exists() and snapshot_path.stat().st_mtime < previous.stat().st_mtime:
             raise ValueError("snapshot is older than the last sync; use --dry-run to inspect it")
     sources, warnings = read_accounts(payload)
-    client = WealthfolioClient(args.base_url)
-    client.login(read_password(root))
     result = sync(client, sources, mapping, dry_run=args.dry_run)
     result["warnings"] = warnings + result["warnings"]
-    result["snapshotPath"] = str(snapshot_path)
+    # Relative to the data directory, so host and container runs agree.
+    result["snapshotPath"] = (
+        snapshot_path.relative_to(root).as_posix() if snapshot_path.is_relative_to(root) else str(snapshot_path)
+    )
     output = root / "simplefin" / ("local-preview.json" if args.dry_run else "local-last-sync.json")
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({k: v for k, v in result.items() if k != "accounts"}))
@@ -606,6 +611,6 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ValueError, InvalidOperation, OSError, SimpleFinError) as exc:
+    except (ValueError, InvalidOperation, OSError, SimpleFinError, WealthfolioError) as exc:
         print(f"Local sync failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

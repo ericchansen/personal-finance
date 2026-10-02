@@ -10,33 +10,35 @@ locally in Docker, and one small daily job syncs [SimpleFIN](https://www.simplef
 ## How it works
 
 Wealthfolio, consumed **unforked** as an upstream image, owns the ledger, net worth, cash
-flow, spending categories, budgets, and charts. This repository only feeds it:
+flow, spending categories, budgets, and charts. This repository only feeds it.
 
-- `importers/simplefin/local_sync.py` fetches 45 days of SimpleFIN data and updates the running
-  app through its local API: posted transactions, cash and card balances, investment positions,
-  and liability values. Replays are no-ops, and it never invents income or spending to force a
-  balance. See the [runbook](docs/runbooks/local-simplefin.md).
+`compose.yml` runs two containers: pinned Wealthfolio, and a `sync` container that runs
+`importers/simplefin/local_sync.py` once a day. The sync fetches 45 days of SimpleFIN data and
+updates the app through its local API: posted transactions, cash and card balances, investment
+positions, and liability values. Replays are no-ops, and it never invents income or spending to
+force a balance. Every secret and all data live in one private directory, so the stack is
+reproducible from a checkout plus that directory. See the
+[runbook](docs/runbooks/local-simplefin.md).
 
 ## Quick start
 
 ```powershell
-# 1. Run Wealthfolio. init-env.ps1 writes deploy/wealthfolio/.env and a generated
-#    login password beside the database (needs: pip install argon2-cffi).
-pwsh deploy/wealthfolio/init-env.ps1 -DataDir "<your-finance-data>/wealthfolio"
-docker compose -f deploy/wealthfolio/compose.yml up -d
+# 1. Create <your-finance-data>/compose.env (needs: pip install argon2-cffi), then start
+pwsh deploy/init-env.ps1 -DataDir "<your-finance-data>"
+function dc { docker compose --env-file "<your-finance-data>/compose.env" @args }
+dc up -d --build
 
 # 2. Connect SimpleFIN once
-python -m importers.simplefin.cli --data-dir "<your-finance-data>" claim --token "<setup-token>"
+dc run --rm --no-deps sync python -m importers.simplefin.cli claim --token "<setup-token>"
 
-# 3. Map accounts in <your-finance-data>\simplefin\account-map.json (see the runbook), then sync
-python -m importers.simplefin.local_sync --data-dir "<your-finance-data>" --dry-run
-python -m importers.simplefin.local_sync --data-dir "<your-finance-data>"
-
-# 4. Schedule it daily
-.\importers\simplefin\install-local-task.ps1 -DataDir "<your-finance-data>"
+# 3. Map accounts in <your-finance-data>/simplefin/account-map.json (see the runbook), preview,
+#    then run the first sync by hand; the daily schedule starts after it
+dc run --rm sync python -m importers.simplefin.local_sync --dry-run
+dc run --rm sync python -m importers.simplefin.local_sync
 ```
 
-Then open <http://localhost:8088> (or the configured `WF_PORT`).
+The sync then runs daily at 06:00. Open <http://localhost:8088> (or the configured `WF_PORT`).
+For alerts when a sync fails or does not run, set `SYNC_PING_URL` (see the runbook).
 
 ## Security
 
@@ -51,16 +53,20 @@ Financial data is sensitive and this repository is public, so the boundary is st
   ```
 - **The SimpleFIN access URL is a credential** for every connected institution. It lives only
   in the data directory and is revocable from the SimpleFIN Bridge dashboard.
-- **Wealthfolio stays on loopback** with authentication enabled, and the sync refuses to talk
-  to a non-loopback URL.
+- **Secrets live in `<data>/compose.env`**, never in a checkout, so deleting or recloning the
+  repository cannot lose them.
+- **Wealthfolio stays on loopback** with authentication enabled. The sync container shares
+  Wealthfolio's network namespace and refuses any non-loopback URL. The optional alert ping
+  carries only an exit status.
 
 ## Layout
 
 ```
-deploy/wealthfolio/   Docker Compose for the Wealthfolio server
-importers/simplefin/  SimpleFIN client, setup CLI, daily local sync, and task installer
-docs/runbooks/        Sync runbook
-.githooks/            Pre-commit data guard
+compose.yml, Dockerfile  Wealthfolio plus the sync container
+deploy/init-env.ps1      Creates the private compose.env
+importers/simplefin/     SimpleFIN client, setup CLI, local sync, and daily scheduler
+docs/runbooks/           Sync runbook
+.githooks/               Pre-commit data guard
 ```
 
 ## History

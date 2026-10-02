@@ -1,1 +1,1 @@
-tzdata>=2025.1; sys_platform == "win32"
+tzdata>=2025.1

@@ -28,27 +28,30 @@ reimplement any of that. Prefer Wealthfolio's own features (for example its spen
 over new code here.
 
 ```
-deploy/wealthfolio/   Docker Compose for the Wealthfolio server
-importers/simplefin/  SimpleFIN client, setup CLI, and the daily local sync
-docs/runbooks/        Sync runbook (PII-free)
+compose.yml, Dockerfile  Wealthfolio plus the sync container
+deploy/init-env.ps1      Creates the private compose.env
+importers/simplefin/     SimpleFIN client, setup CLI, local sync, and daily scheduler
+docs/runbooks/           Sync runbook (PII-free)
 ```
 
-The daily task runs `python -m importers.simplefin.local_sync`; keep that module path stable.
-Code removed from earlier designs is preserved at the git tag `archive/evidence-pipeline`;
-restore pieces from there only when a concrete need appears.
+The `sync` container runs `python -m importers.simplefin.schedule`, which calls
+`importers.simplefin.local_sync`; keep those module paths stable. Code removed from earlier
+designs is preserved at the git tag `archive/evidence-pipeline`; restore pieces from there only
+when a concrete need appears.
 
 ## Data lives outside the repo
 
-The data directory is passed as `--data-dir` or `FINANCE_DATA` and lives outside this
-checkout. Layout:
+The data directory is `FINANCE_DATA` (mounted at `/finance` in the sync container) and lives
+outside this checkout. Layout:
 
 ```
+<data>/compose.env                     Secrets and settings for compose.yml (secret)
 <data>/simplefin/access-url.txt        SimpleFIN credential (secret)
 <data>/simplefin/account-map.json      Private source-account -> Wealthfolio mapping
 <data>/simplefin/local-last-sync.json  Result of the last real sync
 <data>/simplefin/local-preview.json    Result of the last --dry-run
 <data>/raw/simplefin/<date>/           Immutable SimpleFIN responses, replayable with --snapshot
-<data>/wealthfolio/                    Wealthfolio SQLite volume and generated admin password
+<data>/wealthfolio/                    Wealthfolio SQLite volume and its backups
 ```
 
 ## Data-quality invariants
