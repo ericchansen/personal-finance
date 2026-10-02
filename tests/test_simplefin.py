@@ -1,6 +1,6 @@
 import base64
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from io import BytesIO
 
@@ -12,7 +12,10 @@ from importers.simplefin.client import (
     claim_access_url,
     decode_setup_token,
     fetch,
+    fetch_snapshot,
+    load_mapping,
     parse_accounts,
+    read_access_url,
     split_credentials,
 )
 
@@ -275,3 +278,67 @@ def test_fetch_wraps_transport_failures():
         raise OSError("connection reset")
     with pytest.raises(SimpleFinError):
         fetch(ACCESS, opener=boom)
+
+NOW = datetime(2026, 8, 27, 12, 30, tzinfo=timezone.utc)
+
+
+def test_snapshot_is_exact_immutable_dated_raw_json(tmp_path):
+    body = b'{"accounts":[],"errors":[]}\n'
+    path, payload = fetch_snapshot(tmp_path, ACCESS, now=NOW, opener=opener_returning(body))
+    assert path.parent == tmp_path / "raw" / "simplefin" / "2026-08-27"
+    assert path.read_bytes() == body
+    assert payload == {"accounts": [], "errors": []}
+
+
+def test_snapshot_window_is_inclusive_and_requests_pending(tmp_path):
+    seen = []
+
+    def opener(request, timeout=None):
+        seen.append(request.full_url)
+        return FakeResponse(b"{}")
+
+    fetch_snapshot(tmp_path, ACCESS, days=90, now=NOW, opener=opener)
+    start = int(datetime(2026, 5, 30, tzinfo=timezone.utc).timestamp())
+    assert f"start-date={start}" in seen[0] and "pending=1" in seen[0]
+
+
+def test_history_above_90_days_is_rejected_before_network_access(tmp_path):
+    with pytest.raises(SimpleFinError, match="between 1 and 90"):
+        fetch_snapshot(tmp_path, ACCESS, days=91, opener=pytest.fail)
+
+
+def test_daily_limit_blocks_a_25th_attempt_before_network_access(tmp_path):
+    folder = tmp_path / "raw" / "simplefin" / "2026-08-27"
+    folder.mkdir(parents=True)
+    for slot in range(1, 25):
+        (folder / f"request-{slot:02d}").touch()
+    with pytest.raises(SimpleFinError, match="daily SimpleFIN request limit"):
+        fetch_snapshot(tmp_path, ACCESS, now=NOW, opener=pytest.fail)
+
+
+def test_failed_fetch_consumes_a_slot_but_writes_no_snapshot(tmp_path):
+    def opener(request, timeout=None):
+        raise OSError("synthetic outage")
+
+    with pytest.raises(SimpleFinError, match="fetch failed"):
+        fetch_snapshot(tmp_path, ACCESS, now=NOW, opener=opener)
+    folder = tmp_path / "raw" / "simplefin" / "2026-08-27"
+    assert [p.name for p in folder.iterdir()] == ["request-01"]
+
+
+def test_private_mapping_is_required(tmp_path):
+    with pytest.raises(SimpleFinError, match="missing private account mapping"):
+        load_mapping(tmp_path)
+
+
+def test_mapping_file_shape_is_validated(tmp_path):
+    folder = tmp_path / "simplefin"
+    folder.mkdir()
+    (folder / "account-map.json").write_text(json.dumps({"accounts": {}}))
+    with pytest.raises(SimpleFinError, match="version 1"):
+        load_mapping(tmp_path)
+
+
+def test_missing_access_url_explains_how_to_claim(tmp_path):
+    with pytest.raises(SimpleFinError, match="claim --token"):
+        read_access_url(tmp_path)

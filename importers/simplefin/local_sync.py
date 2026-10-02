@@ -13,14 +13,23 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from importers.monarch.wealthfolio_client import (
+from importers.simplefin.client import (
+    DEFAULT_HISTORY_DAYS,
+    MAX_HISTORY_DAYS,
+    SimpleFinAccount,
+    SimpleFinError,
+    SimpleFinTransaction,
+    fetch_snapshot,
+    load_mapping,
+    parse_accounts,
+    read_access_url,
+)
+from importers.simplefin.wealthfolio_client import (
     WealthfolioClient,
     WealthfolioError,
+    read_password,
     source_day_timestamp,
 )
-from importers.simplefin.cli import read_access_url, read_wealthfolio_password
-from importers.simplefin.client import SimpleFinAccount, SimpleFinTransaction, parse_accounts
-from importers.simplefin.pipeline import fetch_snapshot, load_mapping
 
 INFLOWS = {"DEPOSIT", "CREDIT", "INTEREST", "DIVIDEND", "TRANSFER_IN"}
 OUTFLOWS = {"WITHDRAWAL", "EXPENSE", "FEE", "TAX", "TRANSFER_OUT"}
@@ -565,7 +574,8 @@ def main(argv=None) -> int:
     parser.add_argument("--data-dir", default=os.environ.get("FINANCE_DATA"), required=not os.environ.get("FINANCE_DATA"))
     parser.add_argument("--base-url", default="http://127.0.0.1:8088")
     parser.add_argument("--snapshot", type=Path, help="Replay an existing SimpleFIN JSON response")
-    parser.add_argument("--days", type=int, default=45, choices=range(1, 91), metavar="1..90")
+    parser.add_argument("--days", type=int, default=DEFAULT_HISTORY_DAYS,
+                        choices=range(1, MAX_HISTORY_DAYS + 1), metavar=f"1..{MAX_HISTORY_DAYS}")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     root = Path(args.data_dir).resolve()
@@ -581,8 +591,8 @@ def main(argv=None) -> int:
         if previous and Path(previous).exists() and snapshot_path.stat().st_mtime < Path(previous).stat().st_mtime:
             raise ValueError("snapshot is older than the last sync; use --dry-run to inspect it")
     sources, warnings = read_accounts(payload)
-    client = WealthfolioClient(args.base_url, local_sync=True)
-    client.login(read_wealthfolio_password(root))
+    client = WealthfolioClient(args.base_url)
+    client.login(read_password(root))
     result = sync(client, sources, mapping, dry_run=args.dry_run)
     result["warnings"] = warnings + result["warnings"]
     result["snapshotPath"] = str(snapshot_path)
@@ -596,6 +606,6 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ValueError, InvalidOperation, OSError) as exc:
+    except (ValueError, InvalidOperation, OSError, SimpleFinError) as exc:
         print(f"Local sync failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
