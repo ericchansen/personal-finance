@@ -16,9 +16,9 @@ flow, spending categories, budgets, and charts. This repository only feeds it.
 `importers/simplefin/local_sync.py` once a day. The sync fetches 45 days of SimpleFIN data and
 updates the app through its local API: posted transactions, cash and card balances, investment
 positions, and liability values. Replays are no-ops, and it never invents income or spending to
-force a balance. Every secret and all data live in one private directory, so the stack is
-reproducible from a checkout plus that directory. See the
-[runbook](docs/runbooks/local-simplefin.md).
+force a balance. Wealthfolio's own rules categorize new activity. Every secret and all data live
+in one private directory, so the stack is reproducible from a checkout plus that directory. See
+the [runbook](docs/runbooks/local-simplefin.md).
 
 ## Quick start
 

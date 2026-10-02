@@ -64,6 +64,16 @@ The importer keeps the app's existing account names. Name accounts in Wealthfoli
 - Credit cards retain transaction tracking. A reusable positive `TRANSFER_IN` reconciliation is neutral in native spending. A required negative adjustment is an error: import the missing charges or correct the historical data rather than manufacture an expense. Wealthfolio 3.7 cannot represent a neutral negative card adjustment through its API.
 - Unambiguous equal/opposite transfers are linked without changing their posting dates. Explicit account destinations must agree; cross-day links require routing evidence. Unmatched cash legs are reported because Wealthfolio includes them in income/spending until a counterpart is linked. The importer does not invent counterpart transactions.
 
+## Categories and transfers
+
+Categorization is Wealthfolio's job; this repository adds no categorization code. After each sync, Wealthfolio applies its own rules to new, uncategorized activity in the accounts selected in Spending settings. Rules never overwrite a category you chose by hand, and they live in Wealthfolio's database, so its backups include them.
+
+- **Accounts.** Select every cash and card account that should count as household spending in Spending settings. Unselected accounts are never auto-categorized.
+- **Frequent merchants.** Add a rule for each frequent merchant, matching a distinctive fragment of the description. A handful of merchants usually covers a large share of transactions; categorize the rest by hand.
+- **Long tail.** Wealthfolio's built-in assistant can draft a rule from a hint such as "coffee shops are Food / Coffee"; it saves nothing until you approve the draft. The assistant sends transaction text to its AI provider, so use only a local [Ollama](https://ollama.com) provider. Wealthfolio runs in Docker, so set the provider URL to `http://host.docker.internal:11434` on Docker Desktop, not `localhost`.
+
+Transfers between synced accounts are linked automatically when both legs are unambiguous. `unmatchedTransferCount` in `local-last-sync.json` counts the transfer legs still unlinked, which Wealthfolio counts as income or spending. Link each pair in the app; if the money really left your accounts, change the activity's type instead.
+
 ## Investments and loans
 
 The original SimpleFIN parser discarded `holdings`. The local sync imports the provider's actual position quantities and market values using Wealthfolio's native holdings snapshots. Investment accounts use `HOLDINGS` tracking; their existing transaction history is retained, but the importer does not invent trades from investment cash movements.
