@@ -84,6 +84,8 @@ outside this checkout. Layout:
 ```sh
 git config core.hooksPath .githooks   # once
 python .githooks/scan_staged.py --all # scan the whole tree
+WEALTHFOLIO_IT=1 python -m pytest     # unit tests plus the pinned Wealthfolio image (needs Docker)
 ```
 
-Review `git diff --stat` for anything data-shaped that slipped through.
+CI runs the same checks on every pull request. Review `git diff --stat` for anything
+data-shaped that slipped through.

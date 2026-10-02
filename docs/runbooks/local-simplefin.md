@@ -101,3 +101,12 @@ For an alert that also fires when the computer or Docker is off, create a check 
 ## Upgrade or move
 
 Everything private lives in the data directory: `compose.env`, the SimpleFIN files, and Wealthfolio's database. To move machines, copy that directory and run `dc up -d --build` from a checkout of this repository. To update the code, pull and run the same command.
+
+To upgrade Wealthfolio, change the pinned image in `compose.yml` and run the integration test, which starts that image with synthetic data and runs the sync twice:
+
+```powershell
+pip install pytest argon2-cffi
+$env:WEALTHFOLIO_IT = "1"; python -m pytest
+```
+
+CI runs the same test on every pull request. Deploy with `dc up -d` only after it passes.
