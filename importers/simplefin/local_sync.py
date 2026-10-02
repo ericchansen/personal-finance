@@ -33,6 +33,7 @@ from importers.simplefin.wealthfolio_client import (
 
 INFLOWS = {"DEPOSIT", "CREDIT", "INTEREST", "DIVIDEND", "TRANSFER_IN"}
 OUTFLOWS = {"WITHDRAWAL", "EXPENSE", "FEE", "TAX", "TRANSFER_OUT"}
+TRANSFERS = {"TRANSFER_IN", "TRANSFER_OUT"}
 
 
 def money(value) -> Decimal:
@@ -78,6 +79,17 @@ def activity_amount(row: dict) -> Decimal:
     if row["activityType"] in OUTFLOWS:
         return -abs(amount)
     raise ValueError("expected a cash activity")
+
+
+def net_amount(row: dict) -> Decimal:
+    return activity_amount(row) - money(row.get("fee") or 0) - money(row.get("tax") or 0)
+
+
+def source_fields(transaction: SimpleFinTransaction) -> dict:
+    return {
+        "amount": str(transaction.amount), "date": transaction.posted.isoformat(),
+        "description": transaction.description,
+    }
 
 
 def cash_type(transaction: SimpleFinTransaction, account_type: str) -> str:
@@ -161,12 +173,9 @@ def plan_transactions(
                 if activity_amount(row) != txn.amount:
                     raise ValueError("existing source ID has a different amount; correct its mapping")
                 continue
-            current_source = {
-                "amount": str(txn.amount), "date": txn.posted.isoformat(),
-                "description": txn.description,
-            }
+            current_source = source_fields(txn)
             kind = cash_type(txn, account["accountType"])
-            external = kind in {"TRANSFER_IN", "TRANSFER_OUT"} and not row.get("sourceGroupId")
+            external = kind in TRANSFERS and not row.get("sourceGroupId")
             if previous == current_source and metadata(row).get("flow", {}).get("is_external", False) == external:
                 continue
             if activity_amount(row) != money(previous["amount"]) or row["date"][:10] != previous["date"]:
@@ -194,11 +203,8 @@ def plan_transactions(
             "comment": txn.description,
             "idempotencyKey": key,
             "metadata": json.dumps({
-                "simplefin": {
-                    "amount": str(txn.amount), "date": txn.posted.isoformat(),
-                    "description": txn.description,
-                },
-                "flow": {"is_external": kind in {"TRANSFER_IN", "TRANSFER_OUT"}},
+                "simplefin": source_fields(txn),
+                "flow": {"is_external": kind in TRANSFERS},
             }),
         })
     return creates, updates
@@ -212,8 +218,7 @@ def plan_balance(source: SimpleFinAccount, account: dict, activities: list[dict]
     if existing and existing["date"][:10] > source.balance_date.isoformat():
         return [], []
     balance = sum(
-        (activity_amount(row) - money(row.get("fee") or 0) - money(row.get("tax") or 0)
-         for row in activities
+        (net_amount(row) for row in activities
          if row["accountId"] == account["id"]
          and row.get("idempotencyKey") != key
          and row["date"][:10] <= source.balance_date.isoformat()),
@@ -346,12 +351,12 @@ def routed_to(left, right):
     return bool(suffixes & set(re.findall(r"\b\d{4}\b", right.get("accountName") or "")))
 
 
+def unlinked_transfer(row: dict) -> bool:
+    return bool(metadata(row).get("simplefin")) and row["activityType"] in TRANSFERS and not row.get("sourceGroupId")
+
+
 def transfer_pairs(rows):
-    candidates = [
-        row for row in rows if metadata(row).get("simplefin")
-        and row["activityType"] in {"TRANSFER_IN", "TRANSFER_OUT"}
-        and not row.get("sourceGroupId")
-    ]
+    candidates = [row for row in rows if unlinked_transfer(row)]
     matches = {}
     for left in candidates:
         choices = []
@@ -420,6 +425,119 @@ def verify_balances(client, expected, positions, *, attempts=15, sleeper=time.sl
     raise ValueError("Wealthfolio values did not settle to source balances: " + ", ".join(differences))
 
 
+def use_holdings(client, account, snapshot, quotes, positions):
+    if account["trackingMode"] != "HOLDINGS":
+        client.update_account(account["id"], **{
+            k: v for k, v in {**account, "trackingMode": "HOLDINGS"}.items() if k != "id"
+        })
+    publish_holdings(client, snapshot, quotes)
+    positions[account["id"]] = (snapshot, quotes)
+
+
+def unlink(client, rows, update):
+    """A corrected transfer leg leaves its link; the pairing step relinks it if still valid."""
+    group = update["sourceGroupId"]
+    counterpart = next(row for row in rows if row.get("sourceGroupId") == group and row["id"] != update["id"])
+    client.post("/activities/unlink", {"activityAId": update["id"], "activityBId": counterpart["id"]})
+    for member in rows:
+        if member.get("sourceGroupId") == group:
+            member["sourceGroupId"] = None
+            member["metadata"] = {**metadata(member), "flow": {"is_external": True}}
+    update["sourceGroupId"] = None
+    update["metadata"] = json.dumps({**json.loads(update["metadata"]), "flow": {"is_external": True}})
+
+
+def sync_liability(client, source, current, dry_run) -> int:
+    if current["kind"] != "liability" or source.balance > 0:
+        raise ValueError("expected a non-positive source liability balance")
+    if current["currency"] != source.currency:
+        raise ValueError("source and Wealthfolio liability currencies differ")
+    day, valued = source.balance_date.isoformat(), current["valuationDate"][:10]
+    if valued > day or (valued == day and money(current["marketValue"]) == abs(source.balance)):
+        return 0
+    if not dry_run:
+        client.put(f"/alternative-assets/{current['id']}/valuation", {
+            "value": str(abs(source.balance)), "date": day,
+            "notes": "SimpleFIN observed outstanding balance",
+        })
+    return 1
+
+
+def sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run):
+    """Import transactions, then reconcile the balance. Returns the expected app balance."""
+    day = source.balance_date.isoformat()
+    key = f"simplefin-balance:{source.id}"
+    newer = next((row["date"][:10] for row in rows if row.get("idempotencyKey") == key and row["date"][:10] > day), None)
+    if newer:
+        result["warnings"].append(f"{account['name']}: kept newer balance dated {newer}")
+        return None
+    creates, updates = plan_transactions(source, entry, account, rows, zone)
+    if not dry_run:
+        for update in updates:
+            if update.get("sourceGroupId"):
+                unlink(client, rows, update)
+        save_changes(client, creates, updates)
+    result["created"] += len(creates)
+    result["updated"] += len(updates)
+    if account["accountType"] == "CASH":
+        snapshot = {
+            "accountId": account["id"], "snapshotDate": day,
+            "holdings": [], "cashBalances": {source.currency: str(source.balance)},
+        }
+        if not dry_run:
+            use_holdings(client, account, snapshot, [], positions)
+        result["balances"] += 1
+        return source.balance
+    replaced = {row["id"] for row in updates}
+    projected = [row for row in rows if row["id"] not in replaced]
+    projected += [{**row, "date": row["activityDate"]} for row in creates + updates]
+    expected = source.balance + sum(
+        (net_amount(row) for row in projected if row["accountId"] == account["id"] and row["date"][:10] > day),
+        Decimal(0),
+    )
+    balance_creates, balance_updates = plan_balance(source, account, projected, zone)
+    if not dry_run:
+        save_changes(client, balance_creates, balance_updates)
+    result["balances"] += len(balance_creates) + len(balance_updates)
+    return expected
+
+
+def sync_securities(client, source, account, result, positions, dry_run):
+    snapshots = client.get(f"/snapshots?accountId={account['id']}")
+    newest = max((row["snapshotDate"] for row in snapshots if row["source"] == "MANUAL_ENTRY"), default="")
+    if newest > source.balance_date.isoformat():
+        result["warnings"].append(f"{account['name']}: kept newer holdings dated {newest}")
+        return None
+    snapshot, quotes = plan_holdings(source, account, client.get(f"/holdings?accountId={account['id']}"))
+    if not dry_run:
+        use_holdings(client, account, snapshot, quotes, positions)
+    result["positions"] += len(snapshot["holdings"])
+    result["balances"] += 1
+    if not source.holdings and source.balance:
+        result["warnings"].append(f"{account['name']}: source supplies a total but no positions")
+    return source.balance
+
+
+def link_and_verify(client, accounts, result, positions):
+    for left, right in transfer_pairs(list(client.iter_activities())):
+        client.post("/activities/link", {"activityAId": left, "activityBId": right})
+        result["linkedTransfers"] += 1
+    unpaired = [
+        row for row in client.iter_activities()
+        if unlinked_transfer(row) and accounts[row["accountId"]]["accountType"] == "CASH"
+    ]
+    result["unmatchedTransferCount"] = len(unpaired)
+    if unpaired:
+        result["warnings"].append(
+            f"{len(unpaired)} cash transfer legs lack a counterpart; Wealthfolio includes unlinked legs in cash-flow totals"
+        )
+    client.post("/portfolio/recalculate", {"marketSyncMode": {"type": "incremental", "asset_ids": []}})
+    try:
+        verify_balances(client, result["accounts"], positions)
+    except ValueError as exc:
+        result["errors"].append(str(exc))
+
+
 def sync(client, sources, mapping, *, dry_run=False):
     accounts = {row["id"]: row for row in client.list_accounts()}
     alternatives = {row["id"]: row for row in client.get("/alternative-holdings")}
@@ -442,23 +560,9 @@ def sync(client, sources, mapping, *, dry_run=False):
                 raise ValueError("source balance has no observation date")
             if (today - source.balance_date).days > 3:
                 result["warnings"].append(f"{source.name}: balance is dated {source.balance_date}")
-            alt_id = entry.get("wealthfolioAlternativeAssetId")
-            if alt_id:
-                current = alternatives[alt_id]
-                if current["kind"] != "liability" or source.balance > 0:
-                    raise ValueError("expected a non-positive source liability balance")
-                if current["currency"] != source.currency:
-                    raise ValueError("source and Wealthfolio liability currencies differ")
-                if current["valuationDate"][:10] <= source.balance_date.isoformat() and (
-                    money(current["marketValue"]) != abs(source.balance)
-                    or current["valuationDate"][:10] != source.balance_date.isoformat()
-                ):
-                    if not dry_run:
-                        client.put(f"/alternative-assets/{alt_id}/valuation", {
-                            "value": str(abs(source.balance)), "date": source.balance_date.isoformat(),
-                            "notes": "SimpleFIN observed outstanding balance",
-                        })
-                    result["balances"] += 1
+            if entry.get("wealthfolioAlternativeAssetId"):
+                current = alternatives[entry["wealthfolioAlternativeAssetId"]]
+                result["balances"] += sync_liability(client, source, current, dry_run)
                 continue
             account = accounts.get(entry.get("wealthfolioAccountId"))
             if account is None:
@@ -467,105 +571,24 @@ def sync(client, sources, mapping, *, dry_run=False):
                 continue
             if account["currency"] != source.currency:
                 raise ValueError("source and Wealthfolio account currencies differ")
-            expected_balance = source.balance
             if account["accountType"] in {"CASH", "CREDIT_CARD"}:
-                balance_row = next((row for row in rows if row.get("idempotencyKey") == f"simplefin-balance:{source.id}"), None)
-                if balance_row and balance_row["date"][:10] > source.balance_date.isoformat():
-                    result["warnings"].append(f"{account['name']}: kept newer balance dated {balance_row['date'][:10]}")
-                    continue
-                creates, updates = plan_transactions(source, entry, account, rows, zone)
-                if not dry_run:
-                    for update in updates:
-                        group = update.get("sourceGroupId")
-                        if group:
-                            counterpart = next(row for row in rows if row.get("sourceGroupId") == group and row["id"] != update["id"])
-                            client.post("/activities/unlink", {"activityAId": update["id"], "activityBId": counterpart["id"]})
-                            for member in rows:
-                                if member.get("sourceGroupId") == group:
-                                    member["sourceGroupId"] = None
-                                    member["metadata"] = {**metadata(member), "flow": {"is_external": True}}
-                            update["sourceGroupId"] = None
-                            update["metadata"] = json.dumps({**json.loads(update["metadata"]), "flow": {"is_external": True}})
-                    save_changes(client, creates, updates)
-                result["created"] += len(creates)
-                result["updated"] += len(updates)
-                projected = [row for row in rows if row["id"] not in {x["id"] for x in updates}]
-                projected += [{**row, "date": row["activityDate"]} for row in creates + updates]
-                expected_balance += sum(
-                    (activity_amount(row) - money(row.get("fee") or 0) - money(row.get("tax") or 0)
-                     for row in projected if row["accountId"] == account["id"]
-                     and row["date"][:10] > source.balance_date.isoformat()),
-                    Decimal(0),
-                )
-                if account["accountType"] == "CASH":
-                    snapshot = {
-                        "accountId": account["id"], "snapshotDate": source.balance_date.isoformat(),
-                        "holdings": [], "cashBalances": {source.currency: str(source.balance)},
-                    }
-                    expected_balance = source.balance
-                    if not dry_run:
-                        if account["trackingMode"] != "HOLDINGS":
-                            client.update_account(account["id"], **{
-                                k: v for k, v in {**account, "trackingMode": "HOLDINGS"}.items() if k != "id"
-                            })
-                        publish_holdings(client, snapshot, [])
-                        positions[account["id"]] = (snapshot, [])
-                    result["balances"] += 1
-                else:
-                    balance_creates, balance_updates = plan_balance(source, account, projected, zone)
-                    if not dry_run:
-                        save_changes(client, balance_creates, balance_updates)
-                    result["balances"] += len(balance_creates) + len(balance_updates)
+                expected = sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run)
             elif account["accountType"] == "SECURITIES":
-                snapshots = client.get(f"/snapshots?accountId={account['id']}")
-                newest = max((row["snapshotDate"] for row in snapshots if row["source"] == "MANUAL_ENTRY"), default="")
-                if newest > source.balance_date.isoformat():
-                    result["warnings"].append(f"{account['name']}: kept newer holdings dated {newest}")
-                    continue
-                current = client.get(f"/holdings?accountId={account['id']}")
-                snapshot, quotes = plan_holdings(source, account, current)
-                if not dry_run:
-                    if account["trackingMode"] != "HOLDINGS":
-                        client.update_account(account["id"], **{
-                            k: v for k, v in {**account, "trackingMode": "HOLDINGS"}.items() if k != "id"
-                        })
-                    publish_holdings(client, snapshot, quotes)
-                    positions[account["id"]] = (snapshot, quotes)
-                result["positions"] += len(snapshot["holdings"])
-                result["balances"] += 1
-                if not source.holdings and source.balance:
-                    result["warnings"].append(f"{account['name']}: source supplies a total but no positions")
+                expected = sync_securities(client, source, account, result, positions, dry_run)
             else:
                 raise ValueError("unsupported account type for SimpleFIN sync")
+            if expected is None:
+                continue
             result["accounts"].append({
                 "accountId": account["id"], "name": account["name"],
                 "sourceBalance": str(source.balance), "balanceDate": str(source.balance_date),
-                "expectedBalance": str(expected_balance),
+                "expectedBalance": str(expected),
                 "accountType": account["accountType"],
             })
         except (ValueError, KeyError, InvalidOperation, WealthfolioError) as exc:
             result["errors"].append(f"{source.name}: {exc}")
     if not dry_run:
-        for left, right in transfer_pairs(list(client.iter_activities())):
-            client.post("/activities/link", {"activityAId": left, "activityBId": right})
-            result["linkedTransfers"] += 1
-        unpaired = [
-            row for row in client.iter_activities()
-            if metadata(row).get("simplefin")
-            and row["activityType"] in {"TRANSFER_IN", "TRANSFER_OUT"}
-            and not row.get("sourceGroupId")
-            and accounts[row["accountId"]]["accountType"] == "CASH"
-        ]
-        result["unmatchedTransferCount"] = len(unpaired)
-        if unpaired:
-            result["warnings"].append(
-                f"{len(unpaired)} cash transfer legs lack a counterpart; Wealthfolio includes unlinked legs in cash-flow totals"
-            )
-        client.post("/portfolio/recalculate", {"marketSyncMode": {"type": "incremental", "asset_ids": []}})
-        try:
-            verify_balances(client, result["accounts"], positions)
-        except ValueError as exc:
-            result["errors"].append(str(exc))
+        link_and_verify(client, accounts, result, positions)
     return result
 
 
