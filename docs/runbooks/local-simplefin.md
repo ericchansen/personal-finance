@@ -112,11 +112,22 @@ For an alert that also fires when the computer or Docker is off, create a check 
 
 Everything private lives in the data directory: `compose.env`, the SimpleFIN files, and Wealthfolio's database. To move machines, copy that directory and run `dc up -d --build` from a checkout of this repository. To update the code, pull and run the same command.
 
-To upgrade Wealthfolio, change the pinned image in `compose.yml` and run the integration test, which starts that image with synthetic data and runs the sync twice:
+Wealthfolio is pinned to 3.9.1. To upgrade it, change the version and multi-platform digest in `compose.yml` and run the integration test, which starts that image with synthetic data and runs the sync twice:
 
 ```powershell
 pip install pytest argon2-cffi
 $env:WEALTHFOLIO_IT = "1"; python -m pytest
 ```
 
-CI runs the same test on every pull request. Deploy with `dc up -d` only after it passes.
+CI runs the same test on every pull request. Deploy only after it passes:
+
+1. Pull the replacement image with `dc pull wealthfolio`. If `compose.env` sets `WF_IMAGE`, remove the override or set it to the tested version and digest.
+2. Stop both writers with `dc stop sync wealthfolio`.
+3. Back up the entire `<data>\wealthfolio` directory and `compose.env` to a timestamped location outside the repository. Keep the existing image available for rollback. Copying only `wealthfolio.db` is insufficient: 3.9 adds separate profile databases, and the master key in `compose.env` is also required.
+4. Start the stack with `dc up -d --build`, then check `dc ps` and sign in to confirm the existing accounts are present.
+
+The 3.9 upgrade keeps the existing `WF_DB_PATH` and `/data` mount; existing data appears in a Personal profile. Database migrations run automatically on startup. Encryption remains optional; do not enable `WF_DB_REQUIRE_ENCRYPTION` without first performing the documented offline conversion. Update all devices to 3.9.1 before pairing device sync.
+
+The upstream final-cash migration can rewrite legacy activity amounts and flag ambiguous rows for review. Rewritten amounts retain their original values in `final_cash_migration.legacy_amount` metadata. Review flagged activities in Wealthfolio; a raw activity fingerprint need not remain identical across this migration.
+
+If startup or the sync fails, stop both containers before restoring the complete pre-upgrade Wealthfolio directory and its matching secrets, then start the previous pinned image. Never point an older image at a migrated database.
