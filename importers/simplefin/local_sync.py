@@ -368,6 +368,37 @@ def unlinked_transfer(row: dict) -> bool:
     return bool(metadata(row).get("simplefin")) and row["activityType"] in TRANSFERS and not row.get("sourceGroupId")
 
 
+def latest_readable_snapshot(client, account_id, tracking_mode):
+    if tracking_mode not in {"TRANSACTIONS", "HOLDINGS"}:
+        raise ValueError("unsupported native tracking mode")
+    today = datetime.now(client.display_timezone()).date().isoformat()
+    snapshots = [
+        row for row in client.get(f"/snapshots?accountId={account_id}")
+        if row.get("isDateValid", True) and row["snapshotDate"] <= today
+        and (row["source"] == "CALCULATED") == (tracking_mode == "TRANSACTIONS")
+    ]
+    return max(snapshots, key=lambda row: row["snapshotDate"], default=None)
+
+
+def inactive_value_warnings(client, accounts):
+    warnings = []
+    for account in accounts.values():
+        if account["isActive"] or account.get("isArchived", False):
+            continue
+        if account["accountType"] == "CREDIT_CARD":
+            snapshot = latest_readable_snapshot(client, account["id"], account["trackingMode"])
+            nonzero = snapshot is not None and money(snapshot["cashTotalAccountCurrency"]) != 0
+        else:
+            nonzero = any(money(row["marketValue"]["local"]) != 0
+                          for row in client.get(f"/holdings?accountId={account['id']}"))
+        if nonzero:
+            warnings.append(
+                f"{account['name']}: inactive status does not exclude this account from Wealthfolio net worth; "
+                "a retained nonzero value still needs source review. Do not infer a current zero or account closure."
+            )
+    return warnings
+
+
 def verify_balances(client, expected, positions, *, attempts=15, sleeper=time.sleep, repair=True):
     """Wait for native calculations, including the tracking-mode transition."""
     stable = 0
@@ -379,12 +410,14 @@ def verify_balances(client, expected, positions, *, attempts=15, sleeper=time.sl
             account_id = item["accountId"]
             holdings = []
             if item["accountType"] == "CREDIT_CARD":
-                snapshots = client.get(f"/snapshots?accountId={account_id}")
-                if not snapshots:
+                snapshot = latest_readable_snapshot(
+                    client, account_id, item.get("trackingMode", "TRANSACTIONS"),
+                )
+                if snapshot is None:
                     item["wealthfolioBalance"] = None
                     differences.append(item["name"])
                     continue
-                actual = money(max(snapshots, key=lambda x: x["snapshotDate"])["cashTotalAccountCurrency"])
+                actual = money(snapshot["cashTotalAccountCurrency"])
             else:
                 holdings = client.get(f"/holdings?accountId={account_id}")
                 actual = sum(
@@ -468,6 +501,8 @@ def sync_liability(client, source, current, dry_run) -> int:
 
 def sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run):
     """Import real transactions; missing card history must not become an activity."""
+    if account["accountType"] == "CREDIT_CARD" and account.get("trackingMode", "TRANSACTIONS") != "TRANSACTIONS":
+        raise ValueError("credit-card sync requires native transaction tracking; existing settings and activities were retained")
     if account["accountType"] == "CASH" and any(
         not is_cash_position(position)
         or (position.get("currency") or source.currency) != source.currency
@@ -663,6 +698,7 @@ def sync(client, sources, mapping, *, dry_run=False, check=False):
             })
         except (ValueError, KeyError, InvalidOperation, WealthfolioError) as exc:
             result["errors"].append(f"{source.name}: {exc}")
+    result["warnings"].extend(inactive_value_warnings(client, accounts))
     if check or not dry_run:
         verify_import(client, accounts, result, positions, read_only=check)
     return result
