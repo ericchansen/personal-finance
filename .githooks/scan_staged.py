@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Block financial data and secrets from entering this public repository.
 
-Runs as a pre-commit hook over staged files. Use --all to scan the whole tree.
+Runs as a pre-commit hook over staged files. Use --all to scan tracked files
+and non-ignored untracked files.
 
 Two layers of defence:
   1. Extension denylist  - data-shaped files never belong here at all.
@@ -66,17 +67,18 @@ PLACEHOLDER = re.compile(
 
 def staged_files() -> list[Path]:
     out = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-        capture_output=True, text=True, check=True,
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"],
+        capture_output=True, encoding="utf-8", check=True,
     ).stdout
-    return [Path(line) for line in out.splitlines() if line.strip()]
+    return [Path(name) for name in out.split("\0") if name]
 
 
-def tracked_files() -> list[Path]:
+def tree_files() -> list[Path]:
     out = subprocess.run(
-        ["git", "ls-files"], capture_output=True, text=True, check=True
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        capture_output=True, encoding="utf-8", check=True,
     ).stdout
-    return [Path(line) for line in out.splitlines() if line.strip()]
+    return [Path(name) for name in out.split("\0") if name]
 
 
 def is_allowed(path: Path) -> bool:
@@ -127,10 +129,13 @@ def scan(paths: list[Path]) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--all", action="store_true", help="scan all tracked files")
+    parser.add_argument(
+        "--all", action="store_true",
+        help="scan tracked and non-ignored untracked files",
+    )
     args = parser.parse_args()
 
-    paths = tracked_files() if args.all else staged_files()
+    paths = tree_files() if args.all else staged_files()
     if not paths:
         return 0
 
