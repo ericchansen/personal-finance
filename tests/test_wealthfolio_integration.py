@@ -572,6 +572,58 @@ def test_native_crypto_transfers_preserve_base_units_without_inventing_cash_or_p
                for quote in client.get(f"/market-data/quotes/history?symbol={asset_id}"))
 
 
+def test_native_observed_coin_quantity_keeps_market_pricing_without_invented_transfer(wealthfolio):
+    _, client = wealthfolio
+    account = client.post("/accounts", {
+        "name": "Synthetic Observed Coin", "accountType": "CRYPTOCURRENCY", "currency": "USD",
+        "isActive": True, "isDefault": False, "trackingMode": "TRANSACTIONS",
+    })
+    observed = (datetime.now(timezone.utc) - timedelta(days=10)).date()
+    today = datetime.now(timezone.utc).date()
+    quantity = "0.123456789012"
+    row = client.post("/activities", {
+        "accountId": account["id"], "activityType": "TRANSFER_IN", "quantity": quantity,
+        "unitPrice": "0", "currency": "USD", "subtype": "external_transfer", "needsReview": True,
+        "activityDate": local_sync.source_day_timestamp(observed, client.display_timezone()),
+        "asset": {"symbol": "SYNOBS-USD", "name": "Synthetic Observed Coin",
+                  "quoteMode": "MARKET", "quoteCcy": "USD", "instrumentType": "CRYPTO"},
+        "idempotencyKey": "synthetic-unverified-observation-as-transfer",
+    })
+    asset_id = row["assetId"]
+    imported = client.post("/market-data/quotes/import", {
+        "quotes": [
+            {"symbol": asset_id, "date": day.isoformat(), "close": price, "currency": "USD"}
+            for day, price in ((observed, "10"), (today, "20"))
+        ], "overwriteExisting": True,
+    })
+    assert all(item["validationStatus"] == "valid" for item in imported)
+    quotes_before = client.get(f"/market-data/quotes/history?symbol={asset_id}")
+    removed = client.post("/activities/bulk", {"creates": [], "updates": [], "deleteIds": [row["id"]]})
+    assert not removed["errors"]
+    for _ in range(30):
+        if not client.get(f"/holdings?accountId={account['id']}"):
+            break
+        time.sleep(1)
+    assert not client.get(f"/holdings?accountId={account['id']}")
+    snapshot = {
+        "accountId": account["id"], "snapshotDate": observed.isoformat(), "cashBalances": {"USD": "0"},
+        "holdings": [{"assetId": asset_id, "symbol": "SYNOBS-USD", "quantity": quantity, "currency": "USD"}],
+    }
+    local_sync.use_holdings(client, account, snapshot, [])
+    holding = next(item for item in client.get(f"/holdings?accountId={account['id']}")
+                   if item["holdingType"] == "security")
+    assert Decimal(str(holding["quantity"])) == Decimal(quantity)
+    assert holding["instrument"]["id"] == asset_id
+    assert holding["instrument"]["pricingMode"] == "MARKET"
+    assert holding["instrument"]["instrumentType"] == "CRYPTO"
+    assert Decimal(str(holding["price"])) == 20
+    assert abs(Decimal(str(holding["marketValue"]["local"])) - Decimal(quantity) * 20) < Decimal("0.0000000001")
+    assert holding["costBasis"]["local"] == 0
+    assert client.get(f"/market-data/quotes/history?symbol={asset_id}") == quotes_before
+    assert local_sync.has_source_snapshot(client, snapshot)
+    assert not [item for item in client.iter_activities() if item["accountId"] == account["id"]]
+
+
 def test_native_observed_cash_history_does_not_create_opening_income(wealthfolio):
     _, client = wealthfolio
     account = client.post("/accounts", {
