@@ -174,6 +174,11 @@ def test_explicit_alias_preserves_previously_imported_activity():
     ("CASH", "-2", "Interest Paid", "WITHDRAWAL"),
     ("CASH", "-40", "Internet transfer to Savings account 1234", "TRANSFER_OUT"),
     ("CASH", "40", "Internet transfer from Checking account 5678", "TRANSFER_IN"),
+    ("CASH", "50", "VENMO CASHOUT", "TRANSFER_IN"),
+    ("CASH", "50", "Venmo   Cashout", "TRANSFER_IN"),
+    ("CASH", "-5", "VENMO PAYMENT", "WITHDRAWAL"),
+    ("CASH", "-1", "VENMO CASHOUT FEE", "WITHDRAWAL"),
+    ("CASH", "50", "ACH Electronic Credit", "DEPOSIT"),
     ("CREDIT_CARD", "50", "AUTOMATIC PAYMENT - THANK", "TRANSFER_IN"),
     ("CREDIT_CARD", "50", "ONLINE PAYMENT, THANK YOU", "TRANSFER_IN"),
     ("CREDIT_CARD", "50", "PAYMENT - THANK YOU", "TRANSFER_IN"),
@@ -185,21 +190,29 @@ def test_cash_semantics(kind, amount, description, expected):
     assert cash_type(transaction(amount=amount, description=description), kind) == expected
 
 
-def test_existing_card_payment_is_reclassified_without_changing_cash_or_identity():
-    card = {**ACCOUNT, "accountType": "CREDIT_CARD"}
-    payment = transaction(amount="50", description="ONLINE PAYMENT, THANK YOU")
+@pytest.mark.parametrize(("account_type", "existing_type", "description"), [
+    ("CREDIT_CARD", "CREDIT", "ONLINE PAYMENT, THANK YOU"),
+    ("CASH", "DEPOSIT", "VENMO CASHOUT"),
+])
+@pytest.mark.parametrize("linked", [False, True])
+def test_existing_transfer_receipt_is_reclassified_without_changing_cash_or_identity(
+    account_type, existing_type, description, linked,
+):
+    account = {**ACCOUNT, "accountType": account_type}
+    payment = transaction(amount="50", description=description)
     row = {
-        "id": "synthetic-payment", "accountId": card["id"], "activityType": "CREDIT",
+        "id": "synthetic-payment", "accountId": account["id"], "activityType": existing_type,
         "status": "POSTED", "amount": "50", "currency": "USD",
         "date": source_day_timestamp(payment.posted, ZONE),
         "idempotencyKey": "simplefin:source-account:txn-1",
+        "sourceGroupId": "synthetic-pair" if linked else None,
         "metadata": json.dumps({
             "simplefin": {"amount": "50", "date": payment.posted.isoformat(),
                           "description": payment.description},
             "flow": {"is_external": False},
         }),
     }
-    creates, updates = plan_transactions(source(payment), ENTRY, card, [row], ZONE)
+    creates, updates = plan_transactions(source(payment), ENTRY, account, [row], ZONE)
     assert creates == []
     assert len(updates) == 1
     assert updates[0]["id"] == row["id"]
@@ -207,7 +220,15 @@ def test_existing_card_payment_is_reclassified_without_changing_cash_or_identity
     assert updates[0]["activityType"] == "TRANSFER_IN"
     assert activity_amount(updates[0]) == Decimal("50")
     assert updates[0]["activityDate"] == row["date"]
-    assert plan_transactions(source(payment), ENTRY, card, [persisted(updates[0], row["id"])], ZONE) == ([], [])
+    assert plan_transactions(source(payment), ENTRY, account, [persisted(updates[0], row["id"])], ZONE) == ([], [])
+
+
+def test_unchanged_nontransfer_source_preserves_a_native_fee_refinement():
+    charge = transaction(amount="-5", description="Synthetic service charge")
+    creates, _ = plan([charge])
+    row = persisted(creates[0])
+    row["activityType"] = "FEE"
+    assert plan([charge], [row]) == ([], [])
 
 
 @pytest.mark.parametrize("zone", ["America/Chicago", "Pacific/Kiritimati", "Etc/GMT+12"])

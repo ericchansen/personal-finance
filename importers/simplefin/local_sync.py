@@ -118,6 +118,8 @@ def cash_type(transaction: SimpleFinTransaction, account_type: str) -> str:
         return "CREDIT"
     if re.search(r"^(interest (paid|payment|earned)|interest)$", text.strip()):
         return "INTEREST" if transaction.amount >= 0 else "WITHDRAWAL"
+    if transaction.amount > 0 and re.search(r"\bvenmo\s+cashout\b", text):
+        return "TRANSFER_IN"
     internal = re.search(
         r"\btransfer (?:to|from|.* (?:to|from)) .*(?:account|savings|checking|spending)"
         r"|\b(?:citi|chase|amex|credit card|credit crd) .*?(?:autopay|payment)"
@@ -220,7 +222,11 @@ def plan_transactions(
             external = kind in TRANSFERS and not row.get("sourceGroupId")
             if net_amount(row, account["accountType"]) != money(previous["amount"]) or row["date"][:10] != previous["date"]:
                 raise ValueError("a source correction conflicts with a manually edited activity")
-            if previous == current_source and metadata(row).get("flow", {}).get("is_external", False) == external:
+            if (
+                previous == current_source
+                and metadata(row).get("flow", {}).get("is_external", False) == external
+                and (kind not in TRANSFERS or row["activityType"] == kind)
+            ):
                 continue
             meta = {**metadata(row), "simplefin": current_source, "flow": {"is_external": external}}
             changes = {
