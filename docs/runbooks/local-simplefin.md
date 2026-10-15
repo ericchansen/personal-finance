@@ -222,6 +222,10 @@ recalculation or snapshot repair. Needed activity or liability-valuation changes
 mismatches are errors, not adjustments.
 Newer native observations are retained and reported as warnings rather than overwritten.
 
+Inactive is not archived: Wealthfolio deliberately retains non-archived accounts in net worth and can retain their historical Spending. Normal syncs, previews, and read-only checks warn when an inactive account still has a nonzero native value, including card debt or credit. That is a source-scope warning, not proof of closure, zero balance, duplication, or permission to hide history. Card sync requires native transaction tracking and rejects a different mode before activity writes. Card comparisons read the mode-correct, non-future snapshot; a dormant observation cannot stand in for the active ledger calculation.
+
+A flat balance history does not establish a dead connection or account closure. In particular, the first changed value of a final flat run is still a reported change; discarding it can retain the balance before a payment updated. Do not infer a replacement opening or invent another payment from that difference. Credit cards cannot use native holdings tracking in the pinned image; do not bypass that boundary or change account type to hide a reconciliation gap.
+
 In Wealthfolio 3.10, activity `amount` is final cash. Fee and tax fields describe attribution
 inside that amount; they are not extra deductions. The adapter preserves those fields and
 never subtracts them a second time when comparing a bank transaction or a card balance.

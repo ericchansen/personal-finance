@@ -1,6 +1,6 @@
 import json
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -8,7 +8,8 @@ import pytest
 
 from importers.simplefin.client import SimpleFinAccount, SimpleFinTransaction
 from importers.simplefin.local_sync import (
-    SnapshotObservationError, activity_amount, cash_type, plan_holdings, plan_transactions,
+    SnapshotObservationError, activity_amount, cash_type, inactive_value_warnings,
+    latest_readable_snapshot, plan_holdings, plan_transactions,
     read_accounts, save_changes, sync, sync_cash, sync_securities, update_payload, verify_balances,
     use_holdings,
 )
@@ -785,6 +786,7 @@ def test_card_gap_does_not_create_a_synthetic_activity():
 
     client = FakeClient()
     client.account["accountType"] = "CREDIT_CARD"
+    client.account["trackingMode"] = "TRANSACTIONS"
     result = {"created": 0, "updated": 0, "errors": []}
     expected = sync_cash(client, replace(source(), balance=Decimal("-42")),
                          ENTRY, client.account, client.rows, ZONE, result, {}, False)
@@ -798,6 +800,7 @@ def test_unposted_card_rows_do_not_become_assumed_cash_movements():
     from importers.simplefin.local_sync import sync_cash
     client = FakeClient()
     client.account["accountType"] = "CREDIT_CARD"
+    client.account["trackingMode"] = "TRANSACTIONS"
     client.rows.append({
         "id": "synthetic-pending", "accountId": ACCOUNT["id"],
         "activityType": "WITHDRAWAL", "amount": "30", "date": "2026-02-02T18:00:00Z", "status": "PENDING",
@@ -816,6 +819,102 @@ def test_missing_native_card_calculation_is_not_an_observed_zero_balance():
     with pytest.raises(ValueError, match="did not settle"):
         verify_balances(client, expected, {}, attempts=2, sleeper=lambda _: None)
     assert expected[0]["wealthfolioBalance"] is None
+
+
+def test_card_check_cannot_accept_dormant_observations_or_future_calculations_as_current_zero():
+    client = FakeClient()
+    today = datetime.now(ZONE).date()
+    client.get = lambda path: [
+        {"snapshotDate": (today - timedelta(days=2)).isoformat(),
+         "source": "CALCULATED", "cashTotalAccountCurrency": "-25"},
+        {"snapshotDate": (today - timedelta(days=1)).isoformat(),
+         "source": "MANUAL_ENTRY", "cashTotalAccountCurrency": "0"},
+        {"snapshotDate": (today + timedelta(days=7)).isoformat(),
+         "source": "CALCULATED", "cashTotalAccountCurrency": "0"},
+    ]
+    expected = [{"accountId": ACCOUNT["id"], "accountType": "CREDIT_CARD",
+                 "name": "Synthetic Card", "sourceBalance": "0", "trackingMode": "TRANSACTIONS"}]
+    with pytest.raises(ValueError, match="did not settle"):
+        verify_balances(client, expected, {}, attempts=2, sleeper=lambda _: None, repair=False)
+    assert expected[0]["wealthfolioBalance"] == "-25"
+    assert client.writes == []
+
+
+@pytest.mark.parametrize(("mode", "calculated", "observed", "warns"), [
+    ("TRANSACTIONS", "-25", "0", True),
+    ("TRANSACTIONS", "25", "0", True),
+    ("TRANSACTIONS", "0", "-25", False),
+    ("HOLDINGS", "0", "-25", True),
+    ("HOLDINGS", "0", "25", True),
+    ("HOLDINGS", "-25", "0", False),
+])
+def test_inactive_card_scope_uses_the_native_reader_mode(mode, calculated, observed, warns):
+    client = FakeClient()
+    client.account.update(accountType="CREDIT_CARD", trackingMode=mode, isActive=False)
+    today = datetime.now(ZONE).date()
+    reads = []
+
+    def get(path):
+        reads.append(path)
+        assert path == "/snapshots?accountId=cash-account"
+        return [
+            {"snapshotDate": (today - timedelta(days=2)).isoformat(),
+             "source": "CALCULATED", "cashTotalAccountCurrency": calculated},
+            {"snapshotDate": (today - timedelta(days=1)).isoformat(),
+             "source": "CSV_IMPORT", "cashTotalAccountCurrency": observed},
+        ]
+
+    client.get = get
+    warnings = inactive_value_warnings(client, {client.account["id"]: client.account})
+    assert bool(warnings) == warns
+    if warns:
+        assert client.account["name"] in warnings[0] and "inactive status does not exclude" in warnings[0]
+    assert reads == ["/snapshots?accountId=cash-account"] and client.writes == []
+
+
+@pytest.mark.parametrize("account_type", ["CASH", "SECURITIES", "CRYPTOCURRENCY"])
+@pytest.mark.parametrize("value", ["0", "12.50", "-12.50"])
+def test_inactive_noncard_native_value_is_warned_without_changing_it(account_type, value):
+    client = FakeClient()
+    client.account.update(accountType=account_type, isActive=False)
+    client.get = lambda path: [{"marketValue": {"local": value}}]
+    warnings = inactive_value_warnings(client, {client.account["id"]: client.account})
+    assert bool(warnings) == (Decimal(value) != 0)
+    assert client.writes == []
+
+
+@pytest.mark.parametrize(("active", "archived"), [(True, False), (False, True)])
+def test_active_or_archived_accounts_are_not_read_as_inactive_retained_values(active, archived):
+    client = FakeClient()
+    client.account.update(isActive=active, isArchived=archived)
+    client.get = lambda path: pytest.fail("active/archived account should not be queried")
+    assert inactive_value_warnings(client, {client.account["id"]: client.account}) == []
+
+
+def test_inactive_offsetting_holdings_do_not_hide_retained_gross_value():
+    client = FakeClient()
+    client.account.update(accountType="SECURITIES", isActive=False)
+    client.get = lambda path: [{"marketValue": {"local": value}} for value in ("5", "-5")]
+    assert len(inactive_value_warnings(client, {client.account["id"]: client.account})) == 1
+    assert client.writes == []
+
+
+def test_invalid_reader_mode_does_not_default_to_an_observed_balance():
+    client = FakeClient()
+    with pytest.raises(ValueError, match="unsupported native tracking mode"):
+        latest_readable_snapshot(client, ACCOUNT["id"], "SYNTHETIC_INVALID")
+    assert client.writes == []
+
+
+def test_observation_tracked_card_is_rejected_before_activity_writes():
+    client = FakeClient()
+    client.account["accountType"] = "CREDIT_CARD"
+    before = list(client.rows)
+    with pytest.raises(ValueError, match="credit-card sync requires native transaction tracking"):
+        sync_cash(client, source(transaction()), ENTRY, client.account, client.rows,
+                  ZONE, {"created": 0, "updated": 0, "errors": []}, {}, False)
+    assert client.writes == [] and client.rows == before
+    assert client.account["trackingMode"] == "HOLDINGS"
 
 
 def test_replay_does_not_promote_a_native_pending_or_void_activity_to_posted():
@@ -873,6 +972,7 @@ def test_card_balance_projection_does_not_count_same_utc_day_twice():
     observed, _ = read_accounts(payload, balance_zone=ZONE)
     client = FakeClient()
     client.account["accountType"] = "CREDIT_CARD"
+    client.account["trackingMode"] = "TRANSACTIONS"
     result = {"created": 0, "updated": 0, "errors": []}
     expected = sync_cash(client, observed[0], ENTRY, client.account, [], ZONE, result, {}, True)
     assert expected == Decimal("-50")
@@ -917,6 +1017,7 @@ def test_card_projection_retains_utc_basis_when_local_posted_day_matches_balance
     assert creates[0]["activityDate"][:10] == observed[0].balance_utc_date.isoformat()
     client = FakeClient()
     client.account["accountType"] = "CREDIT_CARD"
+    client.account["trackingMode"] = "TRANSACTIONS"
     result = {"created": 0, "updated": 0, "errors": []}
     expected = sync_cash(client, observed[0], bank_entry, client.account, [], ZONE, result, {}, True)
     assert expected == Decimal("-55")
@@ -986,6 +1087,7 @@ def test_legacy_card_reconciliation_is_reported_not_updated():
 
     client = FakeClient()
     client.account["accountType"] = "CREDIT_CARD"
+    client.account["trackingMode"] = "TRANSACTIONS"
     client.rows.append({
         "id": "synthetic-balance", "accountId": ACCOUNT["id"],
         "date": "2026-02-01T18:00:00Z", "activityType": "TRANSFER_IN",

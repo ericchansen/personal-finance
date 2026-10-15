@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from importers.simplefin import local_sync
-from importers.simplefin.wealthfolio_client import WealthfolioClient
+from importers.simplefin.wealthfolio_client import WealthfolioClient, WealthfolioError
 
 pytestmark = pytest.mark.skipif(not os.environ.get("WEALTHFOLIO_IT"), reason="set WEALTHFOLIO_IT=1")
 
@@ -850,3 +850,101 @@ def test_calculated_snapshot_cannot_silently_replace_a_source_observation(wealth
     assert sum((Decimal(str(row["marketValue"]["local"])) for row in holdings), Decimal(0)) == 9
     actual = [row for row in client.iter_activities() if row["accountId"] == account["id"]]
     assert len(actual) == 1 and actual[0]["id"] == activity["id"] and actual[0]["amount"] == "9"
+
+
+def test_inactive_values_remain_in_native_scope_and_are_warned_without_hiding_history(wealthfolio):
+    _, client = wealthfolio
+    accounts = {}
+    moment = (datetime.now(timezone.utc) - timedelta(days=2)).replace(hour=18)
+    creates = []
+    for label, account_type, kind, amount in (
+        ("Cash", "CASH", "DEPOSIT", "10"),
+        ("Debt", "CREDIT_CARD", "WITHDRAWAL", "20"),
+        ("Card Credit", "CREDIT_CARD", "CREDIT", "5"),
+    ):
+        account = client.post("/accounts", {
+            "name": f"Synthetic Inactive {label}", "accountType": account_type, "currency": "USD",
+            "isActive": True, "isDefault": False, "trackingMode": "TRANSACTIONS",
+        })
+        accounts[label] = account
+        creates.append({
+            "accountId": account["id"], "activityType": kind, "amount": amount, "currency": "USD",
+            "activityDate": moment.isoformat(), "comment": f"Synthetic retained {label}",
+        })
+    result = client.save_activities(creates=creates)
+    assert not result["errors"] and len(result["created"]) == 3
+    activity_ids = {row["id"] for row in result["created"]}
+    debt = accounts["Debt"]
+    for _ in range(30):
+        snapshot = local_sync.latest_readable_snapshot(client, debt["id"], "TRANSACTIONS")
+        if snapshot is not None and Decimal(snapshot["cashTotalAccountCurrency"]) == -20:
+            break
+        time.sleep(1)
+    assert snapshot is not None and Decimal(snapshot["cashTotalAccountCurrency"]) == -20
+    shadow_day = (moment + timedelta(days=1)).date().isoformat()
+    client.post("/snapshots", {
+        "accountId": debt["id"], "snapshotDate": shadow_day,
+        "holdings": [], "cashBalances": {"USD": "0"},
+    })
+    expected = [{
+        "accountId": debt["id"], "accountType": "CREDIT_CARD", "name": debt["name"],
+        "sourceBalance": "0", "trackingMode": "TRANSACTIONS",
+    }]
+    with pytest.raises(ValueError, match="did not settle"):
+        local_sync.verify_balances(client, expected, {}, attempts=2, sleeper=lambda _: None, repair=False)
+    assert Decimal(expected[0]["wealthfolioBalance"]) == -20
+    ids = [account["id"] for account in accounts.values()]
+    client.put("/spending/settings", {"enabled": True, "accountIds": ids})
+    before = client.post("/spending/cash-activities/search", {"limit": 100, "offset": 0})
+    assert activity_ids <= {row["id"] for row in before["items"]}
+    for account in accounts.values():
+        current = next(row for row in client.list_accounts() if row["id"] == account["id"])
+        client.update_account(account["id"], **{
+            key: value for key, value in {**current, "isActive": False}.items() if key != "id"
+        })
+    after = client.post("/spending/cash-activities/search", {"limit": 100, "offset": 0})
+    assert {row["id"] for row in after["items"]} == {row["id"] for row in before["items"]}
+
+    def leaves(items):
+        for item in items:
+            yield item
+            yield from leaves(item.get("children", []))
+
+    worth = client.get("/net-worth")
+    values = {row["assetId"]: Decimal(str(row["value"])) for row in leaves(
+        worth["assets"]["breakdown"] + worth["liabilities"]["breakdown"],
+    ) if row.get("assetId")}
+    assert values[f"CASH:{accounts['Cash']['id']}"] == 10
+    assert values[f"CREDIT_CARD:{debt['id']}"] == 20
+    assert values[f"CASH:{accounts['Card Credit']['id']}"] == 5
+    for mode in ("normal", "preview", "check"):
+        result = local_sync.sync(client, [], {}, dry_run=mode == "preview", check=mode == "check")
+        assert result["errors"] == [] and result["created"] == result["updated"] == 0
+        for account in accounts.values():
+            assert any(account["name"] in warning and "inactive status does not exclude" in warning
+                       for warning in result["warnings"])
+            retained = next(row for row in client.list_accounts() if row["id"] == account["id"])
+            assert not retained["isActive"] and not retained["isArchived"]
+        assert activity_ids <= {row["id"] for row in client.iter_activities()}
+
+
+def test_native_card_tracking_rejects_observations_without_changing_ledger(wealthfolio):
+    _, client = wealthfolio
+    account = client.post("/accounts", {
+        "name": "Synthetic Card Mode Boundary", "accountType": "CREDIT_CARD", "currency": "USD",
+        "isActive": True, "isDefault": False, "trackingMode": "TRANSACTIONS",
+    })
+    client.post("/activities", {
+        "accountId": account["id"], "activityType": "WITHDRAWAL", "amount": "20", "currency": "USD",
+        "activityDate": (datetime.now(timezone.utc) - timedelta(days=1)).replace(hour=18).isoformat(),
+        "comment": "Synthetic real card activity",
+    })
+    before = next(row for row in client.list_accounts() if row["id"] == account["id"])
+    activities = [row for row in client.iter_activities() if row["accountId"] == account["id"]]
+    with pytest.raises(WealthfolioError, match="Credit card accounts cannot use HOLDINGS") as error:
+        client.update_account(account["id"], **{
+            key: value for key, value in {**before, "trackingMode": "HOLDINGS"}.items() if key != "id"
+        })
+    assert error.value.status == 400
+    assert next(row for row in client.list_accounts() if row["id"] == account["id"]) == before
+    assert [row for row in client.iter_activities() if row["accountId"] == account["id"]] == activities
