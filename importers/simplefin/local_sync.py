@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import replace
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -279,8 +279,63 @@ def verified_cost(entry: dict, key: str, quantity: Decimal) -> Decimal | None:
     return None
 
 
+HALF_CENT = Decimal("0.005")
+
+
+def rolled_cost(rules: dict, key: str, transactions, start: date, end: date,
+                prices: list[tuple[date, Decimal]], old_quantity: Decimal, old_basis: Decimal,
+                quantity: Decimal) -> Decimal | None:
+    """Average-cost basis after one quantity step, or None unless the provider's transactions prove it.
+
+    `rules["transactions"]` maps an exact transaction description to the share of its dollars each
+    position receives (`{}` for entries that move no shares); `rules["settlementDays"]` is the
+    provider's delay between posting a transaction and reporting the quantity that includes it.
+    The step spans from `start`, when the old quantity was first observed, to the new observation
+    on `end`; `prices` are the dated prices observed in between. Any share decrease leaves average
+    cost unchanged. A purchase adds its dollars and a sale removes average cost for the shares
+    sold. Purchases must bridge: their dollars per share bought must fall within the prices
+    observed from posting onward, allowing for rounding, and the unknown exact sale price may move
+    the result by less than half a cent.
+    """
+    lag = timedelta(days=int(rules.get("settlementDays", 0)))
+    named = rules.get("transactions", {})
+    bought = sold = Decimal(0)
+    count, first, unattributed = 0, end, set()
+    for txn in transactions:
+        if txn.pending or txn.amount == 0 or not start - lag < txn.posted <= end - lag:
+            continue
+        split = named.get(txn.description)
+        if split is None:
+            unattributed.add("purchase" if txn.amount > 0 else "sale")
+            continue
+        part = txn.amount * money(split.get(key, 0))
+        if part:
+            count, first = count + 1, min(first, txn.posted)
+            bought, sold = (bought + part, sold) if part > 0 else (bought, sold - part)
+    average = old_basis / old_quantity
+    change = quantity - old_quantity
+    if "purchase" in unattributed:
+        return None
+    if change < 0 and not bought:
+        return average
+    if change <= 0 or not bought or unattributed:
+        return None
+    observed = [price for day, price in prices if day >= first]
+    low, high = min(observed), max(observed)
+    places = max(-quantity.as_tuple().exponent, -old_quantity.as_tuple().exponent, 0)
+    rounding = Decimal(1).scaleb(-places)
+    least, most = sold / high, sold / low
+    if average * (most - least) >= HALF_CENT:
+        return None
+    if not ((bought - HALF_CENT * count) / (change + most + rounding) <= high
+            and (bought + HALF_CENT * count) / max(change + least - rounding, rounding) >= low):
+        return None
+    return (old_basis - average * (least + most) / 2 + bought) / quantity
+
+
 def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict], entry: dict | None = None,
-                  warnings: list[str] | None = None):
+                  warnings: list[str] | None = None, window=None):
+    """`window(asset_id)` returns when the current quantity was first observed and the prices seen since."""
     entry = entry or {}
     per_unit = entry.get("sourceCostBasis", "total") == "perUnit"
     if source.holdings is None or (not source.holdings and source.balance != 0):
@@ -321,6 +376,20 @@ def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict], 
         elif (scoped and scoped.get("costBasis") and money(scoped["costBasis"]["local"]) > 0
               and money(scoped.get("quantity") or 0) == quantity):
             average_cost = money(scoped["costBasis"]["local"]) / quantity
+        elif (scoped and scoped.get("costBasis") and money(scoped["costBasis"]["local"]) > 0
+              and "rollForward" in entry and window is not None):
+            start, prices = window(asset_id)
+            average_cost = start and rolled_cost(
+                entry["rollForward"], symbol or name, source.transactions, start, source.balance_date,
+                [*prices, (source.balance_date, value / quantity)], money(scoped["quantity"]),
+                money(scoped["costBasis"]["local"]), quantity,
+            )
+            if average_cost is None and warnings is not None:
+                warnings.append(
+                    f"{account['name']}: the provider's transactions do not prove the cost of the "
+                    f"{symbol or name} quantity change since {start or 'its last observation'}; "
+                    "cost is unknown until re-anchored"
+                )
         elif (symbol or name) in (entry.get("verifiedCosts") or {}) and warnings is not None:
             warnings.append(
                 f"{account['name']}: recorded issuer cost for {symbol or name} covers a different quantity "
@@ -612,14 +681,36 @@ def sync_cash(client, source, entry, account, rows, zone, result, positions, dry
     return source.balance
 
 
+def quantity_window(client, account_id, asset_id, quantity):
+    """First snapshot date with the asset's current quantity, and its source prices since then."""
+    start = None
+    days = sorted((row["snapshotDate"] for row in client.get(f"/snapshots?accountId={account_id}")
+                   if row["source"] != "CALCULATED"), reverse=True)
+    for day in days:
+        rows = client.get(f"/snapshots/holdings?accountId={account_id}&date={day}")
+        held = next((row for row in rows if (row.get("instrument") or {}).get("id") == asset_id), None)
+        if held is None or money(held["quantity"]) != quantity:
+            break
+        start = day
+    if start is None:
+        return None, []
+    prices = [(date.fromisoformat(row["timestamp"][:10]), money(row["close"]))
+              for row in client.get(f"/market-data/quotes/history?symbol={asset_id}")
+              if row["timestamp"][:10] >= start]
+    return date.fromisoformat(start), prices
+
+
 def sync_securities(client, source, account, result, positions, dry_run, entry=None):
     snapshots = client.get(f"/snapshots?accountId={account['id']}")
     newest = max((row["snapshotDate"] for row in snapshots if row["source"] != "CALCULATED"), default="")
     if newest > source.balance_date.isoformat():
         result["warnings"].append(f"{account['name']}: kept newer holdings dated {newest}")
         return None
+    current = client.get(f"/holdings?accountId={account['id']}")
+    quantities = {(row.get("instrument") or {}).get("id"): money(row.get("quantity") or 0) for row in current}
     snapshot, quotes = plan_holdings(
-        source, account, client.get(f"/holdings?accountId={account['id']}"), entry, result["warnings"],
+        source, account, current, entry, result["warnings"],
+        lambda asset_id: quantity_window(client, account["id"], asset_id, quantities[asset_id]),
     )
     missing_basis = sum("averageCost" not in holding for holding in snapshot["holdings"])
     if missing_basis:
