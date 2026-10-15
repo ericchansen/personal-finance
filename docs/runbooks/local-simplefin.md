@@ -233,6 +233,12 @@ Actual on-chain movements can be native asset transfers with unknown basis; do n
 turn a quoted holding value into a `BUY`/`DEPOSIT` pair. Retain base-unit precision
 and source fee units rather than inventing fiat fees. Flag unknown acquisition basis
 for native review; a displayed zero book cost does not establish a zero tax basis.
+An observed coin quantity without a known movement belongs in dated native holdings,
+not a fabricated `TRANSFER_IN`. Keep an existing market-priced asset's pricing mode
+and quote history; a new market quote does not refresh the observed quantity's date.
+Daemon synchronization and wallet scanning are separate. A displayed quantity from an
+unfinished wallet scan is not a certified complete or current balance. Retain it only
+as an explicitly unverified observation; never infer zero, a transfer, or missing units.
 Reopening a wallet or changing its cache-file timestamp alone does not prove that
 its blockchain data refreshed.
 
