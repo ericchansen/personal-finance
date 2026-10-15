@@ -260,6 +260,13 @@ def plan_transactions(
     return creates, updates
 
 
+def is_cash_position(position: dict) -> bool:
+    return (
+        not str(position.get("symbol") or "").strip()
+        and str(position.get("description") or "").strip().upper() == "CASH"
+    )
+
+
 def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict]):
     if source.holdings is None or (not source.holdings and source.balance != 0):
         raise ValueError("source positions are unavailable; existing holdings were not replaced")
@@ -279,7 +286,7 @@ def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict]):
         currency = position.get("currency") or source.currency
         if currency != source.currency:
             raise ValueError("investment position currency differs from account currency")
-        if name.upper() == "CASH" and not symbol:
+        if is_cash_position(position):
             cash += value
             continue
         if quantity <= 0 or value < 0:
@@ -461,6 +468,15 @@ def sync_liability(client, source, current, dry_run) -> int:
 
 def sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run):
     """Import real transactions; missing card history must not become an activity."""
+    if account["accountType"] == "CASH" and any(
+        not is_cash_position(position)
+        or (position.get("currency") or source.currency) != source.currency
+        for position in source.holdings or []
+    ):
+        raise ValueError(
+            "cash-only source reports non-cash or different-currency positions; "
+            "review the account mapping"
+        )
     day = source.balance_date.isoformat()
     creates, updates = plan_transactions(source, entry, account, rows, zone)
     if not dry_run:

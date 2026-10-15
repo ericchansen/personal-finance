@@ -532,6 +532,41 @@ class FakeClient:
         return {"created": created, "updated": updated, "errors": []}
 
 
+@pytest.mark.parametrize(("symbol", "description", "currency"), [
+    ("TEST", "Synthetic Fund", "USD"),
+    ("", "Synthetic Bond", "USD"),
+    ("TEST", "Cash", "USD"),
+    ("", "Cash", "EUR"),
+])
+def test_cash_mapping_rejects_non_cash_positions_before_writing_transactions(symbol, description, currency):
+    client = FakeClient()
+    observed = replace(source(transaction()), holdings=[{
+        "id": "synthetic-position", "symbol": symbol, "description": description,
+        "currency": currency, "shares": "1", "market_value": "100",
+    }])
+    with pytest.raises(ValueError, match="cash-only source"):
+        sync_cash(client, observed, ENTRY, client.account, client.rows, ZONE, {}, {}, False)
+    assert client.writes == []
+
+
+@pytest.mark.parametrize("holdings", [None, [], [{
+    "id": "synthetic-cash", "symbol": "", "description": " Cash ",
+    "currency": "USD", "shares": "0", "market_value": "100",
+}]])
+def test_verified_cash_only_account_uses_reported_balance_without_invented_activity(holdings):
+    client = FakeClient()
+    before = list(client.rows)
+    observed = replace(source(), holdings=holdings)
+    result = sync(client, [observed], {
+        observed.id: {**ENTRY, "wealthfolioAccountId": client.account["id"]},
+    })
+    assert result["errors"] == []
+    assert result["created"] == result["updated"] == result["positions"] == 0
+    assert result["balances"] == 1
+    assert client.snapshot["cashBalances"] == {"USD": "100"}
+    assert client.rows == before
+
+
 def test_partial_investment_response_retains_existing_native_state():
     client = FakeClient()
     client.account["accountType"] = "SECURITIES"
