@@ -13,8 +13,8 @@ exchanges it for an access URL and burns the token.
 Bridge dashboard. This is a secret: anyone holding it can read every connected
 account. It belongs in the data directory, never the repository.
 
-The Bridge caps requests at roughly 24 per day and serves about 90 days of
-history; anything older must already be in Wealthfolio.
+The Bridge caps requests at roughly 24 per day and date windows at 90 days.
+Available history varies by institution; a valid older window can return no data.
 """
 
 from __future__ import annotations
@@ -55,6 +55,11 @@ class SimpleFinTransaction:
     description: str
     pending: bool = False
     memo: str = ""
+    posted_at: datetime | None = None
+
+    @property
+    def posted_utc_date(self) -> date | None:
+        return self.posted_at.date() if self.posted_at else None
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,7 @@ class SimpleFinAccount:
     available_balance: Decimal | None = None
     transactions: list[SimpleFinTransaction] = field(default_factory=list)
     holdings: list[dict] | None = None
+    balance_utc_date: date | None = None
 
     @property
     def is_currency(self) -> bool:
@@ -76,7 +82,7 @@ class SimpleFinAccount:
         SimpleFIN allows ``currency`` to hold a URL identifying a non-fiat
         unit, in which case ``balance`` counts units rather than dollars.
         """
-        return "://" not in self.currency
+        return bool(self.currency.strip()) and "://" not in self.currency
 
 
 def decode_setup_token(token: str) -> str:
@@ -159,6 +165,25 @@ def _date(epoch) -> date | None:
         return None
 
 
+def account_currency(raw: dict) -> str:
+    currency = raw.get("currency")
+    if isinstance(currency, str) and currency.strip():
+        return currency
+    holdings = raw.get("holdings") or []
+    units = {position.get("currency") for position in holdings}
+    if len(units) == 1:
+        unit = next(iter(units))
+        if isinstance(unit, str) and unit.strip():
+            try:
+                values = [Decimal(str(position["market_value"])) for position in holdings]
+                balance = Decimal(str(raw["balance"]))
+                if balance.is_finite() and all(value.is_finite() for value in values) and sum(values) == balance:
+                    return unit
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                pass
+    return ""
+
+
 def parse_accounts(payload: dict) -> tuple[list[SimpleFinAccount], list[str]]:
     """Convert a ``/accounts`` response into accounts plus connection errors.
 
@@ -184,17 +209,22 @@ def parse_accounts(payload: dict) -> tuple[list[SimpleFinAccount], list[str]]:
                     description=str(txn.get("description") or ""),
                     pending=bool(txn.get("pending")),
                     memo=str(txn.get("memo") or ""),
+                    posted_at=datetime.fromtimestamp(int(txn["posted"]), timezone.utc),
                 )
             )
         available = raw.get("available-balance")
+        currency = account_currency(raw)
+        if not currency:
+            errors.append("SimpleFIN account currency is missing; units are unknown")
         accounts.append(
             SimpleFinAccount(
                 id=str(raw.get("id") or ""),
                 name=str(raw.get("name") or ""),
                 org=str(org.get("name") or org.get("domain") or ""),
-                currency=str(raw.get("currency") or "USD"),
+                currency=currency,
                 balance=_decimal(raw.get("balance")),
                 balance_date=_date(raw.get("balance-date")),
+                balance_utc_date=_date(raw.get("balance-date")),
                 available_balance=_decimal(available) if available is not None else None,
                 transactions=sorted(transactions, key=lambda t: t.posted),
                 holdings=raw.get("holdings"),
