@@ -104,6 +104,8 @@ Real syncs also request Wealthfolio's native incremental market refresh. Native 
 
 Provider total cost basis is divided by the reported quantity for Wealthfolio's native average-cost input; a provided purchase price is used only when total basis is unavailable. Existing average cost is retained only for the exact same source-scoped asset with unchanged quantity; matching names or tickers do not prove cost basis for different or additional shares. Missing cost basis remains unverified; account values are not a claim of complete tax basis or reliable investment-performance history. Missing position data reports an error and retains previous holdings; a nonzero account total never becomes a fake security or presumed cash.
 
+Normal syncs, previews, and read-only checks warn when a position has neither reported nor retained acquisition cost. Wealthfolio represents an omitted snapshot cost as zero; that is not proof of a zero-cost acquisition, and its cost-based gains are not verified. Quantities and market values can still reconcile independently. A native calculation status of `complete` does not certify the provenance of its cost inputs.
+
 Only an explicitly reported cash position (description `Cash` and no security symbol) becomes a native cash balance. Securities and reported cash must reconcile to the account total; an unexplained positive or negative remainder is not presumed cash. Cash positions must declare compatible units just like securities.
 
 If the quantity of a source-scoped asset changes without provider basis or purchase price, the sync

@@ -544,6 +544,35 @@ def test_native_observed_cash_history_does_not_create_opening_income(wealthfolio
     assert report["current"]["income"] == 0 and report["current"]["outflow"] == 25
 
 
+def test_native_missing_basis_warns_without_inventing_acquisition_cost(wealthfolio):
+    _, client = wealthfolio
+    account = client.post("/accounts", {
+        "name": "Synthetic Unknown Basis", "accountType": "SECURITIES", "currency": "USD",
+        "isActive": True, "isDefault": False, "trackingMode": "HOLDINGS",
+    })
+    sources, _ = local_sync.read_accounts({"accounts": [{
+        "id": "synthetic-unknown-basis", "name": "Synthetic Unknown Basis", "currency": "USD",
+        "balance": "100", "balance-date": epoch(datetime.now(timezone.utc)),
+        "holdings": [{
+            "id": "synthetic-position", "symbol": "SYN-UNKNOWN", "description": "Synthetic Fund",
+            "shares": "2", "market_value": "100", "cost_basis": "0", "purchase_price": "0",
+            "currency": "USD",
+        }],
+    }]}, balance_zone=client.display_timezone())
+    mapping = {sources[0].id: {"wealthfolioAccountId": account["id"]}}
+    for check in (False, True):
+        result = local_sync.sync(client, sources, mapping, check=check)
+        assert result["errors"] == []
+        assert result["created"] == result["updated"] == 0
+        assert any("acquisition cost unavailable for 1 position(s)" in warning
+                   and "gains are unverified" in warning for warning in result["warnings"])
+        holding = next(row for row in client.get(f"/holdings?accountId={account['id']}")
+                       if row["holdingType"] == "security")
+        assert holding["quantity"] == 2 and holding["marketValue"]["local"] == 100
+        assert holding["costBasis"]["local"] == 0
+        assert not [row for row in client.iter_activities() if row["accountId"] == account["id"]]
+
+
 def test_calculated_snapshot_cannot_silently_replace_a_source_observation(wealthfolio):
     _, client = wealthfolio
     account = client.post("/accounts", {
