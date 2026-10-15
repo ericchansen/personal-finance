@@ -260,6 +260,27 @@ def test_a_dollar_account_is_reported_as_currency():
     assert account.is_currency
 
 
+def test_blank_account_currency_can_be_established_by_explicit_complete_positions():
+    payload = json.loads(json.dumps(PAYLOAD))
+    raw = payload["accounts"][0]
+    raw.update(currency="", balance="100", holdings=[
+        {"currency": "USD", "market_value": "60"},
+        {"currency": "USD", "market_value": "40"},
+    ])
+    (account,), errors = parse_accounts(payload)
+    assert account.currency == "USD"
+    assert not errors
+    raw["balance"] = "101"
+    (account,), errors = parse_accounts(payload)
+    assert account.currency == ""
+    assert errors
+    raw["balance"] = "100"
+    raw["holdings"][1]["currency"] = "EUR"
+    (account,), errors = parse_accounts(payload)
+    assert account.currency == ""
+    assert errors
+
+
 def test_a_security_denominated_account_is_not_treated_as_dollars():
     # SimpleFIN puts a URL in `currency` when the unit is not fiat, and the
     # balance then counts units. Treating that as dollars would be wrong.

@@ -35,6 +35,12 @@ Create `<data>\simplefin\account-map.json` (version 1), keyed by SimpleFIN accou
 
 For cash and credit-card entries, `wealthfolioAccountId` names the existing app account. Set `historyThrough` to the last calendar day already covered by earlier imports. SimpleFIN owns posted transactions after that date; do not keep another importer writing that same period.
 
+Use the earlier import's transaction coverage, not its download date or balance observation date, to choose this boundary. An export can report a newer balance while containing transactions only through an earlier day.
+
+For historical imports, verify the issuer's posting-date column separately from the purchase date or an export field name. Preserve the original transaction date as provenance when correcting the ledger date.
+
+For timestamped bank transactions, set `transactionTimezone` to the institution's verified IANA financial timezone when needed. Omitting it retains the provider's UTC calendar day; the sync never guesses a bank timezone from the app or machine locale. The bank's after-midnight posting day can differ from the app's local day. The original UTC timestamp is retained while parsing and its UTC day remains in source metadata for comparisons.
+
 ```json
 {
   "version": 1,
@@ -52,6 +58,14 @@ For an empty account, choose a date before the first transaction you want. Simpl
 
 If a previous importer already delivered transactions after the boundary, add `existingActivities` to that account entry: an object mapping each exact SimpleFIN transaction ID to its existing Wealthfolio activity ID. This is a one-time mapping, not fuzzy merchant matching. Legacy `simplefin:<app-account-id>:<transaction-id>` keys are recognized automatically.
 
+Posted foreign-source activities after the boundary block that account until their ownership is resolved; the sync does not infer cross-source identity from descriptions. This catches conflicting ownership, not an incorrectly late cutoff or every missing transaction: historical coverage still needs evidence.
+
+The mapped source must represent the same complete financial account as Wealthfolio. Mark a known additional-card view with `"sourceScope": "cardmember"`; the sync reports an error for that mapping instead of treating it as the primary billing account. The ordinary full-account value is `"account"`. Other accounts continue syncing; a blocked member view is not silently excluded or treated as zero debt.
+
+Before requesting replacement exports, inspect the private original files, retained browser responses, and earlier account decisions. Missing processed output does not establish missing bank evidence; verify account scope, date columns, and pagination in the original source.
+
+Historical duplicate cleanup must preserve native category assignments and splits, not just activity rows. Read `/spending/activities/{activityId}/assignments` for both copies and preserve supported assignments through the native API before deletion. An activity-row comparison alone does not cover that state; conflicting manual assignments require review.
+
 The importer keeps the app's existing account names. Name accounts in Wealthfolio when creating them; do not copy aggregator decorations into the app.
 
 ## Routine behavior
@@ -59,10 +73,15 @@ The importer keeps the app's existing account names. Name accounts in Wealthfoli
 - Fetch 45 days of overlapping data. Posted transactions use stable, account-scoped provider IDs. Pending transactions wait until posted; two identical purchases with distinct IDs remain two purchases.
 - Replaying transactions is a no-op. Provider corrections update importer-owned rows, preserving unrelated metadata, categories, and edited notes. A conflicting manual amount/date edit is reported instead of overwritten. An older saved response cannot replace the last sync.
 - Source dates display on the correct day in the app's configured timezone, including daylight-saving transitions.
+- Balance observation timestamps use the app's timezone. Transaction financial days use the source's verified `transactionTimezone`, independently of the app timezone, or retain the provider UTC day when no source timezone is declared. Native activity timestamps display that financial day consistently while source metadata retains the UTC comparison day.
+- Card balance comparisons retain the original UTC observation day so they use the same calendar basis as provider transaction days. Snapshot dates and card projection cutoffs are not interchangeable.
 - Institution errors are reported without discarding healthy institutions. Missing accounts are not zeroed out, and old source balances retain their actual observation date.
+- Missing source currency never defaults to USD. It can be established from explicit position currencies only when all positions have the same declared unit and their reported values exactly equal the account total. Otherwise the account reports unknown units and retains existing data. A destination account's configured currency does not prove source units.
 - Cash accounts use native `HOLDINGS` snapshots for reported balances while retaining their real transactions for spending. This avoids inventing income or expenses to force a balance.
-- Credit cards retain transaction tracking. A reusable positive `TRANSFER_IN` reconciliation is neutral in native spending. A required negative adjustment is an error: import the missing charges or correct the historical data rather than manufacture an expense. Wealthfolio 3.7 cannot represent a neutral negative card adjustment through its API.
-- Unambiguous equal/opposite transfers are linked without changing their posting dates. Explicit account destinations must agree; cross-day links require routing evidence. Unmatched cash legs are reported because Wealthfolio includes them in income/spending until a counterpart is linked. The importer does not invent counterpart transactions.
+- Credit cards retain transaction tracking and import only real transactions. Balance mismatches are errors: reconcile missing charges, payments, credits, or historical data instead of creating balance-adjustment activities. Wealthfolio 3.10 does not support holdings tracking for credit cards. Legacy `simplefin-balance:` entries must be reviewed and removed after a backup; the sync never creates or resizes them, and reports their presence as an error.
+- Transfer matching and linking use Wealthfolio's native tools. The importer does not guess counterparts or manufacture missing legs. Unmatched cash legs are reported because Wealthfolio includes them in income/spending until a counterpart is linked.
+- Posted card repayments use native `TRANSFER_IN`, not refund `CREDIT`; punctuation in payment descriptions does not change that meaning. Pending payments are still excluded until the provider marks them posted.
+- A linked transfer's two banks can report different dates and descriptions. For a date or description correction, the sync explicitly supplies both legs to the native bulk API so it does not mirror one bank's fields onto the other. Amount or type corrections unlink the pair for review instead of overwriting the counterpart's source facts.
 
 ## Categories and transfers
 
@@ -72,7 +91,7 @@ Categorization is Wealthfolio's job; this repository adds no categorization code
 - **Frequent merchants.** Add a rule for each frequent merchant, matching a distinctive fragment of the description. A handful of merchants usually covers a large share of transactions; categorize the rest by hand.
 - **Long tail.** Wealthfolio's built-in assistant can draft a rule from a hint such as "coffee shops are Food / Coffee"; it saves nothing until you approve the draft. The assistant sends transaction text to its AI provider, so use only a local [Ollama](https://ollama.com) provider. Wealthfolio runs in Docker, so set the provider URL to `http://host.docker.internal:11434` on Docker Desktop, not `localhost`.
 
-Transfers between synced accounts are linked automatically when both legs are unambiguous. `unmatchedTransferCount` in `local-last-sync.json` counts the transfer legs still unlinked, which Wealthfolio counts as income or spending. Link each pair in the app; if the money really left your accounts, change the activity's type instead.
+`unmatchedTransferCount` in `local-last-sync.json` counts imported cash transfer legs still unlinked, which Wealthfolio counts as income or spending. Review candidate matches and link genuine pairs in Wealthfolio; if the money really left your accounts, classify the activity appropriately in the app.
 
 ## Investments and loans
 
@@ -80,11 +99,33 @@ The original SimpleFIN parser discarded `holdings`. The local sync imports the p
 
 Each provider position has its own stable, manually priced asset. The account-qualified symbol is intentional: providers round share counts and can report different implied prices for the same ticker in two accounts. Reusing one global quote changes the other account's value. Independent position prices preserve both the reported quantities and account totals.
 
-Known average cost is retained and provider purchase prices are used when supplied. Missing cost basis remains unknown; account values are not a claim of complete tax basis or reliable investment-performance history. If SimpleFIN supplies only an account total and there are no known securities, it is labeled as a reported-value position, not presented as cash or a fabricated security purchase. Missing position data never replaces known securities with that aggregate: the account reports an error and retains its previous holdings. An explicitly empty position list with a zero balance can clear an empty account.
+Real syncs also request Wealthfolio's native incremental market refresh. Native market-priced instruments use their configured providers; manual-priced source positions are excluded by Wealthfolio and retain their reported prices. A read-only check does not request market refreshes.
+
+Provider total cost basis is divided by the reported quantity for Wealthfolio's native average-cost input; a provided purchase price is used only when total basis is unavailable. Existing average cost is retained only for the exact same source-scoped asset with unchanged quantity; matching names or tickers do not prove cost basis for different or additional shares. Missing cost basis remains unverified; account values are not a claim of complete tax basis or reliable investment-performance history. Missing position data reports an error and retains previous holdings; a nonzero account total never becomes a fake security or presumed cash.
+
+Only an explicitly reported cash position (description `Cash` and no security symbol) becomes a native cash balance. Securities and reported cash must reconcile to the account total; an unexplained positive or negative remainder is not presumed cash. Cash positions must declare compatible units just like securities.
+
+If the quantity of a source-scoped asset changes without provider basis or purchase price, the sync
+retains its known basis and previous holdings and reports an error rather than scaling the
+old basis onto new shares or clearing it to zero. Pending, draft, and void activities do not
+count as posted cash movements; a missing native card calculation is unavailable, not an
+observed zero balance.
 
 An existing loan maps through `wealthfolioAlternativeAssetId`. Source debt updates its native liability valuation using the actual observation date. A failed bank connection keeps its last reported value and produces a warning; reconnect it in SimpleFIN to obtain fresh data.
 
 The command waits for actual native balances to agree with the source, including Wealthfolio's asynchronous recalculation after changing tracking mode. A mismatch is an error, not a successful plan. For an existing installation, remove obsolete generated `gap:` / `rebuild:assertion:` entries after identifying them as bookkeeping rather than bank transactions; do not let old balance adjustments masquerade as spending or import them a second time.
+
+For observation tracking, the source must persist as a readable, non-`CALCULATED` snapshot.
+A matching total, including zero, is not sufficient. Wealthfolio 3.10 can skip an
+identical snapshot without promoting its calculated source; the sync reports that
+failure and restores the previous tracking mode instead of silently hiding its balance.
+Newer manual or CSV-imported observations are retained rather than overwritten.
+
+Cash accounts explicitly set to native `TRANSACTIONS` tracking keep that setting.
+The sync imports actual transactions and verifies their signed cash and native value
+against the source; a discrepancy never creates funding or forces an observation-mode
+switch. `HOLDINGS` cash accounts use reported balance observations. Choose the native
+mode from the available history, not simply because two ending totals happen to match.
 
 Preview without changing the app:
 
@@ -112,7 +153,7 @@ For an alert that also fires when the computer or Docker is off, create a check 
 
 Everything private lives in the data directory: `compose.env`, the SimpleFIN files, and Wealthfolio's database. To move machines, copy that directory and run `dc up -d --build` from a checkout of this repository. To update the code, pull and run the same command.
 
-Wealthfolio is pinned to 3.9.1. To upgrade it, change the version and multi-platform digest in `compose.yml` and run the integration test, which starts that image with synthetic data and runs the sync twice:
+Wealthfolio is pinned to 3.10.0. To upgrade it, change the version and multi-platform digest in `compose.yml` and run the integration tests. They start that image with synthetic data, replay the sync, verify native Spending, transfer matching/linking, all four cost-basis methods, return of capital, and loan setup/valuation:
 
 ```powershell
 pip install pytest argon2-cffi
@@ -126,8 +167,66 @@ CI runs the same test on every pull request. Deploy only after it passes:
 3. Back up the entire `<data>\wealthfolio` directory and `compose.env` to a timestamped location outside the repository. Keep the existing image available for rollback. Copying only `wealthfolio.db` is insufficient: 3.9 adds separate profile databases, and the master key in `compose.env` is also required.
 4. Start the stack with `dc up -d --build`, then check `dc ps` and sign in to confirm the existing accounts are present.
 
-The 3.9 upgrade keeps the existing `WF_DB_PATH` and `/data` mount; existing data appears in a Personal profile. Database migrations run automatically on startup. Encryption remains optional; do not enable `WF_DB_REQUIRE_ENCRYPTION` without first performing the documented offline conversion. Update all devices to 3.9.1 before pairing device sync.
+The 3.9 upgrade keeps the existing `WF_DB_PATH` and `/data` mount; existing data appears in a Personal profile. Database migrations run automatically on startup. Encryption remains optional; do not enable `WF_DB_REQUIRE_ENCRYPTION` without first performing the documented offline conversion. Update all devices to 3.10 before pairing device sync.
+
+The 3.10 engine recalculates history on first launch. Derived valuations and cost basis may
+change; do not change real transactions merely to reproduce old derived numbers. New
+cost-basis methods apply to transaction-tracked investment accounts, not holdings snapshots.
+Loan schedules require actual terms; never infer them from a reported liability balance.
+Connect cloud backup is optional and is not enabled by this deployment.
+
+Use Spending Insights for the native money-flow chart and its category drill-down. Its
+accuracy depends on real transactions, reviewed transfer links, account selection, and
+categorization; updating the app does not repair incomplete historical imports.
+Use the native Backups tab and supported restore workflow for ordinary application backups.
+The stopped-volume copy above is specifically the pre-migration rollback, not a replacement
+backup system.
 
 The upstream final-cash migration can rewrite legacy activity amounts and flag ambiguous rows for review. Rewritten amounts retain their original values in `final_cash_migration.legacy_amount` metadata. Review flagged activities in Wealthfolio; a raw activity fingerprint need not remain identical across this migration.
 
 If startup or the sync fails, stop both containers before restoring the complete pre-upgrade Wealthfolio directory and its matching secrets, then start the previous pinned image. Never point an older image at a migrated database.
+
+## Read-only financial audit
+
+A healthy scheduler is not proof of complete historical data. Reuse the importer to check
+the last saved SimpleFIN response without fetching again or changing the app:
+
+```powershell
+dc run --rm --no-deps sync python -m importers.simplefin.local_sync --check
+```
+
+`python -m importers.simplefin.audit` is only an alias for this check, not a second audit
+engine. Use `--snapshot` to choose another saved response. Results go to the existing
+private `simplefin\local-preview.json`, leaving the last real sync untouched.
+
+The check uses the same source validation, transaction planning, native balance reads,
+holdings-quantity/price checks, and unmatched-transfer warnings as the sync, without
+recalculation or snapshot repair. Needed activity or liability-valuation changes and balance
+mismatches are errors, not adjustments.
+Newer native observations are retained and reported as warnings rather than overwritten.
+
+In Wealthfolio 3.10, activity `amount` is final cash. Fee and tax fields describe attribution
+inside that amount; they are not extra deductions. The adapter preserves those fields and
+never subtracts them a second time when comparing a bank transaction or a card balance.
+Comparisons also respect account type: native `INTEREST` is income in a cash account
+but an outgoing charge on a credit card.
+
+Wallet balances do not establish purchases, dollar funding, or acquisition cost.
+Actual on-chain movements can be native asset transfers with unknown basis; do not
+turn a quoted holding value into a `BUY`/`DEPOSIT` pair. Retain base-unit precision
+and source fee units rather than inventing fiat fees. Flag unknown acquisition basis
+for native review; a displayed zero book cost does not establish a zero tax basis.
+Reopening a wallet or changing its cache-file timestamp alone does not prove that
+its blockchain data refreshed.
+
+Cash-wallet balance observations belong in native holdings history, not inferred
+opening-income deposits. Keep real payment history without fabricating missing bank
+funding. Native transfer suggestions still require source-purpose review: a bank
+cashout is not a payment from a friend merely because its amount and date match.
+
+Spending, categories, transfer classification, and money-flow calculations belong to Wealthfolio.
+Use its Health Center, Spending, transfer tools, and native reports for those workflows.
+There is no custom report store, duplicate categorizer, currency converter, or shadow ledger.
+Exit `0` means the checked inputs produced no errors, `2` means discrepancies, and `1` means
+execution failed. Inspect warnings and observation dates; source agreement is not proof of
+complete lifetime transaction history.
