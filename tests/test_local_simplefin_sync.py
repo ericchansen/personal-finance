@@ -10,7 +10,7 @@ from importers.simplefin.client import SimpleFinAccount, SimpleFinTransaction
 from importers.simplefin.local_sync import (
     SnapshotObservationError, activity_amount, cash_type, inactive_value_warnings,
     latest_readable_snapshot, plan_holdings, plan_transactions,
-    read_accounts, save_changes, sync, sync_cash, sync_securities, update_payload, verify_balances,
+    read_accounts, rolled_cost, save_changes, sync, sync_cash, sync_securities, update_payload, verify_balances,
     use_holdings,
 )
 from importers.simplefin.wealthfolio_client import WealthfolioClient, source_day_timestamp
@@ -459,6 +459,77 @@ def test_recorded_issuer_cost_applies_only_while_it_still_describes_the_position
     assert len(warnings) == 1 and "refresh it from the issuer" in warnings[0]
     stable = {"verifiedCosts": {"TEST": {"unitCost": "1.00"}}}
     assert plan_holdings(observed, account, [], stable)[0]["holdings"][0]["averageCost"] == "1.00"
+
+
+ROLL = {"settlementDays": 2, "transactions": {
+    "payroll": {"FUND": "0.75", "OTHER": "0.25"}, "Fund A dividend": {"FUND": "1"}, "gain": {},
+}}
+START, END = date(2026, 3, 1), date(2026, 3, 17)
+PRICES = [(date(2026, 3, 1), Decimal("10.00")), (date(2026, 3, 15), Decimal("10.40")),
+          (date(2026, 3, 16), Decimal("9.80"))]
+
+
+def posted(day, amount, description="payroll", id=None):
+    return SimpleFinTransaction(id or f"{day}-{description}-{amount}", date(2026, 3, day), Decimal(amount), description)
+
+
+def roll(transactions, quantity, rules=ROLL, prices=PRICES, old_quantity="100.000", old_basis="900.00"):
+    return rolled_cost(rules, "FUND", transactions, START, END, prices,
+                       Decimal(old_quantity), Decimal(old_basis), Decimal(quantity))
+
+
+def test_roll_forward_adds_bridged_purchase_dollars_at_average_cost():
+    # 400 payroll dollars, three quarters to this fund, bought 30 shares at 10.00 (within 9.80-10.40).
+    assert abs(roll([posted(14, "400.00")], "130.000") * Decimal("130.000") - 1200) < Decimal("1e-20")
+    # A transaction posted after the settlement delay belongs to the next step.
+    assert abs(roll([posted(14, "400.00"), posted(16, "400.00")], "130.000") * Decimal("130.000") - 1200) < Decimal("1e-20")
+    assert roll([posted(16, "400.00")], "130.000") is None
+    # Entries mapped to no position move no shares.
+    assert roll([posted(14, "400.00"), posted(14, "0.40", "gain")], "130.000") is not None
+
+
+def test_roll_forward_rejects_dollars_that_do_not_explain_the_share_change():
+    assert roll([posted(14, "400.00")], "140.000") is None  # 300 dollars for 40 shares is 7.50, below 9.80
+    assert roll([posted(14, "400.00")], "125.000") is None  # 300 dollars for 25 shares is 12.00, above 10.40
+    assert roll([], "130.000") is None
+    assert roll([posted(14, "400.00"), posted(14, "5.00", "unknown credit")], "130.000") is None
+
+
+def test_roll_forward_share_decreases_keep_average_cost():
+    assert roll([posted(14, "-3.00", "fee")], "99.700") == Decimal("9")
+    assert roll([posted(14, "-3.00", "fee"), posted(14, "1.00", "unknown credit")], "99.700") is None
+
+
+def test_roll_forward_mixed_step_requires_a_half_cent_bound():
+    fund_sale = posted(14, "-0.04", "Fund A dividend")
+    small = roll([posted(14, "400.00"), fund_sale], "129.996")
+    assert small is not None and abs(small * Decimal("129.996") - Decimal("1199.96")) < Decimal("0.005")
+    large_sale = posted(14, "-40.00", "Fund A dividend")
+    assert roll([posted(14, "400.00"), large_sale], "126.000") is None
+    # A provider sale with no fund attribution could have removed shares of this fund.
+    assert roll([posted(14, "400.00"), posted(14, "-0.04", "fee")], "129.996") is None
+
+
+def test_holdings_roll_forward_uses_the_provider_transactions_and_warns_when_unproven():
+    observed = investment_source()
+    del observed.holdings[0]["purchase_price"]
+    observed.holdings[0].update(symbol="FUND", shares="3.000", market_value="90")
+    observed.holdings[1]["market_value"] = "10"
+    observed = replace(observed, transactions=[posted(1, "30.00")])
+    observed = replace(observed, balance_date=date(2026, 3, 3))
+    account = {**ACCOUNT, "name": "Synthetic Plan"}
+    snapshot, _ = plan_holdings(observed, account, [])
+    current = [{"instrument": {"id": snapshot["holdings"][0]["assetId"], "symbol": "FUND"},
+                "quantity": "2.000", "costBasis": {"local": "40"}}]
+    entry = {"rollForward": {"settlementDays": 2, "transactions": {"payroll": {"FUND": "1"}}}}
+    window = lambda asset_id: (date(2026, 2, 20), [(date(2026, 2, 27), Decimal("30"))])
+    warnings = []
+    holding = plan_holdings(observed, account, current, entry, warnings, window)[0]["holdings"][0]
+    assert abs(Decimal(holding["averageCost"]) * 3 - 70) < Decimal("1e-20") and warnings == []
+    observed = replace(observed, transactions=[posted(1, "45.00")])
+    holding = plan_holdings(observed, account, current, entry, warnings, window)[0]["holdings"][0]
+    assert "averageCost" not in holding
+    assert len(warnings) == 1 and "do not prove the cost" in warnings[0]
 
 
 def test_reported_total_basis_is_used_instead_of_a_zero_or_rounded_purchase_price():

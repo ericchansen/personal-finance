@@ -110,12 +110,16 @@ Provider total cost basis is divided by the reported quantity for Wealthfolio's 
 
 When the provider reports no cost, an account entry can record issuer evidence in `verifiedCosts`, keyed by the source symbol (or description when there is no symbol). `{"unitCost": "1.00"}` suits a fund whose issuer history shows every purchase at one fixed price, such as a stable-NAV money-market fund; it survives dividend reinvestment. `{"quantity": "...", "costBasis": "..."}` records an issuer's dated total for an exact share count and applies only while the source still reports that quantity. Note the issuer document and date alongside it.
 
+For a plan account whose provider transactions name the money behind each quantity change, `rollForward` carries a known cost through later changes under the average-cost method instead of dropping it. `transactions` maps each exact transaction description to the fraction of its dollars each position (keyed as above) receives; map a description to `{}` when its entries move no shares. `settlementDays` is the provider's observed delay between posting a transaction and reporting the quantity that includes it. Map only what the provider's own records prove (for example, a fund name in the description, or a contribution split that every observed step reconciles to).
+
+The quantity step runs from the first snapshot with the old quantity to the new observation. Any share decrease keeps the average cost. An increase adds its attributed purchase dollars only if those dollars divided by the shares bought fall within the prices observed from posting onward, allowing for share and cent rounding. When a fund both buys and sells in one step, the unknown exact sale price must move the result by less than half a cent. An unattributed purchase, an unattributed sale during an increase, or a step that fails these checks leaves the cost unknown with a warning; recording a new issuer-verified cost re-anchors it.
+
 Normal syncs, previews, and read-only checks warn when a position has neither reported, recorded, nor retained acquisition cost, and when a recorded total no longer matches the source quantity. Wealthfolio represents an omitted snapshot cost as zero; that is not proof of a zero-cost acquisition, and its cost-based gains are not verified. Quantities and market values can still reconcile independently. A native calculation status of `complete` does not certify the provenance of its cost inputs.
 
 Only an explicitly reported cash position (description `Cash` and no security symbol) becomes a native cash balance. Securities and reported cash must reconcile to the account total; an unexplained positive or negative remainder is not presumed cash. Cash positions must declare compatible units just like securities.
 
-If the quantity of a source-scoped asset changes without provider basis, purchase price, or an
-applicable recorded cost, the new holdings are published without cost (and the warning above
+If the quantity of a source-scoped asset changes without provider basis, purchase price, an
+applicable recorded cost, or a proven roll-forward, the new holdings are published without cost (and the warning above
 applies) rather than scaling the old basis onto new shares. Earlier snapshots keep the basis
 that was valid on their dates. Pending, draft, and void activities do not
 count as posted cash movements; a missing native card calculation is unavailable, not an
