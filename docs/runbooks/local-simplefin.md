@@ -114,6 +114,8 @@ old basis onto new shares or clearing it to zero. Pending, draft, and void activ
 count as posted cash movements; a missing native card calculation is unavailable, not an
 observed zero balance.
 
+An aggregate account valuation does not establish cash, coin quantities, purchases, or acquisition cost. Wealthfolio's native `Other` value-only asset can retain a dated valuation without creating an account, activity, or security. Omit unknown purchase details and visibly label unverified legacy values. A retained reporting currency is not independent proof of source units: do not extend unlabelled balances into other dates or currencies without compatible evidence. This manual-source representation is not a fallback for an active SimpleFIN investment feed with missing positions; that feed must still report an error.
+
 An existing loan maps through `wealthfolioAlternativeAssetId`. Source debt updates its native liability valuation using the actual observation date. A failed bank connection keeps its last reported value and produces a warning; reconnect it in SimpleFIN to obtain fresh data.
 
 The command waits for actual native balances to agree with the source, including Wealthfolio's asynchronous recalculation after changing tracking mode. A mismatch is an error, not a successful plan. For an existing installation, remove obsolete generated `gap:` / `rebuild:assertion:` entries after identifying them as bookkeeping rather than bank transactions; do not let old balance adjustments masquerade as spending or import them a second time.
