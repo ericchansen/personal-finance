@@ -332,17 +332,22 @@ def test_source_card_repayment_uses_native_transfer_semantics(wealthfolio):
     assert (replay["created"], replay["updated"], replay["errors"]) == (0, 0, [])
 
 
-def test_native_transfer_matching_and_linking_keep_posting_dates(wealthfolio):
+def test_native_cashout_matching_and_linking_keep_posting_dates(wealthfolio):
     _, client = wealthfolio
     accounts = [client.post("/accounts", {
         "name": f"Synthetic Transfer {index}", "accountType": "CASH", "currency": "USD",
         "isActive": True, "isDefault": False, "trackingMode": "TRANSACTIONS",
     }) for index in range(2)]
+    cashout = local_sync.SimpleFinTransaction(
+        "synthetic-cashout", (datetime.now(timezone.utc) - timedelta(days=3)).date(),
+        Decimal("25"), "VENMO CASHOUT", False,
+    )
+    kinds = ("TRANSFER_OUT", local_sync.cash_type(cashout, "CASH"))
     creates = [{
         "accountId": account["id"], "activityType": kind, "amount": "25", "currency": "USD",
         "activityDate": (datetime.now(timezone.utc) - timedelta(days=2 + index)).replace(hour=18).isoformat(),
         "comment": "Synthetic account transfer", "metadata": json.dumps({"flow": {"is_external": True}}),
-    } for index, (account, kind) in enumerate(zip(accounts, ("TRANSFER_OUT", "TRANSFER_IN")))]
+    } for index, (account, kind) in enumerate(zip(accounts, kinds))]
     result = client.save_activities(creates=creates)
     assert not result["errors"]
     left, right = result["created"]
