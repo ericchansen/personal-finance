@@ -623,6 +623,115 @@ def test_native_observed_cash_history_does_not_create_opening_income(wealthfolio
     assert report["current"]["income"] == 0 and report["current"]["outflow"] == 25
 
 
+def test_native_money_market_classification_preserves_securities_and_bank_cash(wealthfolio):
+    _, client = wealthfolio
+    account = client.post("/accounts", {
+        "name": "Synthetic Fund Classification", "accountType": "SECURITIES", "currency": "USD",
+        "isActive": True, "isDefault": False, "trackingMode": "HOLDINGS",
+    })
+    sources, _ = local_sync.read_accounts({"accounts": [{
+        "id": "synthetic-fund-classification", "name": "Synthetic Fund", "currency": "USD",
+        "balance": "100", "balance-date": epoch(datetime.now(timezone.utc)), "holdings": [{
+            "id": "synthetic-fund", "symbol": "SYN-LIQUID", "description": "Synthetic Money Market Fund",
+            "shares": "90", "market_value": "90", "currency": "USD",
+        }, {
+            "id": "synthetic-cash", "symbol": "", "description": "Cash",
+            "shares": "0", "market_value": "10", "currency": "USD",
+        }],
+    }]}, balance_zone=client.display_timezone())
+    mapping = {sources[0].id: {"wealthfolioAccountId": account["id"]}}
+    activity_ids = {row["id"] for row in client.iter_activities()}
+    assert local_sync.sync(client, sources, mapping)["errors"] == []
+    before = client.get(f"/holdings?accountId={account['id']}")
+    fund = next(row for row in before if row["holdingType"] == "security")
+    asset_id = fund["instrument"]["id"]
+    assert fund["instrument"]["classifications"]["assetType"]["id"] == "STOCK_COMMON"
+    profile = client.get(f"/assets/profile?assetId={asset_id}")
+    for taxonomy, category in (("instrument_type", "FUND_MUTUAL"), ("asset_classes", "CASH_MONEY_MARKET")):
+        result = client.put(f"/taxonomies/assignments/asset/{asset_id}/taxonomy/{taxonomy}", [{
+            "assetId": asset_id, "taxonomyId": taxonomy, "categoryId": category,
+            "weight": 10000, "source": "MANUAL",
+        }])
+        assert len(result) == 1 and result[0]["categoryId"] == category
+    for check in (False, True):
+        result = local_sync.sync(client, sources, mapping, check=check)
+        assert result["errors"] == [] and result["created"] == result["updated"] == 0
+        holdings = client.get(f"/holdings?accountId={account['id']}")
+        fund = next(row for row in holdings if row["holdingType"] == "security")
+        classes = fund["instrument"]["classifications"]
+        assert classes["assetType"]["id"] == "FUND_MUTUAL"
+        assert [(row["category"]["id"], row["topLevelCategory"]["id"], row["weight"])
+                for row in classes["assetClasses"]] == [("CASH_MONEY_MARKET", "CASH", 100.0)]
+        for old in before:
+            actual = next(row for row in holdings if row["id"] == old["id"])
+            for field in ("holdingType", "quantity", "marketValue", "costBasis", "price", "localCurrency"):
+                assert actual[field] == old[field]
+        assert sum(Decimal(str(row["marketValue"]["local"])) for row in holdings
+                   if row["holdingType"] == "cash") == 10
+        allocation = client.get(f"/allocations?accountId={account['id']}")
+        assert allocation["totalValue"] == 100
+        assert [(row["categoryId"], row["value"]) for row in allocation["assetClasses"]["categories"]] == [
+            ("CASH", 100.0),
+        ]
+        assert next(row for row in allocation["securityTypes"]["categories"]
+                    if row["categoryId"] == "FUND")["value"] == 90
+        updated_profile = client.get(f"/assets/profile?assetId={asset_id}")
+        assert {key: value for key, value in updated_profile.items() if key != "updatedAt"} == {
+            key: value for key, value in profile.items() if key != "updatedAt"
+        }
+        assert {row["id"] for row in client.iter_activities()} == activity_ids
+
+
+@pytest.mark.parametrize(("instrument_category", "clear_allocation"), [
+    ("FUND", True), ("DEPOSITARY_RECEIPT", False),
+])
+def test_native_wrapper_types_and_unclassified_exposure_survive_replay(
+    wealthfolio, instrument_category, clear_allocation,
+):
+    _, client = wealthfolio
+    account = client.post("/accounts", {
+        "name": f"Synthetic Wrapper {instrument_category}", "accountType": "SECURITIES",
+        "currency": "USD", "isActive": True, "isDefault": False, "trackingMode": "HOLDINGS",
+    })
+    sources, _ = local_sync.read_accounts({"accounts": [{
+        "id": f"synthetic-wrapper-{instrument_category}", "name": "Synthetic Wrapper", "currency": "USD",
+        "balance": "100", "balance-date": epoch(datetime.now(timezone.utc)), "holdings": [{
+            "id": "synthetic-wrapper-position", "symbol": "SYN-WRAPPER",
+            "description": "Synthetic Pooled Investment", "shares": "2",
+            "market_value": "100", "currency": "USD",
+        }],
+    }]}, balance_zone=client.display_timezone())
+    mapping = {sources[0].id: {"wealthfolioAccountId": account["id"]}}
+    assert local_sync.sync(client, sources, mapping)["errors"] == []
+    before = next(row for row in client.get(f"/holdings?accountId={account['id']}")
+                  if row["holdingType"] == "security")
+    asset_id = before["instrument"]["id"]
+    client.put(f"/taxonomies/assignments/asset/{asset_id}/taxonomy/instrument_type", [{
+        "assetId": asset_id, "taxonomyId": "instrument_type", "categoryId": instrument_category,
+        "weight": 10000, "source": "MANUAL",
+    }])
+    if clear_allocation:
+        client.put(f"/taxonomies/assignments/asset/{asset_id}/taxonomy/asset_classes", [])
+    for check in (False, True):
+        result = local_sync.sync(client, sources, mapping, check=check)
+        assert result["errors"] == [] and result["created"] == result["updated"] == 0
+        actual = next(row for row in client.get(f"/holdings?accountId={account['id']}")
+                      if row["holdingType"] == "security")
+        assert actual["instrument"]["classifications"]["assetType"]["id"] == instrument_category
+        for field in ("holdingType", "quantity", "marketValue", "costBasis", "price", "localCurrency"):
+            assert actual[field] == before[field]
+        if clear_allocation:
+            assert actual["instrument"]["classifications"]["assetClasses"] == []
+            allocation = client.get(f"/allocations?accountId={account['id']}")
+            assert [(row["categoryId"], row["value"]) for row in allocation["assetClasses"]["categories"]] == [
+                ("__UNKNOWN__", 100.0),
+            ]
+        else:
+            assert actual["instrument"]["classifications"]["assetClasses"] == (
+                before["instrument"]["classifications"]["assetClasses"]
+            )
+
+
 def test_native_missing_basis_warns_without_inventing_acquisition_cost(wealthfolio):
     _, client = wealthfolio
     account = client.post("/accounts", {
