@@ -562,6 +562,12 @@ def sync_securities(client, source, account, result, positions, dry_run):
         result["warnings"].append(f"{account['name']}: kept newer holdings dated {newest}")
         return None
     snapshot, quotes = plan_holdings(source, account, client.get(f"/holdings?accountId={account['id']}"))
+    missing_basis = sum("averageCost" not in holding for holding in snapshot["holdings"])
+    if missing_basis:
+        result["warnings"].append(
+            f"{account['name']}: acquisition cost unavailable for {missing_basis} position(s); "
+            "Wealthfolio's zero cost is not verified tax basis, and cost-based gains are unverified"
+        )
     positions[account["id"]] = (snapshot, quotes)
     if not dry_run:
         use_holdings(client, account, snapshot, quotes)

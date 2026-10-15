@@ -9,7 +9,7 @@ import pytest
 from importers.simplefin.client import SimpleFinAccount, SimpleFinTransaction
 from importers.simplefin.local_sync import (
     SnapshotObservationError, activity_amount, cash_type, plan_holdings, plan_transactions,
-    read_accounts, save_changes, sync, sync_cash, update_payload, verify_balances,
+    read_accounts, save_changes, sync, sync_cash, sync_securities, update_payload, verify_balances,
     use_holdings,
 )
 from importers.simplefin.wealthfolio_client import WealthfolioClient, source_day_timestamp
@@ -583,6 +583,45 @@ def test_partial_investment_response_retains_existing_native_state():
     assert client.snapshot is None
     assert client.account["trackingMode"] == "TRANSACTIONS"
     assert client.writes == ["/portfolio/recalculate"]
+
+
+@pytest.mark.parametrize("basis_source", ["missing", "zero", "total", "purchase", "retained"])
+def test_missing_acquisition_cost_is_visible_without_changing_positions(basis_source):
+    client = FakeClient()
+    client.account["accountType"] = "SECURITIES"
+    observed = investment_source()
+    del observed.holdings[0]["purchase_price"]
+    current = []
+    if basis_source == "zero":
+        observed.holdings[0].update(cost_basis="0", purchase_price="0")
+    elif basis_source == "total":
+        observed.holdings[0]["cost_basis"] = "60"
+    elif basis_source == "purchase":
+        observed.holdings[0]["purchase_price"] = "30"
+    elif basis_source == "retained":
+        snapshot, _ = plan_holdings(observed, client.account, [])
+        current = [{
+            "instrument": {"id": snapshot["holdings"][0]["assetId"], "symbol": "TEST"},
+            "quantity": "2", "costBasis": {"local": "60"},
+        }]
+    base_get = client.get
+    client.get = lambda path: current if path == "/holdings?accountId=cash-account" else base_get(path)
+    result = {"warnings": [], "positions": 0, "balances": 0}
+    positions = {}
+    assert sync_securities(client, observed, client.account, result, positions, True) == Decimal("100")
+    snapshot, quotes = positions[client.account["id"]]
+    assert snapshot["holdings"][0]["quantity"] == "2" and quotes[0]["close"] == "45"
+    assert snapshot["cashBalances"] == {"USD": "10.00"}
+    assert result["positions"] == result["balances"] == 1
+    if basis_source in ("missing", "zero"):
+        assert "averageCost" not in snapshot["holdings"][0]
+        assert len(result["warnings"]) == 1
+        assert "acquisition cost unavailable for 1 position(s)" in result["warnings"][0]
+        assert "gains are unverified" in result["warnings"][0]
+    else:
+        assert snapshot["holdings"][0]["averageCost"] == "30"
+        assert result["warnings"] == []
+    assert client.writes == []
 
 
 def test_full_cash_sync_replay_preserves_transactions_and_matches_bank(monkeypatch):
