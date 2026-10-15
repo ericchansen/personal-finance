@@ -106,15 +106,18 @@ Existing/local search results describe stored metadata, not independent referenc
 
 Real syncs also request Wealthfolio's native incremental market refresh. Native market-priced instruments use their configured providers; manual-priced source positions are excluded by Wealthfolio and retain their reported prices. A read-only check does not request market refreshes.
 
-Provider total cost basis is divided by the reported quantity for Wealthfolio's native average-cost input; a provided purchase price is used only when total basis is unavailable. Existing average cost is retained only for the exact same source-scoped asset with unchanged quantity; matching names or tickers do not prove cost basis for different or additional shares. Missing cost basis remains unverified; account values are not a claim of complete tax basis or reliable investment-performance history. Missing position data reports an error and retains previous holdings; a nonzero account total never becomes a fake security or presumed cash.
+Provider total cost basis is divided by the reported quantity for Wealthfolio's native average-cost input; a provided purchase price is used only when total basis is unavailable. Some providers put a per-share average cost in the total-basis field. Set `"sourceCostBasis": "perUnit"` on that account's map entry only after the values match the issuer's own transaction history. Existing average cost is retained only for the exact same source-scoped asset with unchanged quantity; matching names or tickers do not prove cost basis for different or additional shares. Missing cost basis remains unverified; account values are not a claim of complete tax basis or reliable investment-performance history. Missing position data reports an error and retains previous holdings; a nonzero account total never becomes a fake security or presumed cash.
 
-Normal syncs, previews, and read-only checks warn when a position has neither reported nor retained acquisition cost. Wealthfolio represents an omitted snapshot cost as zero; that is not proof of a zero-cost acquisition, and its cost-based gains are not verified. Quantities and market values can still reconcile independently. A native calculation status of `complete` does not certify the provenance of its cost inputs.
+When the provider reports no cost, an account entry can record issuer evidence in `verifiedCosts`, keyed by the source symbol (or description when there is no symbol). `{"unitCost": "1.00"}` suits a fund whose issuer history shows every purchase at one fixed price, such as a stable-NAV money-market fund; it survives dividend reinvestment. `{"quantity": "...", "costBasis": "..."}` records an issuer's dated total for an exact share count and applies only while the source still reports that quantity. Note the issuer document and date alongside it.
+
+Normal syncs, previews, and read-only checks warn when a position has neither reported, recorded, nor retained acquisition cost, and when a recorded total no longer matches the source quantity. Wealthfolio represents an omitted snapshot cost as zero; that is not proof of a zero-cost acquisition, and its cost-based gains are not verified. Quantities and market values can still reconcile independently. A native calculation status of `complete` does not certify the provenance of its cost inputs.
 
 Only an explicitly reported cash position (description `Cash` and no security symbol) becomes a native cash balance. Securities and reported cash must reconcile to the account total; an unexplained positive or negative remainder is not presumed cash. Cash positions must declare compatible units just like securities.
 
-If the quantity of a source-scoped asset changes without provider basis or purchase price, the sync
-retains its known basis and previous holdings and reports an error rather than scaling the
-old basis onto new shares or clearing it to zero. Pending, draft, and void activities do not
+If the quantity of a source-scoped asset changes without provider basis, purchase price, or an
+applicable recorded cost, the new holdings are published without cost (and the warning above
+applies) rather than scaling the old basis onto new shares. Earlier snapshots keep the basis
+that was valid on their dates. Pending, draft, and void activities do not
 count as posted cash movements; a missing native card calculation is unavailable, not an
 observed zero balance.
 

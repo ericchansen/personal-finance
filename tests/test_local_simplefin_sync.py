@@ -432,11 +432,33 @@ def test_cost_basis_is_not_guessed_from_changed_quantity_or_matching_names():
     }]
     assert plan_holdings(observed, account, current)[0]["holdings"][0]["averageCost"] == "30"
     observed.holdings[0]["shares"] = "3"
-    with pytest.raises(ValueError, match="source quantity changed without reported cost basis"):
-        plan_holdings(observed, account, current)
+    assert "averageCost" not in plan_holdings(observed, account, current)[0]["holdings"][0]
     observed.holdings[0]["shares"] = "2"
     current[0]["instrument"]["id"] = "synthetic-unrelated-asset"
     assert "averageCost" not in plan_holdings(observed, account, current)[0]["holdings"][0]
+
+
+def test_per_unit_provider_cost_is_not_divided_by_quantity_again():
+    observed = investment_source()
+    observed.holdings[0].update(cost_basis="28", purchase_price="0")
+    account = {**ACCOUNT, "name": "Synthetic Broker"}
+    assert plan_holdings(observed, account, [])[0]["holdings"][0]["averageCost"] == "14"
+    snapshot, _ = plan_holdings(observed, account, [], {"sourceCostBasis": "perUnit"})
+    assert snapshot["holdings"][0]["averageCost"] == "28"
+
+
+def test_recorded_issuer_cost_applies_only_while_it_still_describes_the_position():
+    observed = investment_source()
+    del observed.holdings[0]["purchase_price"]
+    account = {**ACCOUNT, "name": "Synthetic Broker"}
+    entry = {"verifiedCosts": {"TEST": {"quantity": "2", "costBasis": "50"}}}
+    warnings = []
+    assert plan_holdings(observed, account, [], entry, warnings)[0]["holdings"][0]["averageCost"] == "25"
+    observed.holdings[0]["shares"] = "3"
+    assert "averageCost" not in plan_holdings(observed, account, [], entry, warnings)[0]["holdings"][0]
+    assert len(warnings) == 1 and "refresh it from the issuer" in warnings[0]
+    stable = {"verifiedCosts": {"TEST": {"unitCost": "1.00"}}}
+    assert plan_holdings(observed, account, [], stable)[0]["holdings"][0]["averageCost"] == "1.00"
 
 
 def test_reported_total_basis_is_used_instead_of_a_zero_or_rounded_purchase_price():
@@ -586,19 +608,22 @@ def test_partial_investment_response_retains_existing_native_state():
     assert client.writes == ["/portfolio/recalculate"]
 
 
-@pytest.mark.parametrize("basis_source", ["missing", "zero", "total", "purchase", "retained"])
+@pytest.mark.parametrize("basis_source", ["missing", "zero", "total", "purchase", "retained", "recorded"])
 def test_missing_acquisition_cost_is_visible_without_changing_positions(basis_source):
     client = FakeClient()
     client.account["accountType"] = "SECURITIES"
     observed = investment_source()
     del observed.holdings[0]["purchase_price"]
     current = []
+    entry = {}
     if basis_source == "zero":
         observed.holdings[0].update(cost_basis="0", purchase_price="0")
     elif basis_source == "total":
         observed.holdings[0]["cost_basis"] = "60"
     elif basis_source == "purchase":
         observed.holdings[0]["purchase_price"] = "30"
+    elif basis_source == "recorded":
+        entry = {"verifiedCosts": {"TEST": {"quantity": "2", "costBasis": "60"}}}
     elif basis_source == "retained":
         snapshot, _ = plan_holdings(observed, client.account, [])
         current = [{
@@ -609,7 +634,7 @@ def test_missing_acquisition_cost_is_visible_without_changing_positions(basis_so
     client.get = lambda path: current if path == "/holdings?accountId=cash-account" else base_get(path)
     result = {"warnings": [], "positions": 0, "balances": 0}
     positions = {}
-    assert sync_securities(client, observed, client.account, result, positions, True) == Decimal("100")
+    assert sync_securities(client, observed, client.account, result, positions, True, entry) == Decimal("100")
     snapshot, quotes = positions[client.account["id"]]
     assert snapshot["holdings"][0]["quantity"] == "2" and quotes[0]["close"] == "45"
     assert snapshot["cashBalances"] == {"USD": "10.00"}
