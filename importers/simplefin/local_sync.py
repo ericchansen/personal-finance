@@ -267,7 +267,22 @@ def is_cash_position(position: dict) -> bool:
     )
 
 
-def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict]):
+def verified_cost(entry: dict, key: str, quantity: Decimal) -> Decimal | None:
+    """Average cost from issuer evidence recorded in the private account map, if it still applies."""
+    record = (entry.get("verifiedCosts") or {}).get(key)
+    if record is None:
+        return None
+    if "unitCost" in record:
+        return money(record["unitCost"])
+    if money(record["quantity"]) == quantity:
+        return money(record["costBasis"]) / quantity
+    return None
+
+
+def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict], entry: dict | None = None,
+                  warnings: list[str] | None = None):
+    entry = entry or {}
+    per_unit = entry.get("sourceCostBasis", "total") == "perUnit"
     if source.holdings is None or (not source.holdings and source.balance != 0):
         raise ValueError("source positions are unavailable; existing holdings were not replaced")
     holdings, quotes = [], []
@@ -296,14 +311,21 @@ def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict]):
         asset_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"simplefin:{source.id}:{position['id']}"))
         scoped = next((row for row in current if (row.get("instrument") or {}).get("id") == asset_id), None)
         average_cost = None
+        recorded = verified_cost(entry, symbol or name, quantity)
         if money(position.get("cost_basis") or 0) > 0:
-            average_cost = money(position["cost_basis"]) / quantity
+            average_cost = money(position["cost_basis"]) / (1 if per_unit else quantity)
         elif money(position.get("purchase_price") or 0) > 0:
             average_cost = money(position["purchase_price"])
-        elif scoped and scoped.get("costBasis") and money(scoped["costBasis"]["local"]) > 0:
-            if money(scoped.get("quantity") or 0) != quantity:
-                raise ValueError("source quantity changed without reported cost basis; existing holdings and known cost basis were retained")
+        elif recorded is not None:
+            average_cost = recorded
+        elif (scoped and scoped.get("costBasis") and money(scoped["costBasis"]["local"]) > 0
+              and money(scoped.get("quantity") or 0) == quantity):
             average_cost = money(scoped["costBasis"]["local"]) / quantity
+        elif (symbol or name) in (entry.get("verifiedCosts") or {}) and warnings is not None:
+            warnings.append(
+                f"{account['name']}: recorded issuer cost for {symbol or name} covers a different quantity "
+                "than the source now reports; refresh it from the issuer"
+            )
         holding = {
             "assetId": asset_id,
             "symbol": scoped["instrument"]["symbol"] if scoped else f"{symbol or name} @ {account['name']}",
@@ -590,13 +612,15 @@ def sync_cash(client, source, entry, account, rows, zone, result, positions, dry
     return source.balance
 
 
-def sync_securities(client, source, account, result, positions, dry_run):
+def sync_securities(client, source, account, result, positions, dry_run, entry=None):
     snapshots = client.get(f"/snapshots?accountId={account['id']}")
     newest = max((row["snapshotDate"] for row in snapshots if row["source"] != "CALCULATED"), default="")
     if newest > source.balance_date.isoformat():
         result["warnings"].append(f"{account['name']}: kept newer holdings dated {newest}")
         return None
-    snapshot, quotes = plan_holdings(source, account, client.get(f"/holdings?accountId={account['id']}"))
+    snapshot, quotes = plan_holdings(
+        source, account, client.get(f"/holdings?accountId={account['id']}"), entry, result["warnings"],
+    )
     missing_basis = sum("averageCost" not in holding for holding in snapshot["holdings"])
     if missing_basis:
         result["warnings"].append(
@@ -684,7 +708,7 @@ def sync(client, sources, mapping, *, dry_run=False, check=False):
             if account["accountType"] in {"CASH", "CREDIT_CARD"}:
                 expected = sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run)
             elif account["accountType"] == "SECURITIES":
-                expected = sync_securities(client, source, account, result, positions, dry_run)
+                expected = sync_securities(client, source, account, result, positions, dry_run, entry)
             else:
                 raise ValueError("unsupported account type for SimpleFIN sync")
             if expected is None:
