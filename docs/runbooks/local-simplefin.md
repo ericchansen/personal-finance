@@ -128,6 +128,14 @@ against the source; a discrepancy never creates funding or forces an observation
 switch. `HOLDINGS` cash accounts use reported balance observations. Choose the native
 mode from the available history, not simply because two ending totals happen to match.
 
+Classify contribution-only subaccounts from issuer evidence, not the institution's name.
+When the issuer defines a balance as payroll contributions excluding purchased shares,
+use a separate cash contribution account; keep the actual share-holding brokerage as
+securities. This does not make contributions spendable cash or establish acquisition cost.
+Do not relabel an unitemized investment total as cash just to avoid a positions error.
+A cash-mapped source reporting securities or foreign-currency positions is rejected
+before importing transactions.
+
 Preview without changing the app:
 
 ```powershell

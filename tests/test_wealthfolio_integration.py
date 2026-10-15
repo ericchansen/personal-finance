@@ -234,6 +234,42 @@ def test_native_loan_preview_and_valuation_preserve_activity(wealthfolio):
     assert {row["id"] for row in client.iter_activities()} == before
 
 
+def test_verified_contribution_account_can_use_native_cash_observations(wealthfolio):
+    _, client = wealthfolio
+    account = client.post("/accounts", {
+        "name": "Synthetic Contribution Plan", "accountType": "SECURITIES",
+        "currency": "USD", "isActive": True, "isDefault": False,
+        "group": "Retirement", "trackingMode": "HOLDINGS",
+    })
+    client.update_account(
+        account["id"], name="Synthetic Plan Contributions", accountType="CASH",
+        group="Investments", isActive=True, isDefault=False, trackingMode="HOLDINGS",
+    )
+    actual = next(row for row in client.list_accounts() if row["id"] == account["id"])
+    assert actual["accountType"] == "CASH"
+    assert actual["trackingMode"] == "HOLDINGS"
+    now = datetime.now(timezone.utc)
+    sources, errors = local_sync.read_accounts({"accounts": [{
+        "id": "synthetic-contributions", "name": "Synthetic Contribution Balance",
+        "currency": "USD", "balance": "75", "balance-date": epoch(now),
+        "transactions": [], "holdings": [],
+    }]}, balance_zone=client.display_timezone())
+    assert errors == []
+    mapping = {sources[0].id: {
+        "wealthfolioAccountId": account["id"],
+        "historyThrough": (now - timedelta(days=30)).date().isoformat(),
+    }}
+    result = local_sync.sync(client, sources, mapping)
+    assert result["errors"] == []
+    assert result["created"] == result["updated"] == result["positions"] == 0
+    holdings = client.get(f"/holdings?accountId={account['id']}")
+    assert not any(row["holdingType"] == "security" for row in holdings)
+    assert sum(Decimal(str(row["quantity"])) for row in holdings) == Decimal("75")
+    assert not any(row["accountId"] == account["id"] for row in client.iter_activities())
+    replay = local_sync.sync(client, sources, mapping)
+    assert (replay["created"], replay["updated"], replay["errors"]) == (0, 0, [])
+
+
 def test_source_card_repayment_uses_native_transfer_semantics(wealthfolio):
     _, client = wealthfolio
     accounts = {
