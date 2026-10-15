@@ -234,6 +234,85 @@ def test_native_loan_preview_and_valuation_preserve_activity(wealthfolio):
     assert {row["id"] for row in client.iter_activities()} == before
 
 
+def test_native_value_only_history_does_not_require_cash_coins_or_purchase_basis(wealthfolio):
+    _, client = wealthfolio
+    activity_ids = {row["id"] for row in client.iter_activities()}
+    account = client.post("/accounts", {
+        "name": "Synthetic Legacy Balance Shell", "accountType": "CRYPTOCURRENCY", "currency": "USD",
+        "isActive": True, "isDefault": False, "trackingMode": "TRANSACTIONS",
+    })
+    last = (datetime.now(timezone.utc) - timedelta(days=2)).date()
+    days = [last - timedelta(days=2), last - timedelta(days=1), last]
+    opening = client.post("/activities", {
+        "accountId": account["id"], "activityType": "DEPOSIT", "currency": "USD", "amount": "100",
+        "activityDate": local_sync.source_day_timestamp(last, client.display_timezone()),
+        "idempotencyKey": "synthetic-invalid-balance-as-deposit",
+    })
+    for _ in range(30):
+        cash = sum((Decimal(str(row["marketValue"]["local"]))
+                    for row in client.get(f"/holdings?accountId={account['id']}")), Decimal(0))
+        if cash == 100:
+            break
+        time.sleep(1)
+    assert cash == 100
+    before = client.get("/net-worth")
+    history_path = f"/net-worth/history?startDate={days[0]}&endDate={last}"
+    history_before = {row["date"]: row for row in client.get(history_path)}
+    accounts_before = client.list_accounts()
+    saved = client.post("/alternative-assets", {
+        "kind": "other", "name": "Synthetic Historical Account Valuation", "currency": "USD",
+        "currentValue": "100", "valueDate": last.isoformat(),
+        "metadata": {"valuation_scope": "historical_account_total", "positions_status": "unknown"},
+    })
+    assert client.list_accounts() == accounts_before
+    result = client.post("/market-data/quotes/import", {
+        "quotes": [
+            {"symbol": saved["assetId"], "date": day.isoformat(), "close": value, "currency": "USD"}
+            for day, value in zip(days, ("60", "80", "100"))
+        ], "overwriteExisting": True,
+    })
+    assert len(result) == 3 and all(row["validationStatus"] == "valid" for row in result)
+    removed = client.post("/activities/bulk", {
+        "creates": [], "updates": [], "deleteIds": [opening["id"]],
+    })
+    assert not removed["errors"]
+    for _ in range(30):
+        cash = sum((Decimal(str(row["marketValue"]["local"]))
+                    for row in client.get(f"/holdings?accountId={account['id']}")), Decimal(0))
+        if cash == 0:
+            break
+        time.sleep(1)
+    assert cash == 0
+    full = next(row for row in client.list_accounts() if row["id"] == account["id"])
+    client.update_account(account["id"], **{
+        key: value for key, value in {**full, "isArchived": True, "isActive": False}.items() if key != "id"
+    })
+    assert account["id"] not in {row["id"] for row in client.list_accounts()}
+    archived = next(row for row in client.get("/accounts?includeArchived=true") if row["id"] == account["id"])
+    assert archived["name"] == full["name"] and archived["isArchived"] and not archived["isActive"]
+    actual = next(row for row in client.get("/alternative-holdings") if row["id"] == saved["assetId"])
+    assert actual["kind"] == "other" and Decimal(actual["marketValue"]) == 100
+    assert actual["purchasePrice"] is None and actual["purchaseDate"] is None
+    assert actual["unrealizedGain"] is None and actual["unrealizedGainPct"] is None
+    assert actual["valuationDate"][:10] == last.isoformat()
+    assert {row["id"] for row in client.iter_activities()} == activity_ids
+    quotes = client.get(f"/market-data/quotes/history?symbol={saved['assetId']}")
+    assert {row["timestamp"][:10]: Decimal(str(row["close"])) for row in quotes} == {
+        day.isoformat(): Decimal(value) for day, value in zip(days, ("60", "80", "100"))
+    }
+    after = client.get("/net-worth")
+    assert abs(Decimal(str(after["netWorth"])) - Decimal(str(before["netWorth"]))) < Decimal("0.005")
+    cash_before = sum(Decimal(str(row["value"])) for row in before["assets"]["breakdown"] if row["category"] == "cash")
+    cash_after = sum(Decimal(str(row["value"])) for row in after["assets"]["breakdown"] if row["category"] == "cash")
+    assert abs(cash_before - cash_after - 100) < Decimal("0.005")
+    history = client.get(history_path)
+    expected_history = {day.isoformat(): Decimal(value) for day, value in zip(days, ("60", "80", "100"))}
+    for row in history:
+        old = Decimal(str(history_before.get(row["date"], {}).get("alternativeAssetsValue", 0)))
+        assert Decimal(str(row["alternativeAssetsValue"])) - old == expected_history[row["date"]]
+    assert {row["date"] for row in history} == {day.isoformat() for day in days}
+
+
 def test_verified_contribution_account_can_use_native_cash_observations(wealthfolio):
     _, client = wealthfolio
     account = client.post("/accounts", {
