@@ -289,7 +289,8 @@ def rolled_cost(rules: dict, key: str, transactions, start: date, end: date,
 
     `rules["transactions"]` maps an exact transaction description to the share of its dollars each
     position receives (`{}` for entries that move no shares); `rules["settlementDays"]` is the
-    provider's delay between posting a transaction and reporting the quantity that includes it.
+    provider's delay between posting a transaction and reporting the quantity that includes it,
+    counted in the same timezone as the snapshot dates.
     The step spans from `start`, when the old quantity was first observed, to the new observation
     on `end`; `prices` are the dated prices observed in between. Any share decrease leaves average
     cost unchanged. A purchase adds its dollars and a sale removes average cost for the shares
@@ -708,6 +709,13 @@ def sync_securities(client, source, account, result, positions, dry_run, entry=N
         return None
     current = client.get(f"/holdings?accountId={account['id']}")
     quantities = {(row.get("instrument") or {}).get("id"): money(row.get("quantity") or 0) for row in current}
+    # Balance and snapshot dates are display-zone days; date postings the same way so the
+    # roll-forward settlement delay compares like with like.
+    zone = client.display_timezone()
+    source = replace(source, transactions=[
+        replace(txn, posted=txn.posted_at.astimezone(zone).date()) if txn.posted_at else txn
+        for txn in source.transactions
+    ])
     snapshot, quotes = plan_holdings(
         source, account, current, entry, result["warnings"],
         lambda asset_id: quantity_window(client, account["id"], asset_id, quantities[asset_id]),
