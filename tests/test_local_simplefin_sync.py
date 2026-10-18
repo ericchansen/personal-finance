@@ -718,6 +718,40 @@ def test_missing_acquisition_cost_is_visible_without_changing_positions(basis_so
     else:
         assert snapshot["holdings"][0]["averageCost"] == "30"
         assert result["warnings"] == []
+
+
+def test_roll_forward_dates_postings_in_the_snapshot_timezone():
+    # The provider posts at its own midnight (04:00 UTC, the 14th in Chicago) and reports the new
+    # quantity two Chicago days later, just before Chicago midnight (the 17th in UTC).
+    client = FakeClient()
+    client.account["accountType"] = "SECURITIES"
+    posted_at = datetime.fromisoformat("2026-03-15T04:00:00+00:00")
+    observed = SimpleFinAccount(
+        "source-plan", "Synthetic Plan", "Synthetic Bank", "USD", Decimal("93"), date(2026, 3, 16),
+        transactions=[SimpleFinTransaction("contribution-1", posted_at.date(), Decimal("31.00"),
+                                           "payroll", posted_at=posted_at)],
+        holdings=[{"id": "position-1", "symbol": "FUND", "description": "Synthetic Fund",
+                   "shares": "3.000", "market_value": "93", "currency": "USD"}],
+    )
+    asset = plan_holdings(observed, client.account, [])[0]["holdings"][0]["assetId"]
+    responses = {
+        "/snapshots?accountId=cash-account": [{"snapshotDate": "2026-03-02", "source": "MANUAL_ENTRY"}],
+        "/holdings?accountId=cash-account": [{"instrument": {"id": asset, "symbol": "FUND"},
+                                              "quantity": "2.000", "costBasis": {"local": "60"}}],
+        "/snapshots/holdings?accountId=cash-account&date=2026-03-02": [
+            {"instrument": {"id": asset}, "quantity": "2.000"}],
+        f"/market-data/quotes/history?symbol={asset}": [
+            {"timestamp": "2026-03-02T00:00:00Z", "close": "30"},
+            {"timestamp": "2026-03-14T00:00:00Z", "close": "31.20"}],
+    }
+    client.get = responses.__getitem__
+    entry = {"rollForward": {"settlementDays": 2, "transactions": {"payroll": {"FUND": "1"}}}}
+    result = {"warnings": [], "positions": 0, "balances": 0}
+    positions = {}
+    sync_securities(client, observed, client.account, result, positions, True, entry)
+    holding = positions[client.account["id"]][0]["holdings"][0]
+    assert abs(Decimal(holding["averageCost"]) * 3 - 91) < Decimal("1e-20")
+    assert result["warnings"] == []
     assert client.writes == []
 
 
