@@ -661,6 +661,43 @@ def test_verified_cash_only_account_uses_reported_balance_without_invented_activ
     assert client.rows == before
 
 
+def contribution_sync(purchase_amount=None, purchase_day=date(2026, 2, 1)):
+    client = FakeClient()
+    client.snapshot = {"accountId": ACCOUNT["id"], "snapshotDate": "2026-01-30",
+                       "holdings": [], "cashBalances": {"USD": "250.00"}}
+    plan_source = replace(source(), id="plan", balance=Decimal("0.00"))
+    buyer = SimpleFinAccount("brokerage", "Synthetic Brokerage", "Synthetic Bank", "USD",
+                             Decimal("0"), date(2026, 2, 1), transactions=[
+                                 SimpleFinTransaction("buy-1", purchase_day, Decimal(purchase_amount),
+                                                      "Synthetic plan purchase")
+                             ] if purchase_amount else [])
+    result = sync(client, [plan_source, buyer], {
+        "plan": {**ENTRY, "wealthfolioAccountId": client.account["id"], "purchaseAccount": "brokerage"},
+        "brokerage": {"action": "exclude"},
+    })
+    return client, result
+
+
+def test_contribution_balance_ignores_a_zero_no_purchase_explains():
+    client, result = contribution_sync()
+    assert result["errors"] == []
+    assert client.snapshot["cashBalances"] == {"USD": "250.00"}
+    assert result["balances"] == 0
+    assert any("no matching purchase" in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize("amount", ["-249.99", "-500.00"])
+def test_contribution_balance_needs_a_purchase_of_that_balance(amount):
+    client, _ = contribution_sync(amount)
+    expected = {"USD": "0.00"} if amount == "-249.99" else {"USD": "250.00"}
+    assert client.snapshot["cashBalances"] == expected
+
+
+def test_contribution_balance_ignores_an_old_purchase():
+    client, _ = contribution_sync("-250.00", purchase_day=date(2026, 1, 1))
+    assert client.snapshot["cashBalances"] == {"USD": "250.00"}
+
+
 def test_partial_investment_response_retains_existing_native_state():
     client = FakeClient()
     client.account["accountType"] = "SECURITIES"
