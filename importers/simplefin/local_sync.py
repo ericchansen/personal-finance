@@ -594,7 +594,29 @@ def sync_liability(client, source, current, dry_run) -> int:
     return 1
 
 
-def sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run):
+def unexplained_zero(client, source, entry, account, day, sources):
+    """A contribution balance empties only through a purchase its purchase account reports."""
+    purchaser = entry.get("purchaseAccount")
+    if not purchaser or source.balance != 0:
+        return None
+    earlier = [row for row in client.get(f"/snapshots?accountId={account['id']}")
+               if row["source"] != "CALCULATED" and row["snapshotDate"] < day]
+    if not earlier:
+        return None
+    last = max(earlier, key=lambda row: row["snapshotDate"])
+    previous = money(last["cashTotalAccountCurrency"])
+    if previous == 0:
+        return None
+    since = date.fromisoformat(last["snapshotDate"]) - timedelta(days=7)
+    buyer = sources.get(purchaser)
+    if buyer and any(abs(abs(txn.amount) - previous) <= Decimal("0.05") and txn.posted >= since
+                     for txn in buyer.transactions):
+        return None
+    return (f"{source.name}: reported 0.00 with no matching purchase in its purchase account; "
+            f"kept the balance dated {last['snapshotDate']}")
+
+
+def sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run, sources=None):
     """Import real transactions; missing card history must not become an activity."""
     if account["accountType"] == "CREDIT_CARD" and account.get("trackingMode", "TRANSACTIONS") != "TRANSACTIONS":
         raise ValueError("credit-card sync requires native transaction tracking; existing settings and activities were retained")
@@ -660,6 +682,9 @@ def sync_cash(client, source, entry, account, rows, zone, result, positions, dry
                 )
         return expected
     if kept_newer(client, account, day, "balance", result):
+        return None
+    if reason := unexplained_zero(client, source, entry, account, day, sources or {}):
+        result["warnings"].append(reason)
         return None
     snapshot = {
         "accountId": account["id"], "snapshotDate": day,
@@ -751,6 +776,8 @@ def sync(client, sources, mapping, *, dry_run=False, check=False):
     result = {"created": 0, "updated": 0, "balances": 0, "positions": 0, "accounts": [], "warnings": [], "errors": []}
     today = datetime.now(timezone.utc).date()
     positions = {}
+    sources = list(sources)
+    by_id = {item.id: item for item in sources}
     for source in sources:
         entry = mapping.get(source.id)
         if entry is None:
@@ -785,7 +812,8 @@ def sync(client, sources, mapping, *, dry_run=False, check=False):
                     "in for the primary billing account"
                 )
             if account["accountType"] in {"CASH", "CREDIT_CARD"}:
-                expected = sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run)
+                expected = sync_cash(client, source, entry, account, rows, zone, result, positions, dry_run,
+                                     by_id)
             elif account["accountType"] == "SECURITIES":
                 expected = sync_securities(client, source, account, result, positions, dry_run, entry)
             else:
