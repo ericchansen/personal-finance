@@ -39,9 +39,8 @@ dc run --rm sync python -m importers.simplefin.local_sync
 
 The sync then runs daily at 06:00. Open <http://localhost:8088> (or the configured `WF_PORT`).
 For alerts when a sync fails or does not run, set `SYNC_PING_URL` (see the runbook).
-For repeatable, read-only reconciliation and reporting-quality checks, use the
-[financial audit](docs/runbooks/local-simplefin.md#read-only-financial-audit). Its inputs
-and detailed reports stay in the private data directory.
+To reconcile the app against the last saved SimpleFIN response without changing anything, run
+the [read-only check](docs/runbooks/local-simplefin.md#check).
 
 ## Security
 
