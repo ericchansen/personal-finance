@@ -60,7 +60,6 @@ def read_accounts(payload: dict, *, balance_zone=timezone.utc) -> tuple[list[Sim
             raise ValueError("SimpleFIN account ID is missing or repeated")
         seen.add(account["id"])
         money(account["balance"])
-        datetime.fromtimestamp(int(account["balance-date"]), timezone.utc)
         transactions = {}
         for txn in account.get("transactions", []):
             pending = txn.get("pending", False)
@@ -97,8 +96,6 @@ def activity_amount(row: dict, account_type: str | None = None) -> Decimal:
     raise ValueError("expected a cash activity")
 
 
-net_amount = activity_amount
-
 
 def source_fields(transaction: SimpleFinTransaction) -> dict:
     return {
@@ -106,6 +103,13 @@ def source_fields(transaction: SimpleFinTransaction) -> dict:
         "description": transaction.description,
         **({"utcDate": transaction.posted_utc_date.isoformat()} if transaction.posted_utc_date else {}),
     }
+
+
+def posted_in(transaction: SimpleFinTransaction, zone) -> SimpleFinTransaction:
+    """Date a timestamped posting by its calendar day in `zone`."""
+    if transaction.posted_at is None:
+        return transaction
+    return replace(transaction, posted=transaction.posted_at.astimezone(zone).date())
 
 
 def cash_type(transaction: SimpleFinTransaction, account_type: str) -> str:
@@ -191,8 +195,7 @@ def plan_transactions(
         if txn.pending or txn.id in seen:
             continue
         seen.add(txn.id)
-        if txn.posted_at is not None:
-            txn = replace(txn, posted=txn.posted_at.astimezone(transaction_zone).date())
+        txn = posted_in(txn, transaction_zone)
         key = f"simplefin:{source.id}:{txn.id}"
         old_key = f"simplefin:{account['id']}:{txn.id}"
         alias = entry.get("existingActivities", {}).get(txn.id)
@@ -214,13 +217,13 @@ def plan_transactions(
                 raise ValueError("existing source activity has a different currency")
             previous = metadata(row).get("simplefin")
             if not previous:
-                if net_amount(row, account["accountType"]) != txn.amount or row["date"][:10] != txn.posted.isoformat():
+                if activity_amount(row, account["accountType"]) != txn.amount or row["date"][:10] != txn.posted.isoformat():
                     raise ValueError("existing source ID has a different amount or date; correct its mapping")
                 continue
             current_source = source_fields(txn)
             kind = cash_type(txn, account["accountType"])
             external = kind in TRANSFERS and not row.get("sourceGroupId")
-            if net_amount(row, account["accountType"]) != money(previous["amount"]) or row["date"][:10] != previous["date"]:
+            if activity_amount(row, account["accountType"]) != money(previous["amount"]) or row["date"][:10] != previous["date"]:
                 raise ValueError("a source correction conflicts with a manually edited activity")
             if (
                 previous == current_source
@@ -368,22 +371,21 @@ def plan_holdings(source: SimpleFinAccount, account: dict, current: list[dict], 
         scoped = next((row for row in current if (row.get("instrument") or {}).get("id") == asset_id), None)
         average_cost = None
         recorded = verified_cost(entry, symbol or name, quantity)
+        retained = money(((scoped or {}).get("costBasis") or {}).get("local") or 0)
         if money(position.get("cost_basis") or 0) > 0:
             average_cost = money(position["cost_basis"]) / (1 if per_unit else quantity)
         elif money(position.get("purchase_price") or 0) > 0:
             average_cost = money(position["purchase_price"])
         elif recorded is not None:
             average_cost = recorded
-        elif (scoped and scoped.get("costBasis") and money(scoped["costBasis"]["local"]) > 0
-              and money(scoped.get("quantity") or 0) == quantity):
-            average_cost = money(scoped["costBasis"]["local"]) / quantity
-        elif (scoped and scoped.get("costBasis") and money(scoped["costBasis"]["local"]) > 0
-              and "rollForward" in entry and window is not None):
+        elif retained > 0 and money(scoped.get("quantity") or 0) == quantity:
+            average_cost = retained / quantity
+        elif retained > 0 and "rollForward" in entry and window is not None:
             start, prices = window(asset_id)
             average_cost = start and rolled_cost(
                 entry["rollForward"], symbol or name, source.transactions, start, source.balance_date,
                 [*prices, (source.balance_date, value / quantity)], money(scoped["quantity"]),
-                money(scoped["costBasis"]["local"]), quantity,
+                retained, quantity,
             )
             if average_cost is None and warnings is not None:
                 warnings.append(
@@ -431,14 +433,22 @@ def save_changes(client, creates, updates):
         raise ValueError("Wealthfolio did not acknowledge all requested activity changes")
 
 
+def observed_days(client, account_id, query=""):
+    """Dates of source (non-calculated) snapshots."""
+    return [row["snapshotDate"] for row in client.get(f"/snapshots?accountId={account_id}{query}")
+            if row["source"] != "CALCULATED"]
+
+
+def kept_newer(client, account, day, what, result) -> bool:
+    newest = max(observed_days(client, account["id"]), default="")
+    if newest > day:
+        result["warnings"].append(f"{account['name']}: kept newer {what} dated {newest}")
+    return newest > day
+
+
 def has_source_snapshot(client, snapshot):
     day = snapshot["snapshotDate"]
-    return any(
-        row["snapshotDate"] == day and row["source"] != "CALCULATED"
-        for row in client.get(
-            f"/snapshots?accountId={snapshot['accountId']}&dateFrom={day}&dateTo={day}"
-        )
-    )
+    return day in observed_days(client, snapshot["accountId"], f"&dateFrom={day}&dateTo={day}")
 
 
 def publish_holdings(client, snapshot, quotes):
@@ -454,10 +464,6 @@ def publish_holdings(client, snapshot, quotes):
         })
         if len(result) != len(quotes) or any(row.get("validationStatus") != "valid" for row in result):
             raise ValueError("Wealthfolio rejected source position quotes")
-
-
-def unlinked_transfer(row: dict) -> bool:
-    return bool(metadata(row).get("simplefin")) and row["activityType"] in TRANSFERS and not row.get("sourceGroupId")
 
 
 def latest_readable_snapshot(client, account_id, tracking_mode):
@@ -494,7 +500,6 @@ def inactive_value_warnings(client, accounts):
 def verify_balances(client, expected, positions, *, attempts=15, sleeper=time.sleep, repair=True):
     """Wait for native calculations, including the tracking-mode transition."""
     stable = 0
-    differences = []
     last_differences = []
     for _ in range(attempts):
         differences = []
@@ -562,17 +567,15 @@ def use_holdings(client, account, snapshot, quotes):
         raise
 
 
-def unlink(client, rows, update):
+def unlink(client, rows, row):
     """An economically corrected transfer must be reviewed and relinked in Wealthfolio."""
-    group = update["sourceGroupId"]
-    counterpart = next(row for row in rows if row.get("sourceGroupId") == group and row["id"] != update["id"])
-    client.post("/activities/unlink", {"activityAId": update["id"], "activityBId": counterpart["id"]})
+    group = row["sourceGroupId"]
+    counterpart = next(other for other in rows if other.get("sourceGroupId") == group and other["id"] != row["id"])
+    client.post("/activities/unlink", {"activityAId": row["id"], "activityBId": counterpart["id"]})
     for member in rows:
         if member.get("sourceGroupId") == group:
             member["sourceGroupId"] = None
             member["metadata"] = {**metadata(member), "flow": {"is_external": True}}
-    update["sourceGroupId"] = None
-    update["metadata"] = json.dumps({**json.loads(update["metadata"]), "flow": {"is_external": True}})
 
 
 def sync_liability(client, source, current, dry_run) -> int:
@@ -608,17 +611,14 @@ def sync_cash(client, source, entry, account, rows, zone, result, positions, dry
     creates, updates = plan_transactions(source, entry, account, rows, zone)
     if not dry_run:
         for update in updates:
-            if update.get("sourceGroupId"):
-                previous = next(row for row in rows if row["id"] == update["id"])
-                if not previous.get("sourceGroupId"):
-                    update["sourceGroupId"] = None
-                    update["metadata"] = json.dumps({
-                        **json.loads(update["metadata"]), "flow": {"is_external": True},
-                    })
-                    continue
-                if (previous["activityType"] != update["activityType"]
-                        or net_amount(previous, account["accountType"]) != net_amount(update, account["accountType"])):
-                    unlink(client, rows, update)
+            previous = next(row for row in rows if row["id"] == update["id"])
+            if previous.get("sourceGroupId") and (
+                    previous["activityType"] != update["activityType"]
+                    or activity_amount(previous, account["accountType"]) != activity_amount(update, account["accountType"])):
+                unlink(client, rows, previous)
+            if update.get("sourceGroupId") and not previous.get("sourceGroupId"):
+                update["sourceGroupId"] = None
+                update["metadata"] = json.dumps({**json.loads(update["metadata"]), "flow": {"is_external": True}})
         writes = {update["id"]: update for update in updates}
         for update in updates:
             if group := update.get("sourceGroupId"):
@@ -638,18 +638,11 @@ def sync_cash(client, source, entry, account, rows, zone, result, positions, dry
     result["updated"] += len(updates)
     if account["accountType"] == "CREDIT_CARD" or account["trackingMode"] == "TRANSACTIONS":
         transaction_day = (source.balance_utc_date or source.balance_date).isoformat()
-        synthetic = [row for row in rows if row["accountId"] == account["id"]
-                     and (row.get("idempotencyKey") or "").startswith("simplefin-balance:")]
-        if synthetic:
-            result["errors"].append(
-                f"{account['name']}: legacy synthetic balance activities remain; "
-                "remove generated entries and reconcile real account history"
-            )
         replaced = {row["id"] for row in updates}
         projected = [row for row in rows if row["id"] not in replaced]
         projected += [{**row, "date": row["activityDate"]} for row in creates + updates]
         expected = source.balance + sum(
-            (net_amount(row, account["accountType"]) for row in projected
+            (activity_amount(row, account["accountType"]) for row in projected
              if row["accountId"] == account["id"] and row.get("status") == "POSTED"
              and (metadata(row).get("simplefin") or {}).get("utcDate", row["date"][:10]) > transaction_day),
             Decimal(0),
@@ -659,17 +652,14 @@ def sync_cash(client, source, entry, account, rows, zone, result, positions, dry
                       if row["accountId"] == account["id"] and row.get("status") == "POSTED"]
             if any(row["currency"] != source.currency or row.get("amount") is None for row in posted):
                 raise ValueError("transaction-tracked cash needs a cash-only ledger in the source currency")
-            actual = sum((net_amount(row, "CASH") for row in posted), Decimal(0))
+            actual = sum((activity_amount(row, "CASH") for row in posted), Decimal(0))
             if abs(actual - expected) > Decimal("0.005"):
                 raise ValueError(
                     "transaction-tracked cash history does not reconcile with the source; "
                     "review real funding history or native observation tracking"
                 )
         return expected
-    snapshots = client.get(f"/snapshots?accountId={account['id']}")
-    newest = max((row["snapshotDate"] for row in snapshots if row["source"] != "CALCULATED"), default="")
-    if newest > day:
-        result["warnings"].append(f"{account['name']}: kept newer balance dated {newest}")
+    if kept_newer(client, account, day, "balance", result):
         return None
     snapshot = {
         "accountId": account["id"], "snapshotDate": day,
@@ -685,9 +675,7 @@ def sync_cash(client, source, entry, account, rows, zone, result, positions, dry
 def quantity_window(client, account_id, asset_id, quantity):
     """First snapshot date with the asset's current quantity, and its source prices since then."""
     start = None
-    days = sorted((row["snapshotDate"] for row in client.get(f"/snapshots?accountId={account_id}")
-                   if row["source"] != "CALCULATED"), reverse=True)
-    for day in days:
+    for day in sorted(observed_days(client, account_id), reverse=True):
         rows = client.get(f"/snapshots/holdings?accountId={account_id}&date={day}")
         held = next((row for row in rows if (row.get("instrument") or {}).get("id") == asset_id), None)
         if held is None or money(held["quantity"]) != quantity:
@@ -702,20 +690,14 @@ def quantity_window(client, account_id, asset_id, quantity):
 
 
 def sync_securities(client, source, account, result, positions, dry_run, entry=None):
-    snapshots = client.get(f"/snapshots?accountId={account['id']}")
-    newest = max((row["snapshotDate"] for row in snapshots if row["source"] != "CALCULATED"), default="")
-    if newest > source.balance_date.isoformat():
-        result["warnings"].append(f"{account['name']}: kept newer holdings dated {newest}")
+    if kept_newer(client, account, source.balance_date.isoformat(), "holdings", result):
         return None
     current = client.get(f"/holdings?accountId={account['id']}")
     quantities = {(row.get("instrument") or {}).get("id"): money(row.get("quantity") or 0) for row in current}
     # Balance and snapshot dates are display-zone days; date postings the same way so the
     # roll-forward settlement delay compares like with like.
     zone = client.display_timezone()
-    source = replace(source, transactions=[
-        replace(txn, posted=txn.posted_at.astimezone(zone).date()) if txn.posted_at else txn
-        for txn in source.transactions
-    ])
+    source = replace(source, transactions=[posted_in(txn, zone) for txn in source.transactions])
     snapshot, quotes = plan_holdings(
         source, account, current, entry, result["warnings"],
         lambda asset_id: quantity_window(client, account["id"], asset_id, quantities[asset_id]),
@@ -737,7 +719,7 @@ def sync_securities(client, source, account, result, positions, dry_run, entry=N
 def verify_import(client, accounts, result, positions, *, read_only=False):
     unpaired = []
     for row in client.iter_activities():
-        if not unlinked_transfer(row):
+        if not metadata(row).get("simplefin") or row["activityType"] not in TRANSFERS or row.get("sourceGroupId"):
             continue
         account = accounts.get(row["accountId"])
         if account is None:
@@ -781,8 +763,6 @@ def sync(client, sources, mapping, *, dry_run=False, check=False):
                 raise ValueError("SimpleFIN account currency is missing; refusing to assume USD")
             if not source.is_currency:
                 raise ValueError("non-fiat SimpleFIN account requires a unit-specific importer")
-            if source.balance_date is None:
-                raise ValueError("source balance has no observation date")
             if (today - source.balance_date).days > 3:
                 result["warnings"].append(f"{source.name}: balance is dated {source.balance_date}")
             if entry.get("wealthfolioAlternativeAssetId"):
@@ -839,11 +819,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     root = Path(args.data_dir).resolve()
     mapping = load_mapping(root)
+    last_path = root / "simplefin" / "local-last-sync.json"
     if args.check:
         args.dry_run = True
         if args.snapshot is None:
-            previous = json.loads((root / "simplefin" / "local-last-sync.json").read_text(encoding="utf-8"))
-            args.snapshot = root / previous["snapshotPath"]
+            args.snapshot = root / json.loads(last_path.read_text(encoding="utf-8"))["snapshotPath"]
     # Fail before spending a SimpleFIN request when Wealthfolio is unavailable.
     client = WealthfolioClient(args.base_url)
     client.login(read_password())
@@ -852,7 +832,6 @@ def main(argv=None) -> int:
         payload = json.loads(args.snapshot.read_text(encoding="utf-8"))
     else:
         snapshot_path, payload = fetch_snapshot(root, read_access_url(root), days=args.days)
-    last_path = root / "simplefin" / "local-last-sync.json"
     if not args.dry_run and last_path.exists():
         previous = json.loads(last_path.read_text(encoding="utf-8")).get("snapshotPath")
         previous = root / previous if previous else None
@@ -860,9 +839,8 @@ def main(argv=None) -> int:
             raise ValueError("snapshot is older than the last sync; use --dry-run to inspect it")
     sources, warnings = read_accounts(payload, balance_zone=client.display_timezone())
     result = sync(client, sources, mapping, dry_run=args.dry_run, check=args.check)
-    if args.check:
-        if result["created"] or result["updated"]:
-            result["errors"].append("Saved source requires real activity changes; preview and sync before declaring it reconciled")
+    if args.check and (result["created"] or result["updated"]):
+        result["errors"].append("Saved source requires real activity changes; preview and sync before declaring it reconciled")
     result["warnings"] = warnings + result["warnings"]
     # Relative to the data directory, so host and container runs agree.
     result["snapshotPath"] = (

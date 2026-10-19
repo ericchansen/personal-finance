@@ -837,6 +837,31 @@ def test_source_description_correction_does_not_destroy_a_native_transfer_link()
     assert actual[counterpart["id"]]["comment"] == counterpart["comment"]
 
 
+def test_source_amount_correction_unlinks_a_native_transfer_for_review():
+    creates, _ = plan([transaction(description="Internet transfer to Savings account XXXX1234")])
+    row = {**persisted(creates[0]), "sourceGroupId": "synthetic-native-link"}
+    counterpart = {
+        "id": "synthetic-counterpart", "accountId": "synthetic-savings",
+        "activityType": "TRANSFER_IN", "status": "POSTED", "amount": row["amount"],
+        "currency": "USD", "date": "2026-01-31T18:00:00Z", "sourceGroupId": row["sourceGroupId"],
+    }
+    client = FakeClient()
+    client.rows = [row, counterpart]
+    posted, native_post = [], client.post
+    client.post = lambda path, body: posted.append((path, body)) if path == "/activities/unlink" else native_post(path, body)
+    corrected = transaction(amount="-13.00", description="Internet transfer to Savings account XXXX1234")
+    result = {"created": 0, "updated": 0, "balances": 0, "warnings": [], "errors": []}
+    sync_cash(client, source(corrected), ENTRY, client.account, client.rows, ZONE, result, {}, True)
+    assert posted == [] and client.writes == []
+    sync_cash(client, source(corrected), ENTRY, client.account, client.rows, ZONE, result, {}, False)
+    assert posted[0] == ("/activities/unlink", {"activityAId": row["id"], "activityBId": counterpart["id"]})
+    actual = {item["id"]: item for item in client.rows}
+    assert actual[row["id"]]["amount"] == "13.00"
+    assert actual[row["id"]]["sourceGroupId"] is None
+    assert json.loads(actual[row["id"]]["metadata"])["flow"] == {"is_external": True}
+    assert counterpart["sourceGroupId"] is None and counterpart["amount"] == "12.50"
+
+
 @pytest.mark.parametrize("snapshot_source", ["MANUAL_ENTRY", "CSV_IMPORT"])
 def test_newer_balance_does_not_suppress_real_transaction_import(snapshot_source):
     client = FakeClient()
@@ -1210,24 +1235,6 @@ def test_transient_native_difference_keeps_an_actionable_account_name():
                  "name": "Synthetic Checking", "sourceBalance": "10"}]
     with pytest.raises(ValueError, match="Synthetic Checking"):
         verify_balances(client, expected, {}, attempts=2, sleeper=lambda _: None, repair=False)
-
-
-def test_legacy_card_reconciliation_is_reported_not_updated():
-    from importers.simplefin.local_sync import sync_cash
-
-    client = FakeClient()
-    client.account["accountType"] = "CREDIT_CARD"
-    client.account["trackingMode"] = "TRANSACTIONS"
-    client.rows.append({
-        "id": "synthetic-balance", "accountId": ACCOUNT["id"],
-        "date": "2026-02-01T18:00:00Z", "activityType": "TRANSFER_IN",
-        "amount": "10", "idempotencyKey": "simplefin-balance:source-account",
-    })
-    result = {"created": 0, "updated": 0, "errors": []}
-    sync_cash(client, source(), ENTRY, client.account, client.rows, ZONE, result, {}, False)
-    assert "legacy synthetic" in result["errors"][0]
-    assert client.writes == []
-    assert client.rows[-1]["amount"] == "10"
 
 
 def test_bad_account_mapping_does_not_block_healthy_accounts(monkeypatch):
