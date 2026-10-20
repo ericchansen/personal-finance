@@ -333,3 +333,11 @@ def test_canvas_server_refuses_foreign_hosts_and_form_posts(world):
         assert status("/api/undo", b"{}", {"Content-Type": "application/json"}) == 200
     finally:
         server.shutdown()
+
+def test_deferred_merchants_wait_at_the_end_of_the_queue(world):
+    fake, ws = world
+    fake.add("shared-kiosk", "shared", "TINY KIOSK", amount=1)
+    ws.refresh()
+    assert [g["key"] for g in ws.queue()] == ["HARDWARE STORE", "TINY KIOSK"]
+    ws.config["deferMerchants"] = ["^HARDWARE\\b"]
+    assert [g["key"] for g in ws.queue()] == ["TINY KIOSK", "HARDWARE STORE"]
