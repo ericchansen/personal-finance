@@ -93,6 +93,9 @@ class WealthfolioClient:
     def put(self, path: str, payload: Any) -> Any:
         return self._request("PUT", path, payload)
 
+    def delete(self, path: str) -> Any:
+        return self._request("DELETE", path)
+
     def login(self, password: str) -> None:
         self.post("/auth/login", {"password": password})
         if not any(c.name == "wf_session" for c in self._jar):

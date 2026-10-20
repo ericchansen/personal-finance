@@ -3,5 +3,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY importers/ importers/
+COPY labeling/ labeling/
 ENV PYTHONUNBUFFERED=1 FINANCE_DATA=/finance
 CMD ["python", "-m", "importers.simplefin.schedule"]

@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spender labeler</title>
+<style>
+  body { margin: 0; padding: 16px 20px; background: var(--background-color-default, #fff); color: var(--text-color-default, #1f2328);
+         font-family: var(--font-sans, system-ui, sans-serif); font-size: var(--text-body-medium, 14px); line-height: var(--leading-body-medium, 20px); }
+  .muted { color: var(--text-color-muted, #656d76); }
+  header { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  nav button { background: none; border: 0; padding: 4px 8px; color: inherit; font: inherit; cursor: pointer; border-bottom: 2px solid transparent; }
+  nav button.on { border-color: var(--true-color-blue, #0969da); font-weight: var(--font-weight-semibold, 600); }
+  .bar { height: 4px; background: var(--border-color-default, #d0d7de); border-radius: 2px; margin: 8px 0 12px; }
+  .bar div { height: 100%; background: var(--true-color-green, #1a7f37); border-radius: 2px; }
+  .notice { padding: 6px 10px; border-radius: 6px; background: var(--true-color-yellow-muted, #fff8c5); margin-bottom: 8px; }
+  .notice:empty { display: none; }
+  h1 { font-size: var(--text-title-large, 24px); line-height: 1.2; margin: 0; }
+  .guess { display: inline-flex; gap: 8px; align-items: center; padding: 4px 10px; border-radius: 999px; background: var(--true-color-blue-muted, #ddf4ff); }
+  .reasons { margin: 4px 0 0; padding-left: 18px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-color-default, #d0d7de); white-space: nowrap; }
+  td.desc { white-space: normal; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.cur { outline: 2px solid var(--color-focus-outline, #0969da); outline-offset: -2px; }
+  .pill { padding: 1px 6px; border-radius: 4px; background: var(--border-color-default, #eaeef2); font-size: 12px; }
+  kbd { font-family: var(--font-mono, monospace); border: 1px solid var(--border-color-default, #d0d7de); border-radius: 4px; padding: 0 4px; }
+  footer { position: sticky; bottom: 0; margin-top: 16px; padding: 8px 0; display: flex; gap: 14px; flex-wrap: wrap;
+           background: var(--background-color-default, #fff); border-top: 1px solid var(--border-color-default, #d0d7de); }
+  input, select { font: inherit; padding: 4px 6px; color: inherit; background: inherit; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 6px; }
+  #picker { position: fixed; inset: 10% 20%; background: var(--background-color-default, #fff); border: 1px solid var(--border-color-default, #d0d7de);
+            border-radius: 8px; padding: 12px; overflow: auto; box-shadow: 0 8px 24px rgba(0,0,0,.2); }
+  #picker li.cur { background: var(--true-color-blue-muted, #ddf4ff); }
+  #picker ul { list-style: none; padding: 0; margin: 8px 0 0; }
+  #picker li { padding: 2px 6px; cursor: pointer; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <nav><button data-mode="queue">Queue</button><button data-mode="check">Check set</button><button data-mode="audit">Audit</button></nav>
+  <span id="counts" class="muted"></span>
+</header>
+<div class="bar"><div id="progress" style="width:0"></div></div>
+<div id="notice" class="notice"></div>
+<main id="main"></main>
+<div id="audit" class="hidden">
+  <select id="a-source">
+    <option value="model">model</option><option value="unlabeled">unlabeled (guess)</option><option value="">any source</option>
+    <option value="user">user</option><option value="merchant">merchant</option><option value="wealthfolio-ui">wealthfolio-ui</option>
+    <option value="account">account</option><option value="cardmember">cardmember</option>
+  </select>
+  confidence <input id="a-min" size="4" value="0"> to <input id="a-max" size="4" value="0.95">
+  <input id="a-q" placeholder="search description or account">
+  <span class="muted">Up and Down select a row, spender keys relabel it, H shows its history.</span>
+  <table id="a-table"></table>
+  <pre id="a-history" class="muted"></pre>
+</div>
+<input id="note" class="hidden" placeholder="One-line note for the next label; Enter to keep" size="60">
+<div id="picker" class="hidden"><input id="p-q" size="40"> <span id="p-hint" class="muted"></span><ul id="p-list"></ul></div>
+<footer class="muted" id="keys"></footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const money = (n) => n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+let config, mode = "queue", card = null, cur = 0, skip = [], note = "", categories = [], picker = null, audit = [], auditCur = 0;
+
+async function api(path, body) {
+  const res = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+function flash(text) { $("notice").textContent = text; }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+function spenderKeys() { return Object.entries(config.spenders).map(([k, v]) => `<kbd>${k.toUpperCase()}</kbd> ${esc(v)}`).join(" "); }
+
+function legend() {
+  const common = `${spenderKeys()} <span><kbd>Shift</kbd>+key labels the whole merchant, past and future</span>`;
+  $("keys").innerHTML = mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
+    : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> need/want category</span>
+       <span><kbd>'</kbd> note</span> <span><kbd>S</kbd> skip</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span>`;
+}
+
+async function load() {
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+  $("audit").classList.toggle("hidden", mode !== "audit");
+  $("main").classList.toggle("hidden", mode === "audit");
+  legend();
+  if (mode === "audit") return loadAudit();
+  const data = await api(`/api/card?mode=${mode}&skip=${encodeURIComponent(skip.join("\n"))}`);
+  const c = data.counts;
+  $("counts").textContent = `${c.rows.toLocaleString()} rows (${money(c.amount)}) left in ${c.groups.toLocaleString()} ${mode === "check" ? "check rows" : "merchants"} · ${c.session} labeled this session · model ${config.model}`;
+  $("progress").style.width = `${Math.round(100 * (1 - c.rows / Math.max(c.total, 1)))}%`;
+  if (c.notice && !$("notice").textContent) flash(c.notice);
+  card = data.card; cur = 0;
+  render();
+}
+
+function render() {
+  if (!card) { $("main").innerHTML = `<h1>Nothing left to label here.</h1>`; return; }
+  const row = card.rows[cur], g = row.guess;
+  const title = card.merchant || row.notes || `(no description) ${row.type.toLowerCase()}`;
+  $("main").innerHTML = `
+    <h1>${esc(title)}</h1>
+    <div class="muted">${card.rows.length + card.more} unlabeled row(s), ${money(card.total)}${card.labeledElsewhere ? `, ${card.labeledElsewhere} more from this merchant already labeled` : ""}</div>
+    <p>${card.blind ? `<span class="pill">blind check: no guess shown</span>`
+      : `<span class="guess">Guess <b>${esc(g.value)}</b> ${(g.confidence * 100).toFixed(0)}%</span>
+         <ul class="reasons muted">${g.reasons.map((r) => `<li>${esc(r)}</li>`).join("") || "<li>no informative features yet</li>"}</ul>`}</p>
+    ${note ? `<p>Note: <i>${esc(note)}</i></p>` : ""}
+    <table><tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Category</th><th>Need/Want</th></tr>
+    ${card.rows.map((r, i) => `<tr class="${i === cur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td>
+      <td class="desc">${esc(r.notes)}</td><td>${esc(r.category) || '<span class="muted">none</span>'}</td><td>${esc(r.needWant) || ""}</td></tr>`).join("")}
+    </table>${card.more ? `<p class="muted">and ${card.more} more</p>` : ""}`;
+}
+
+async function act(path, body) {
+  try { await api(path, body); flash(""); } catch (e) { flash(e.message); return; }
+  note = "";
+  await load();
+}
+
+function label(value, whole) {
+  const row = card.rows[cur];
+  if (whole && card.merchant && !card.blind) return act("/api/label", { value, merchant: card.merchant, note });
+  return act("/api/label", { value, ids: [row.id], note, check: card.blind });
+}
+
+async function openPicker(filter, whole) {
+  if (!categories.length) categories = await api("/api/categories");
+  picker = { filter, whole, cur: 0 };
+  $("picker").classList.remove("hidden");
+  $("p-hint").textContent = `${filter ? filter + " categories" : "all categories"}${whole && card.merchant ? `: native rule for ${card.merchant}` : ": this row"}`;
+  $("p-q").value = ""; $("p-q").focus(); listPicker();
+}
+function pickerItems() {
+  const q = $("p-q").value.toLowerCase();
+  return categories.filter((c) => (!picker.filter || c.needWant === picker.filter) && `${c.parent} ${c.name}`.toLowerCase().includes(q));
+}
+function listPicker() {
+  const items = pickerItems();
+  picker.cur = Math.min(picker.cur, Math.max(items.length - 1, 0));
+  $("p-list").innerHTML = items.map((c, i) => `<li class="${i === picker.cur ? "cur" : ""}">${esc(c.parent ? c.parent + " › " : "")}${esc(c.name)} <span class="muted">${esc(c.needWant || "")}</span></li>`).join("");
+}
+function closePicker() { picker = null; $("picker").classList.add("hidden"); }
+$("p-q").addEventListener("input", listPicker);
+$("p-q").addEventListener("keydown", (e) => {
+  const items = pickerItems();
+  if (e.key === "Escape") closePicker();
+  else if (e.key === "ArrowDown") picker.cur = Math.min(picker.cur + 1, items.length - 1);
+  else if (e.key === "ArrowUp") picker.cur = Math.max(picker.cur - 1, 0);
+  else if (e.key === "Enter" && items[picker.cur]) {
+    const body = picker.whole && card.merchant ? { categoryId: items[picker.cur].id, merchant: card.merchant } : { categoryId: items[picker.cur].id, ids: [card.rows[cur].id] };
+    closePicker(); act("/api/category", body); return;
+  } else return;
+  e.preventDefault(); listPicker();
+});
+
+$("note").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === "Escape") { note = e.key === "Enter" ? $("note").value.trim() : note; $("note").classList.add("hidden"); render(); e.preventDefault(); }
+});
+
+async function loadAudit() {
+  const q = new URLSearchParams({ source: $("a-source").value, min: $("a-min").value, max: $("a-max").value, q: $("a-q").value });
+  audit = await api(`/api/audit?${q}`); auditCur = 0; renderAudit();
+  $("counts").textContent = `${audit.length} row(s) shown, lowest confidence first (max 300)`;
+}
+function renderAudit() {
+  $("a-table").innerHTML = `<tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Spender</th><th>Source</th><th class="num">Conf.</th><th>Reasons</th></tr>` +
+    audit.map((r, i) => {
+      const value = r.spender ?? (r.guess ? `${r.guess.value}?` : ""), conf = r.confidence ?? r.guess?.confidence;
+      const why = (r.reasons.length ? r.reasons : r.guess?.reasons || []).join("; ");
+      return `<tr class="${i === auditCur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td><td class="desc">${esc(r.notes)}</td>
+        <td>${esc(value)}</td><td>${esc(r.source || "")}</td><td class="num">${conf == null ? "" : (conf * 100).toFixed(0) + "%"}</td><td class="desc muted">${esc(why)}${r.note ? ` · note: ${esc(r.note)}` : ""}</td></tr>`;
+    }).join("");
+}
+["a-source", "a-min", "a-max", "a-q"].forEach((id) => $(id).addEventListener("change", loadAudit));
+
+document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => { mode = b.dataset.mode; skip = []; load(); }));
+
+document.addEventListener("keydown", async (e) => {
+  if (picker || e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const key = e.key.toLowerCase(), spender = config.spenders[key];
+  if (mode === "audit") {
+    const row = audit[auditCur];
+    if (e.key === "ArrowDown") auditCur = Math.min(auditCur + 1, audit.length - 1);
+    else if (e.key === "ArrowUp") auditCur = Math.max(auditCur - 1, 0);
+    else if (spender && row) { try { await api("/api/label", { value: spender, ids: [row.id] }); } catch (err) { return flash(err.message); } return loadAudit(); }
+    else if (key === "h" && row) { $("a-history").textContent = JSON.stringify(await api(`/api/history?id=${row.id}`), null, 1); return; }
+    else return;
+    e.preventDefault(); return renderAudit();
+  }
+  if (!card) return;
+  if (spender) label(spender, e.shiftKey);
+  else if (e.key === "Enter" && !card.blind) label(card.rows[cur].guess.value, e.shiftKey);
+  else if (key === "c") openPicker(null, e.shiftKey);
+  else if (key === "n") openPicker("Need", e.shiftKey);
+  else if (key === "w") openPicker("Want", e.shiftKey);
+  else if (key === "s") { skip.push(card.key); load(); }
+  else if (key === "u") act("/api/undo", {});
+  else if (e.key === "'") { $("note").classList.remove("hidden"); $("note").value = note; $("note").focus(); }
+  else if (e.key === "ArrowDown") { cur = Math.min(cur + 1, card.rows.length - 1); render(); }
+  else if (e.key === "ArrowUp") { cur = Math.max(cur - 1, 0); render(); }
+  else return;
+  e.preventDefault();
+});
+
+(async () => { config = await api("/api/config"); load(); })().catch((e) => flash(e.message));
+</script>
+</body>
+</html>

@@ -135,3 +135,20 @@ def test_unreachable_wealthfolio_restarts_before_any_request(monkeypatch, tmp_pa
     with pytest.raises(SystemExit):
         schedule.poll(tmp_path, at(10, 6, 5), SIX, None)
     assert calls == []
+
+
+def test_labels_new_rows_only_after_a_sync_that_did_not_crash(monkeypatch, tmp_path, calls):
+    labeled = []
+    monkeypatch.setattr(schedule, "label", labeled.append)
+    last_sync(tmp_path, at(9, 7))
+    fake_run(monkeypatch, calls, 1)
+    schedule.poll(tmp_path, at(10, 6, 5), SIX, None)
+    assert labeled == []
+    fake_run(monkeypatch, calls, 0, lambda: last_sync(tmp_path, at(10, 7, 10)))
+    schedule.poll(tmp_path, at(10, 7, 10), SIX, None)
+    assert labeled == [tmp_path]
+
+
+def test_labeling_does_nothing_until_configured(tmp_path, capsys):
+    schedule.label(tmp_path)
+    assert "not configured" in capsys.readouterr().err

@@ -948,3 +948,44 @@ def test_native_card_tracking_rejects_observations_without_changing_ledger(wealt
     assert error.value.status == 400
     assert next(row for row in client.list_accounts() if row["id"] == account["id"]) == before
     assert [row for row in client.iter_activities() if row["accountId"] == account["id"]] == activities
+
+
+def test_spender_labels_use_native_events_rules_and_backups(wealthfolio, tmp_path):
+    from labeling.__main__ import setup
+    from labeling.workspace import Workspace
+
+    _, client = wealthfolio
+    account = client.post("/accounts", {
+        "name": "Synthetic Shared Card", "accountType": "CREDIT_CARD", "currency": "USD",
+        "isActive": True, "isDefault": False, "trackingMode": "TRANSACTIONS",
+    })
+    day = datetime.now(timezone.utc).replace(hour=18) - timedelta(days=2)
+    saved = client.save_activities(creates=[{
+        "accountId": account["id"], "activityType": "WITHDRAWAL", "amount": amount, "currency": "USD",
+        "activityDate": day.isoformat(), "comment": notes,
+    } for amount, notes in (("12", "SQ *BLUE KETTLE COFFEE SPRINGFIELD ZZ"), ("30", "HARDWARE STORE 0412"))])
+    assert not saved["errors"]
+    coffee, hardware = (row["id"] for row in saved["created"])
+    client.put("/spending/settings", {"enabled": True, "accountIds": [account["id"]]})
+    (tmp_path / "labels").mkdir()
+    (tmp_path / "labels" / "config.json").write_text(json.dumps({
+        "spenders": {"a": "Ann", "b": "Ben", "j": "Joint"}, "needWant": {"wants": "Want"},
+    }), encoding="utf-8")
+    ws = Workspace(tmp_path, client, by="integration")
+    setup(ws)
+    events = {e["name"]: e for e in client.get("/spending/events")}
+    assert events["Joint"]["endDate"].startswith("2099-12-31")
+    ws.label("Joint", merchant="HARDWARE STORE")
+    ws.label("Ann", ids=[coffee])
+    rows = {r["id"]: r for r in client.post("/spending/cash-activities/search", {"limit": 100, "offset": 0})["items"]}
+    assert rows[hardware]["eventId"] == events["Joint"]["id"] and rows[coffee]["eventId"] == events["Ann"]["id"]
+    filtered = client.post("/spending/cash-activities/search", {"limit": 100, "offset": 0, "eventIds": [events["Joint"]["id"]]})
+    assert [r["id"] for r in filtered["items"]] == [hardware]
+    dining = next(i for i, c in ws.categories.items() if c.get("parentId") == "cat_food")
+    assert ws.categorize(dining, merchant="BLUE KETTLE")["categorized"] == 1
+    assert ws.need_want(ws.rows[coffee]) == "Want"
+    ws.undo()
+    assert not [a for a in client.get(f"/spending/activities/{coffee}/assignments") if a["taxonomyId"] == "spending_categories"]
+    assert client.get("/spending/rules") == [] or all("BLUE" not in r["pattern"] for r in client.get("/spending/rules"))
+    client.post("/utilities/database/backup", {})
+    assert client.get("/utilities/database/backups")
