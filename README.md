@@ -20,10 +20,8 @@ force a balance. Wealthfolio's own rules categorize new activity. Every secret a
 in one private directory, so the stack is reproducible from a checkout plus that directory. See
 the [runbook](docs/runbooks/local-simplefin.md).
 
-After each sync, `labeling` tags whose spending each row is (a native Wealthfolio spending
-event) and keeps an auditable private record of why. Need or want comes from each category's
-budget group. A keyboard-first labeler canvas and a small standard-library classifier fill the
-gaps. See the [labeling runbook](docs/runbooks/labeling.md).
+After each sync, `labeling` tags whose spending each row is; see the
+[labeling runbook](docs/runbooks/labeling.md).
 
 ## Quick start
 
@@ -72,8 +70,8 @@ Financial data is sensitive and this repository is public, so the boundary is st
 compose.yml, Dockerfile  Wealthfolio plus the sync container
 deploy/init-env.ps1      Creates the private compose.env
 importers/simplefin/     SimpleFIN client, setup CLI, local sync, and daily scheduler
-labeling/                Spender (whose spending) and need/want labels, classifier, labeler
-.github/extensions/      Spending labeler canvas for the Copilot app
+labeling/                Spender labels and the labeler canvas backend
+.github/extensions/      Spending labeler canvas
 docs/runbooks/           Sync and labeling runbooks
 .githooks/               Pre-commit data guard
 ```

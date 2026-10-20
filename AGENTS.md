@@ -31,8 +31,8 @@ over new code here.
 compose.yml, Dockerfile  Wealthfolio plus the sync container
 deploy/init-env.ps1      Creates the private compose.env
 importers/simplefin/     SimpleFIN client, setup CLI, local sync, and daily scheduler
-labeling/                Spender and need/want labels, classifier, labeler backend
-.github/extensions/      Spending labeler canvas (starts `python -m labeling serve`)
+labeling/                Spender labels and the labeler canvas backend
+.github/extensions/      Spending labeler canvas
 docs/runbooks/           Sync and labeling runbooks (PII-free)
 ```
 
@@ -53,7 +53,7 @@ outside this checkout. Layout:
 <data>/simplefin/local-last-sync.json  Result of the last real sync
 <data>/simplefin/local-preview.json    Result of the last --dry-run
 <data>/raw/simplefin/<date>/           Immutable SimpleFIN responses, replayable with --snapshot
-<data>/labels/                         Labeling config, append-only ledger, model, evaluations
+<data>/labels/                         Labeling config and append-only ledger
 <data>/wealthfolio/                    Wealthfolio SQLite volume and its backups
 ```
 
@@ -67,9 +67,7 @@ outside this checkout. Layout:
   balance. Report the mismatch instead.
 - **Active vs. closed accounts.** Inactive or excluded accounts are skipped and must not
   distort net worth or cash flow.
-- **Labels never edit activities.** The spender is a native spending event and need/want is the
-  category's budget group; provenance goes to the private ledger. An edit made in Wealthfolio's
-  UI wins over the labeler and the model.
+- **Labels never edit activities.** Spender labels are native events; Wealthfolio UI edits win.
 
 ## Account names and private decisions
 
