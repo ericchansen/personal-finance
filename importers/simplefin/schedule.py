@@ -83,6 +83,16 @@ def run_once(data_dir: Path, extra: list[str]) -> int:
         return 1
 
 
+def label(data_dir: Path) -> None:
+    """Label the new spending rows; does nothing until labeling is configured."""
+    from labeling.__main__ import main as labeling
+
+    try:
+        labeling(["apply", "--data-dir", str(data_dir), "--base-url", BASE_URL])
+    except Exception as exc:  # noqa: BLE001 - labels must never stop the scheduler
+        print(f"labeling failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def poll(data_dir: Path, now: datetime, at: time, url: str | None) -> None:
     last = mtime(data_dir / "simplefin" / "local-last-sync.json", now.tzinfo)
     crash_marker = data_dir / "simplefin" / "local-sync-crashed"
@@ -107,6 +117,7 @@ def poll(data_dir: Path, now: datetime, at: time, url: str | None) -> None:
         os.utime(crash_marker, (now.timestamp(), now.timestamp()))
     else:
         crash_marker.unlink(missing_ok=True)
+        label(data_dir)
     ping(url, code)
 
 

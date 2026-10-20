@@ -28,6 +28,8 @@ function dc { docker compose --env-file "<your-finance-data>/compose.env" @args 
   transaction-tracked; loans update their liability valuation. The run then waits for
   Wealthfolio's values to match the source. A mismatch is an
   error, never an adjustment: the sync does not invent income, spending, trades, or cash.
+- **Labels.** After a run that did not crash, `labeling apply` tags new spending rows with their
+  spender; see the [labeling runbook](labeling.md). It does nothing until it is configured.
 - **Health.** Docker marks `wealthfolio-sync` unhealthy when the last sync is more than 26 hours
   old or reported errors. For an alert that also fires when the host is off, set
   `SYNC_PING_URL` in `compose.env` to a [healthchecks.io](https://healthchecks.io) check with a
