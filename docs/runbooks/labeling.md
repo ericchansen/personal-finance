@@ -23,8 +23,9 @@ after a native backup.
 
 ## Private files (`<data>/labels/`)
 
-`config.json` (spenders and keys, threshold, account defaults, cardmember files, check
-accounts), `ledger.jsonl` (append-only reasons and history), `applied.json`, `model.json`,
+`config.json` (spenders and keys, threshold, account defaults, cardmember files,
+check accounts, `deferMerchants` regexes that move merchants to the end of the queue),
+`ledger.jsonl` (append-only reasons and history), `applied.json`, `model.json`,
 and `eval-<version>.json`. `python -m labeling status` summarizes them.
 
 ## Threshold

@@ -405,7 +405,9 @@ class Workspace:
             group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0})
             group["ids"].append(row_id)
             group["value"] += (1 - self.guess[row_id]["confidence"]) * abs(float(row.get("amount") or 0))
-        return sorted(groups.values(), key=lambda g: -g["value"])
+        defer = [re.compile(p) for p in self.config.get("deferMerchants", [])]
+        later = lambda key: any(p.search(key) for p in defer)
+        return sorted(groups.values(), key=lambda g: (later(g["key"]), -g["value"]))
 
     def view(self, row_id: str, *, blind: bool = False) -> dict:
         row = self.rows[row_id]
