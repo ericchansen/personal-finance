@@ -215,7 +215,7 @@ class Workspace:
         found = [e for e in self.ledger.candidates(FIELD, row_id, self.merchant[row_id])
                  if e["source"] != "model" and not (training and e.get("check"))]
         found += [x for x in (self.account_default(row_id), self.cardmember.get(row_id)) if x]
-        if not training and row_id in self.guess and self.guess[row_id]["confidence"] >= self.threshold:
+        if not training and self.auto_apply and row_id in self.guess and self.guess[row_id]["confidence"] >= self.threshold:
             found.append(self.guess[row_id])
         best = strongest(found)
         return best if best and (best["value"] is not None or best["source"] in ("user", "wealthfolio-ui")) else None
@@ -250,6 +250,10 @@ class Workspace:
                 "reasons": [f"{describe(f, names)} (seen {count}x as {value})" for f, _, count in lift],
             }
         self.examples, self.check = examples, check
+        # Calibration comes from personal accounts; only the blind shared-card check set can show the
+        # model is safe to trust above the threshold, so it applies nothing until that evidence exists.
+        sure = [self.guess[i]["value"] == truth for i, truth in check if self.guess[i]["confidence"] >= self.threshold]
+        self.auto_apply = len(sure) >= int(self.config.get("minCheckLabels", 30)) and (not sure or sum(sure) / len(sure) >= 0.95)
 
     def evaluate(self) -> dict:
         """Honest accuracy: unseen merchants, a later period, and the blind check set."""

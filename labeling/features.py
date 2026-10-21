@@ -15,6 +15,8 @@ NOISE = {
     "WEB", "INITIATED", "PAYMENT", "AT", "ACH", "RECURRING", "WITHDRAWAL", "DEPOSIT", "ELECTRONIC", "PREAUTHORIZED",
 }
 DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+# Filler that says nothing about who is spending; words of one or two letters and masked numbers go too.
+STOPWORDS = {"OF", "THE", "AND", "FOR", "INC", "LLC", "COM", "WWW", "CORP"}
 KINDS = {"m": "merchant", "w": "word", "mcc": "MCC", "type": "type"}
 
 
@@ -70,7 +72,8 @@ def features(row: dict, raw: dict | None = None, zone=timezone.utc) -> list[str]
     key = merchant_key(notes)
     if key:
         found.append(f"m:{key}")
-        found += [f"w:{word}" for word in dict.fromkeys(tokens(notes)) if word not in NOISE]
+        found += [f"w:{word}" for word in dict.fromkeys(tokens(notes))
+                  if word not in NOISE and word not in STOPWORDS and len(word) > 2 and not any(c.isdigit() for c in word)]
     amount = abs(float(row.get("amount") or 0))
     found.append(f"amt:{int(math.log2(amount + 1))}")
     day = date.fromisoformat(row["activityDate"][:10])

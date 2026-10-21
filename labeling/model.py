@@ -9,6 +9,16 @@ from collections import defaultdict
 
 ALPHA = 0.5
 BINS = 10
+STRONG = 3  # a reason seen fewer times than this never outranks better-evidenced ones
+
+
+def sigmoid(x: float) -> float:
+    return 1 / (1 + math.exp(-x)) if x >= 0 else math.exp(x) / (1 + math.exp(x))
+
+
+def logit(p: float) -> float:
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return math.log(p / (1 - p))
 
 
 class NaiveBayes:
@@ -19,7 +29,7 @@ class NaiveBayes:
         self.seen = {c: defaultdict(int) for c in self.classes}
         self.totals = {c: 0.0 for c in self.classes}
         self.vocab: set[str] = set()
-        self.calibration = [None] * BINS
+        self.calibration = [1.0, 0.0]  # Platt slope and intercept; identity until fitted
 
     def fit(self, examples: list[tuple[list[str], str, float]]) -> "NaiveBayes":
         for found, label, weight in examples:
@@ -49,39 +59,59 @@ class NaiveBayes:
 
     def predict(self, found: list[str]) -> tuple[str, float, list[tuple[str, float, int]], float]:
         """Best class, calibrated confidence, the features that favoured it most (with times seen), and the
-        raw posterior. Calibration is monotone but coarse, so the raw posterior breaks its ties when ranking."""
+        raw posterior, which breaks ties left by rounding the calibrated value."""
         probs = self.raw(found)
         best = max(probs, key=probs.get)
         runner = max((c for c in self.classes if c != best), key=probs.get)
         lift = sorted(
             ((f, self._log_likelihood(best, f) - self._log_likelihood(runner, f), self.seen[best].get(f, 0))
              for f in dict.fromkeys(found) if f in self.vocab),
-            key=lambda item: -item[1],
+            key=lambda item: (item[2] >= STRONG, item[1]), reverse=True,
         )
         return best, self.calibrate(probs[best]), [item for item in lift if item[1] > 0 and item[2] > 0][:3], probs[best]
 
     def calibrate(self, p: float) -> float:
-        value = self.calibration[min(int(p * BINS), BINS - 1)]
-        return round(p if value is None else value, 3)
+        slope, intercept = self.calibration
+        return round(sigmoid(slope * logit(p) + intercept), 3)
 
     def fit_calibration(self, pairs: list[tuple[float, bool]]) -> None:
-        """Histogram binning made monotone with pool-adjacent-violators."""
-        hits, sizes = [0.0] * BINS, [0.0] * BINS
-        for p, correct in pairs:
-            b = min(int(p * BINS), BINS - 1)
-            hits[b] += correct
-            sizes[b] += 1
-        blocks = [[(hits[b] + 1) / (sizes[b] + 2), sizes[b] + 2, [b]] for b in range(BINS)]
-        merged = []
-        for block in blocks:
-            merged.append(block)
-            while len(merged) > 1 and merged[-2][0] > merged[-1][0]:
-                right, left = merged.pop(), merged.pop()
-                weight = left[1] + right[1]
-                merged.append([(left[0] * left[1] + right[0] * right[1]) / weight, weight, left[2] + right[2]])
-        for value, _, members in merged:
-            for b in members:
-                self.calibration[b] = round(value, 4)
+        """Platt scaling, sigmoid(a * logit(p) + b), fit on held-out (p, correct) pairs.
+
+        Monotone and continuous, so it keeps the model's ranking and resolution; histogram binning
+        collapsed every prediction into a few values. Newton's method with backtracking and Platt's
+        smoothed targets, after Lin, Lin and Weng (2007).
+        """
+        if not pairs:
+            return
+        right = sum(correct for _, correct in pairs)
+        hit, miss = (right + 1) / (right + 2), 1 / (len(pairs) - right + 2)
+        data = [(logit(p), hit if correct else miss) for p, correct in pairs]
+
+        def loss(a, b):
+            return sum(max(s, 0) + math.log1p(math.exp(-abs(s))) - t * s for z, t in data for s in [a * z + b])
+
+        a, b = 0.0, logit((right + 1) / (len(pairs) + 2))
+        current = loss(a, b)
+        for _ in range(100):
+            ga = gb = 0.0
+            haa = hbb = 1e-12
+            hab = 0.0
+            for z, target in data:
+                q = sigmoid(a * z + b)
+                d, w = q - target, q * (1 - q)
+                ga, gb, haa, hab, hbb = ga + d * z, gb + d, haa + w * z * z, hab + w * z, hbb + w
+            if abs(ga) + abs(gb) < 1e-6:
+                break
+            det = haa * hbb - hab * hab
+            da, db = (hbb * ga - hab * gb) / det, (haa * gb - hab * ga) / det
+            step, slope = 1.0, ga * da + gb * db
+            while step > 1e-10 and loss(a - step * da, b - step * db) > current - 1e-4 * step * slope:
+                step /= 2
+            if step <= 1e-10:
+                break
+            a, b = a - step * da, b - step * db
+            current = loss(a, b)
+        self.calibration = [round(max(a, 1e-3), 6), round(b, 6)]
 
     def to_json(self) -> dict:
         return {
