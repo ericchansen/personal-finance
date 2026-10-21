@@ -545,3 +545,31 @@ def test_queue_cards_show_each_row_prediction_and_the_merchant_summary(world):
     assert all(r["guess"]["value"] in ws.spenders and r["guess"]["reasons"] is not None for r in card["rows"])
     blind = app.handle("GET", "/api/card", {"mode": "check"}, {})["card"]
     assert blind["summary"] is None and all(r["guess"] is None for r in blind["rows"])
+
+def test_repeated_labels_are_not_recorded_twice(world):
+    fake, ws = world
+    first = ws.label("Joint", merchant="HARDWARE STORE")
+    again = ws.label("Joint", merchant="HARDWARE STORE")
+    assert first["recorded"] == 1 and again["recorded"] == 0
+    assert ws.label("Ben", ids=["shared-coffee"])["recorded"] == 1
+    assert ws.label("Ben", ids=["shared-coffee"])["recorded"] == 0
+    assert ws.label("Ann", ids=["shared-coffee"])["recorded"] == 1
+    ws.undo()
+    assert ws.label("Ann", ids=["shared-coffee"])["recorded"] == 1
+    assert len([e for e in ws.ledger.entries if e.get("merchant") == "HARDWARE STORE"]) == 1
+
+
+def test_a_labeled_card_stays_on_screen_until_moved_on(world):
+    fake, ws = world
+    app = Labeler(ws)
+    app.handle("POST", "/api/label", {}, {"value": "Joint", "merchant": "HARDWARE STORE"})
+    card = app.handle("GET", "/api/card", {"key": "HARDWARE STORE"}, {})["card"]
+    assert card["missing"] == {"spender": 0, "category": 2}
+    assert "HARDWARE STORE" in {g["key"] for g in ws.queue()}, "a spender without a category stays queued"
+    app.handle("POST", "/api/category", {}, {"categoryId": "cat_groceries", "merchant": "HARDWARE STORE"})
+    assert "HARDWARE STORE" not in {g["key"] for g in ws.queue()}
+    card = app.handle("GET", "/api/card", {"key": "HARDWARE STORE"}, {})["card"]
+    assert card["missing"] == {"spender": 0, "category": 0} and {r["needWant"] for r in card["rows"]} == {"Need"}
+    assert card["key"] == "HARDWARE STORE" and card["labeled"] == [("Joint", 2)]
+    assert all(r["spender"] == "Joint" and r["source"] == "merchant" for r in card["rows"])
+    assert app.handle("GET", "/api/card", {"key": "NO SUCH SHOP"}, {})["card"] is None

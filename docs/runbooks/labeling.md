@@ -17,12 +17,16 @@ after a native backup.
 | Spender letter (from config) | Label the highlighted row; with **Shift**, the whole merchant, past and future |
 | **Enter** | Accept the guess |
 | **C** / **N** / **W** | Pick a category, a Need category, or a Want category (**Shift**: native rule for the merchant) |
-| **'** · **S** · **U** · **↑↓** | Note · skip · undo · move between rows |
+| **'** · **U** · **↑↓** | Note · undo · move between rows |
+| **→**/**Space** · **←** | Next card (asks once if the card is incomplete) · previous card |
 | **O** · **Tab** · **R** · **Esc** | Cycle the queue order (remembered) · next view (**Shift+Tab** back) · re-read Wealthfolio · close a picker or box |
 
 **Predictions** lists every unlabeled row with the model's guess and confidence. Sort by any
 column and filter; **Enter** accepts a guess, and **Space** then **A** accepts the selected rows.
 **Audit** filters labels by source and confidence; **H** shows a row's history.
+
+A card stays on screen after labeling. It is complete when every row has a spender and a category
+(which gives need or want); a merchant labeled by hand stays queued until it has both.
 
 ## Private files (`<data>/labels/`)
 
