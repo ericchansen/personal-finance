@@ -341,3 +341,15 @@ def test_deferred_merchants_wait_at_the_end_of_the_queue(world):
     assert [g["key"] for g in ws.queue()] == ["HARDWARE STORE", "TINY KIOSK"]
     ws.config["deferMerchants"] = ["^HARDWARE\\b"]
     assert [g["key"] for g in ws.queue()] == ["TINY KIOSK", "HARDWARE STORE"]
+
+def test_every_write_bumps_the_version_open_pages_poll(world):
+    fake, ws = world
+    app = Labeler(ws)
+    start = app.handle("GET", "/api/version", {}, {})["version"]
+    assert app.handle("GET", "/api/card", {}, {})["counts"]["version"] == start
+    app.handle("POST", "/api/label", {}, {"value": "Joint", "merchant": "HARDWARE STORE"})
+    assert app.handle("GET", "/api/version", {}, {})["version"] == start + 1
+    app.handle("GET", "/api/card", {}, {})
+    assert app.handle("GET", "/api/version", {}, {})["version"] == start + 1
+    app.handle("POST", "/api/undo", {}, {})
+    assert app.handle("GET", "/api/card", {}, {})["counts"]["version"] == start + 2
