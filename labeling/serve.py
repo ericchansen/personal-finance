@@ -113,7 +113,7 @@ class Labeler:
         "amount": lambda ws, i: abs(float(ws.rows[i].get("amount") or 0)),
         "category": lambda ws, i: ws.view(i)["category"],
         "value": lambda ws, i: ws.guess[i]["value"],
-        "confidence": lambda ws, i: ws.guess[i]["confidence"],
+        "confidence": lambda ws, i: ws.guess[i]["rank"],
     }
 
     def predictions(self, query: dict) -> dict:

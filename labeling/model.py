@@ -47,8 +47,9 @@ class NaiveBayes:
         norm = sum(exp.values())
         return {c: v / norm for c, v in exp.items()}
 
-    def predict(self, found: list[str]) -> tuple[str, float, list[tuple[str, float, int]]]:
-        """Best class, calibrated confidence, and the features that favoured it most (with times seen)."""
+    def predict(self, found: list[str]) -> tuple[str, float, list[tuple[str, float, int]], float]:
+        """Best class, calibrated confidence, the features that favoured it most (with times seen), and the
+        raw posterior. Calibration is monotone but coarse, so the raw posterior breaks its ties when ranking."""
         probs = self.raw(found)
         best = max(probs, key=probs.get)
         runner = max((c for c in self.classes if c != best), key=probs.get)
@@ -57,7 +58,7 @@ class NaiveBayes:
              for f in dict.fromkeys(found) if f in self.vocab),
             key=lambda item: -item[1],
         )
-        return best, self.calibrate(probs[best]), [item for item in lift if item[1] > 0 and item[2] > 0][:3]
+        return best, self.calibrate(probs[best]), [item for item in lift if item[1] > 0 and item[2] > 0][:3], probs[best]
 
     def calibrate(self, p: float) -> float:
         value = self.calibration[min(int(p * BINS), BINS - 1)]

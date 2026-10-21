@@ -176,11 +176,11 @@ def test_naive_bayes_calibrates_monotonically_and_explains():
     examples = [(f"{p}{i}", [f"m:{p}{i % 3}", f"w:{word}", "dow:Mon"], p, 1.0)
                 for p, word in (("Ann", "COFFEE"), ("Ben", "GYM")) for i in range(30)]
     model, version = nb.train(["Ann", "Ben", "Joint"], examples)
-    value, confidence, lift = model.predict(["m:new", "w:COFFEE"])
+    value, confidence, lift, _ = model.predict(["m:new", "w:COFFEE"])
     assert value == "Ann" and confidence > 0.8 and lift[0][0] == "w:COFFEE" and lift[0][2] == 30
     tiny = nb.NaiveBayes(["Ann", "Joint"]).fit(
         [(["w:A", "w:Z"] if i == 0 else ["w:A"], "Ann", 1.0) for i in range(30)] + [(["w:J"], "Joint", 1.0)])
-    best, _, reasons = tiny.predict(["w:J", "w:Z"])
+    best, _, reasons, _ = tiny.predict(["w:J", "w:Z"])
     assert best == "Joint" and [f for f, _, _ in reasons] == ["w:J"]
     assert model.calibration == sorted(model.calibration)
     assert version == nb.train(["Ann", "Ben", "Joint"], list(reversed(examples)))[1]
@@ -419,8 +419,8 @@ def test_queue_orders_keep_deferred_merchants_last(world, order, first):
     keys = [g["key"] for g in ws.queue(order=order)]
     assert keys[-1] == "ZZ DEFER" and (first is None or keys[0] == first)
     if order.endswith("confidence"):
-        conf = [max(ws.guess[i]["confidence"] for i in g["ids"]) for g in ws.queue(order=order)[:-1]]
-        assert conf == sorted(conf, reverse=order == "high-confidence")
+        ranks = [g["confidence"] for g in ws.queue(order=order)[:-1]]
+        assert ranks == sorted(ranks, reverse=order == "high-confidence")
 
 
 def test_rows_that_do_not_count_as_spending_need_no_spender(world):
@@ -462,3 +462,22 @@ def test_rereading_picks_up_changes_made_outside_the_labeler(world):
     config = json.loads((ws.dir / "config.json").read_text(encoding="utf-8"))
     (ws.dir / "config.json").write_text(json.dumps({**config, "threshold": 0.99}), encoding="utf-8")
     assert app.handle("GET", "/api/refresh", {}, {})["version"] == start + 2 and ws.threshold == 0.99
+
+
+def test_confidence_orders_break_calibration_ties_with_the_raw_posterior(world):
+    fake, ws = world
+    model = nb.NaiveBayes(["Ann", "Ben"]).fit([(["w:A"], "Ann", 1.0)] * 9 + [(["w:A"], "Ben", 1.0), (["w:B"], "Ben", 1.0)])
+    model.calibration = [0.6] * nb.BINS
+    sure, unsure = model.predict(["w:A", "w:A"]), model.predict(["w:B"])
+    assert sure[1] == unsure[1] == 0.6 and sure[3] != unsure[3]
+    for i, raw in ((1, 0.70), (2, 0.55), (3, 0.90)):
+        fake.add(f"tie-{i}", "card", f"TIE SHOP{i} 1", amount=10, day="2026-03-0" + str(i))
+    ws.refresh()
+    app = Labeler(ws)
+    for i, raw in ((1, 0.70), (2, 0.55), (3, 0.90)):
+        ws.guess[f"tie-{i}"].update(confidence=0.6, rank=(0.6, raw))
+    ties = lambda keys: [k for k in keys if k.startswith("TIE")]
+    assert ties(g["key"] for g in ws.queue(order="low-confidence")) == ["TIE SHOP2", "TIE SHOP1", "TIE SHOP3"]
+    assert ties(g["key"] for g in ws.queue(order="high-confidence")) == ["TIE SHOP3", "TIE SHOP1", "TIE SHOP2"]
+    rows = app.handle("GET", "/api/predictions", {"q": "tie shop", "sort": "confidence"}, {})["rows"]
+    assert [r["id"] for r in rows] == ["tie-2", "tie-1", "tie-3"]
