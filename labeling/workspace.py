@@ -7,6 +7,7 @@ row, so amounts, dates, transfer links, and balances cannot change.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -107,6 +108,7 @@ class Workspace:
         self.config = json.loads((self.dir / "config.json").read_text(encoding="utf-8"))
         self.spenders: list[str] = list(self.config["spenders"].values())
         self.threshold = float(self.config.get("threshold", 0.9))
+        self.descriptions = self._descriptions()
         self.ledger = Ledger(self.dir / "ledger.jsonl")
         applied = self.dir / "applied.json"
         self.applied: dict[str, str | None] = json.loads(applied.read_text(encoding="utf-8")) if applied.exists() else {}
@@ -137,6 +139,18 @@ class Workspace:
             (i, r.get("updatedAt"), r.get("eventId"), r.get("visibleSpendingAmount"), tuple(r["categoryIds"]))
             for i, r in sorted(self.rows.items()))))
 
+    def _descriptions(self) -> dict[str, str]:
+        """Original descriptions from private exports, keyed like idempotency keys, for rows with empty notes."""
+        found = {}
+        for source in self.config.get("descriptionFiles", []):
+            path = self.data_dir / source["file"]
+            if path.exists():
+                with path.open(encoding="utf-8-sig", newline="") as handle:
+                    for line in csv.DictReader(handle):
+                        if (line.get(source["text"]) or "").strip():
+                            found[source["key"].format(**line)] = line[source["text"]].strip()
+        return found
+
     @staticmethod
     def _categories(row: dict) -> list[str]:
         found = [a["categoryId"] for a in row["assignments"] if a["taxonomyId"] == SPENDING]
@@ -152,6 +166,8 @@ class Workspace:
         self.rows = {}
         for row in spending_rows(self.client):
             row["categoryIds"] = self._categories(row)
+            if not (row.get("notes") or "").strip():
+                row["notes"] = self.descriptions.get(row.get("idempotencyKey") or "")
             self.rows[row["id"]] = row
         self.merchant = {i: merchant_key(r.get("notes")) for i, r in self.rows.items()}
         self.features = {i: features(r, self.raw.get(r.get("idempotencyKey") or ""), self.zone) for i, r in self.rows.items()}

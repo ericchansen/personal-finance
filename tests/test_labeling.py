@@ -139,6 +139,9 @@ def shown(fake, row_id):
     ("POS 1234 COFFEE SHOP", "COFFEE SHOP"),
     ("RIDES", "RIDES"),
     ("PAYPAL PAYMENT", "PAYPAL PAYMENT"),
+    ("ACH Withdrawal DEPT EDUCATION STUDENT LN", "DEPT EDUCATION"),
+    ("ACH Deposit ACME PAYROLL", "ACME PAYROLL"),
+    ("DEBIT CARD PURCHASE CORNER DELI", "CORNER DELI"),
     (None, ""),
 ])
 def test_merchant_key_and_native_rule_pattern_agree(text, key):
@@ -481,3 +484,16 @@ def test_confidence_orders_break_calibration_ties_with_the_raw_posterior(world):
     assert ties(g["key"] for g in ws.queue(order="high-confidence")) == ["TIE SHOP3", "TIE SHOP1", "TIE SHOP2"]
     rows = app.handle("GET", "/api/predictions", {"q": "tie shop", "sort": "confidence"}, {})["rows"]
     assert [r["id"] for r in rows] == ["tie-2", "tie-1", "tie-3"]
+
+
+def test_empty_notes_fall_back_to_a_private_export_description(world):
+    fake, ws = world
+    fake.add("legacy", "shared", None, amount=73, idempotencyKey="legacy:42")
+    fake.add("blank", "shared", "", amount=5, idempotencyKey="legacy:7")
+    (ws.data_dir / "export.csv").write_text("Id,Original Statement\n42,ACH Withdrawal RIVER HOMES 0099\n7,\n", encoding="utf-8")
+    config = json.loads((ws.dir / "config.json").read_text(encoding="utf-8"))
+    config["descriptionFiles"] = [{"file": "export.csv", "key": "legacy:{Id}", "text": "Original Statement"}]
+    (ws.dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    ws.load()
+    assert ws.merchant["legacy"] == "RIVER HOMES" and ws.view("legacy")["notes"] == "ACH Withdrawal RIVER HOMES 0099"
+    assert ws.merchant["blank"] == "" and fake.rows["legacy"]["notes"] is None
