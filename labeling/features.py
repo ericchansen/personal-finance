@@ -69,7 +69,8 @@ def features(row: dict, raw: dict | None = None, zone=timezone.utc, merchant: st
     """`merchant` overrides the identity derived from the description (a name given in the labeler)."""
     raw = raw or {}
     notes = row.get("notes")
-    found = [f"type:{row['activityType'].lower()}"]
+    # Nearly every row is a withdrawal, so that type says nothing; credits, fees and the like still do.
+    found = [] if row["activityType"] == "WITHDRAWAL" else [f"type:{row['activityType'].lower()}"]
     key = merchant_key(notes) if merchant is None else merchant
     if key:
         found.append(f"m:{key}")

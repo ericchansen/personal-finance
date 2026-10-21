@@ -10,6 +10,7 @@ from collections import defaultdict
 ALPHA = 0.5
 BINS = 10
 STRONG = 3  # a reason seen fewer times than this never outranks better-evidenced ones
+MIN_LIFT = math.log(1.25)  # a reason must make its class at least 25% likelier to be worth showing
 
 
 def sigmoid(x: float) -> float:
@@ -68,7 +69,7 @@ class NaiveBayes:
              for f in dict.fromkeys(found) if f in self.vocab),
             key=lambda item: (item[2] >= STRONG, item[1]), reverse=True,
         )
-        return best, self.calibrate(probs[best]), [item for item in lift if item[1] > 0 and item[2] > 0][:3], probs[best]
+        return best, self.calibrate(probs[best]), [item for item in lift if item[1] >= MIN_LIFT and item[2] > 0][:3], probs[best]
 
     def calibrate(self, p: float) -> float:
         slope, intercept = self.calibration

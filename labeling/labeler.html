@@ -98,6 +98,7 @@ const ORDERS = [["impact", "Biggest impact"], ["low-confidence", "Lowest confide
 const store = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
 const pred = { rows: [], total: 0, sort: "confidence", dir: "asc", offset: 0, cur: 0, selected: new Map() };
 let busy = false, pinned = null;  // a write in flight; the card to keep showing after labeling it
+let labeledHere = null;  // the card the user just labeled, the only one that gets the "Labeled" banner
 let confirmSkip = null;  // the incomplete card whose skip was asked about once
 const needWantCell = (r) => (r.category ? esc(r.needWant || "—") : '<span class="miss" title="No category, so no need/want">✗ none</span>');
 function missingText() {
@@ -177,7 +178,7 @@ function render() {
   const chip = (name, missing) => `<span class="pill ${missing ? "bad" : "ok"}">${name} ${missing ? `✗ ${missing} missing` : "✓"}</span>`;
   const status = `<p>${chip("Spender", m.spender)} ${card.blind ? "" : chip("Need/Want", m.category)}
     ${complete ? `<b>Complete.</b>` : `<span class="muted">Rows marked ✗ still need it: ${card.blind ? "a spender key" : "spender keys, then <kbd>N</kbd>/<kbd>W</kbd> or <kbd>C</kbd> (<kbd>Shift</kbd> for the whole merchant)"}.</span>`}</p>`;
-  const done = labeled && `<p><span class="guess labeled">Labeled ${card.labeled.length === 1 ? `${labeled} row${labeled === 1 ? "" : "s"} ${esc(card.labeled[0][0])}`
+  const done = labeled && labeledHere === card.key && `<p><span class="guess labeled">Labeled ${card.labeled.length === 1 ? `${labeled} row${labeled === 1 ? "" : "s"} ${esc(card.labeled[0][0])}`
       : card.labeled.map(([v, c]) => `${c} ${esc(v)}`).join(" / ")}</span>
     <span class="muted"><kbd>→</kbd> or <kbd>Space</kbd> for next · <kbd>←</kbd> previous · <kbd>U</kbd> to undo</span></p>`;
   $("main").innerHTML = `
@@ -215,6 +216,7 @@ async function act(path, body) {
 }
 
 async function label(value, whole) {
+  labeledHere = card.key;
   const at = cur;
   const ok = whole && card.merchant && !card.blind ? await act("/api/label", { value, merchant: card.merchant, note })
     : await act("/api/label", { value, ids: [card.rows[cur].id], note, check: card.blind });

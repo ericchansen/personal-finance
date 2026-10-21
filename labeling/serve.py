@@ -99,7 +99,8 @@ class Labeler:
                 "predicted": Counter(self.ws.guess[i]["value"] for i in ids).most_common(),
                 "confidence": round(group["confidence"][0], 3) if "confidence" in group else None,
             },
-            "labeled": Counter(v["spender"] for v in views if v["spender"]).most_common(),
+            # Labels made by hand; defaults show only as each row's source tag.
+            "labeled": Counter(v["spender"] for v in views if v["spender"] and v["source"] in ("user", "merchant")).most_common(),
         }}
 
     def audit(self, query: dict) -> list[dict]:
