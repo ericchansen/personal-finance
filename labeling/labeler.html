@@ -21,6 +21,8 @@
   td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-color-default, #d0d7de); white-space: nowrap; }
   td.desc { white-space: normal; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th[data-sort] { cursor: pointer; user-select: none; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
   tr.cur { outline: 2px solid var(--color-focus-outline, #0969da); outline-offset: -2px; }
   .pill { padding: 1px 6px; border-radius: 4px; background: var(--border-color-default, #eaeef2); font-size: 12px; }
   kbd { font-family: var(--font-mono, monospace); border: 1px solid var(--border-color-default, #d0d7de); border-radius: 4px; padding: 0 4px; }
@@ -37,7 +39,7 @@
 </head>
 <body>
 <header>
-  <nav><button data-mode="queue">Queue</button><button data-mode="check">Check set</button><button data-mode="audit">Audit</button></nav>
+  <nav><button data-mode="queue">Queue</button><button data-mode="check">Check set</button><button data-mode="predictions">Predictions</button><button data-mode="audit">Audit</button></nav>
   <span id="counts" class="muted"></span>
 </header>
 <div class="bar"><div id="progress" style="width:0"></div></div>
@@ -45,7 +47,7 @@
 <main id="main"></main>
 <div id="audit" class="hidden">
   <select id="a-source">
-    <option value="model">model</option><option value="unlabeled">unlabeled (guess)</option><option value="">any source</option>
+    <option value="model">model</option><option value="">any source</option>
     <option value="user">user</option><option value="merchant">merchant</option><option value="wealthfolio-ui">wealthfolio-ui</option>
     <option value="account">account</option><option value="cardmember">cardmember</option>
   </select>
@@ -55,12 +57,25 @@
   <table id="a-table"></table>
   <pre id="a-history" class="muted"></pre>
 </div>
+<div id="pred" class="hidden">
+  <div id="pr-model" class="muted"></div>
+  <div class="controls">
+    <input id="pr-q" placeholder="filter description or account">
+    <select id="pr-value"><option value="">any prediction</option></select>
+    confidence <input id="pr-min" size="4" value="0"> to <input id="pr-max" size="4" value="1">
+    <button id="pr-accept">Accept selected (0)</button>
+    <button id="pr-prev">‹</button><span id="pr-page" class="muted"></span><button id="pr-next">›</button>
+  </div>
+  <table id="pr-table"></table>
+</div>
 <input id="note" class="hidden" placeholder="One-line note for the next label; Enter to keep" size="60">
 <div id="picker" class="hidden"><input id="p-q" size="40"> <span id="p-hint" class="muted"></span><ul id="p-list"></ul></div>
 <footer class="muted" id="keys"></footer>
 <script>
 const $ = (id) => document.getElementById(id);
 const money = (n) => n.toLocaleString(undefined, { style: "currency", currency: "USD" });
+const PAGE = 100;
+const pred = { rows: [], total: 0, sort: "confidence", dir: "asc", offset: 0, cur: 0, selected: new Map() };
 let seen = -1, config, mode = "queue", card = null, cur = 0, skip = [], note = "", categories = [], picker = null, audit = [], auditCur = 0;
 
 async function api(path, body) {
@@ -76,6 +91,8 @@ function spenderKeys() { return Object.entries(config.spenders).map(([k, v]) => 
 function legend() {
   const common = `${spenderKeys()} <span><kbd>Shift</kbd>+key labels the whole merchant, past and future</span>`;
   $("keys").innerHTML = mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
+    : mode === "predictions" ? `${common} <span><kbd>Enter</kbd> accept prediction</span> <span><kbd>Space</kbd> select</span>
+       <span><kbd>A</kbd> accept selected</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span> <span><kbd>PgUp</kbd><kbd>PgDn</kbd> page</span>`
     : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> need/want category</span>
        <span><kbd>'</kbd> note</span> <span><kbd>S</kbd> skip</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span>`;
 }
@@ -83,9 +100,11 @@ function legend() {
 async function load() {
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
   $("audit").classList.toggle("hidden", mode !== "audit");
-  $("main").classList.toggle("hidden", mode === "audit");
+  $("pred").classList.toggle("hidden", mode !== "predictions");
+  $("main").classList.toggle("hidden", mode === "audit" || mode === "predictions");
   legend();
   if (mode === "audit") return loadAudit();
+  if (mode === "predictions") return loadPredictions();
   const data = await api(`/api/card?mode=${mode}&skip=${encodeURIComponent(skip.join("\n"))}`);
   const c = data.counts;
   seen = c.version;
@@ -114,9 +133,10 @@ function render() {
 }
 
 async function act(path, body) {
-  try { await api(path, body); flash(""); } catch (e) { flash(e.message); return; }
+  try { await api(path, body); flash(""); } catch (e) { flash(e.message); return false; }
   note = "";
   await load();
+  return true;
 }
 
 function label(value, whole) {
@@ -174,6 +194,65 @@ function renderAudit() {
         <td>${esc(value)}</td><td>${esc(r.source || "")}</td><td class="num">${conf == null ? "" : (conf * 100).toFixed(0) + "%"}</td><td class="desc muted">${esc(why)}${r.note ? ` · note: ${esc(r.note)}` : ""}</td></tr>`;
     }).join("");
 }
+const pct = (x) => (x && x.n ? `${Math.round(x.accuracy * 100)}% (n=${x.n})` : "n/a");
+const COLUMNS = [["date", "Date"], ["description", "Description"], ["account", "Account"], ["amount", "Amount", "num"],
+  ["category", "Category"], ["value", "Prediction"], ["confidence", "Confidence", "num"]];
+
+async function loadPredictions() {
+  const q = new URLSearchParams({ q: $("pr-q").value, value: $("pr-value").value, min: $("pr-min").value, max: $("pr-max").value,
+    sort: pred.sort, dir: pred.dir, offset: pred.offset, limit: PAGE });
+  const data = await api(`/api/predictions?${q}`), m = data.model;
+  seen = data.version;
+  Object.assign(pred, { rows: data.rows, total: data.total, cur: Math.min(pred.cur, Math.max(data.rows.length - 1, 0)) });
+  if ($("pr-value").options.length === 1) Object.values(config.spenders).forEach((v) => $("pr-value").add(new Option(v, v)));
+  const classes = Object.entries(m.classes).map(([v, c]) => `${v} ${c.examples.toLocaleString()} labels / ${c.merchants} merchants`).join(" · ");
+  $("pr-model").innerHTML = `Model <b>${esc(m.model)}</b>, trained on ${m.examples.toLocaleString()} labels (${esc(classes)}).
+    Accuracy: later period ${pct(m.laterPeriod)}, unseen merchants ${pct(m["unseenMerchants.purchaser"])}, blind check set ${pct(m.checkSet)}.
+    Labels apply automatically only at ${Math.round(data.threshold * 100)}%+ confidence. ${m.warnings.map((w) => `<b>${esc(w)}</b>`).join(" ")}`;
+  $("counts").textContent = `${data.total.toLocaleString()} unlabeled row(s) match · ${pred.selected.size} selected`;
+  renderPredictions();
+}
+
+function renderPredictions() {
+  const head = COLUMNS.map(([key, name, cls]) =>
+    `<th class="${cls || ""}" data-sort="${key}">${name}${pred.sort === key ? (pred.dir === "asc" ? " ▲" : " ▼") : ""}</th>`).join("");
+  $("pr-table").innerHTML = `<tr><th><input type="checkbox" id="pr-all" title="Select this page"></th>${head}<th>Top reason</th></tr>` +
+    pred.rows.map((r, i) => `<tr class="${i === pred.cur ? "cur" : ""}" data-i="${i}">
+      <td><input type="checkbox" data-i="${i}" ${pred.selected.has(r.id) ? "checked" : ""}></td><td>${r.date}</td>
+      <td class="desc">${esc(r.notes)}</td><td>${esc(r.account)}</td><td class="num">${money(r.amount)}</td><td>${esc(r.category)}</td>
+      <td>${esc(r.guess.value)}</td><td class="num">${Math.round(r.guess.confidence * 100)}%</td>
+      <td class="desc muted" title="${esc(r.guess.reasons.join("\n"))}">${esc(r.guess.reasons[0] || "")}</td></tr>`).join("");
+  $("pr-accept").textContent = `Accept selected (${pred.selected.size})`;
+  $("pr-page").textContent = pred.total ? `${pred.offset + 1}–${pred.offset + pred.rows.length} of ${pred.total.toLocaleString()}` : "none";
+}
+
+function toggle(i, on) {
+  const r = pred.rows[i];
+  if (on ?? !pred.selected.has(r.id)) pred.selected.set(r.id, r.guess.value); else pred.selected.delete(r.id);
+}
+async function acceptSelected() {
+  const items = [...pred.selected].map(([id, value]) => ({ id, value }));
+  if (items.length && await act("/api/label", { accept: items })) pred.selected.clear();
+  renderPredictions();
+}
+function page(step) {
+  const next = pred.offset + step * PAGE;
+  if (next < 0 || next >= pred.total) return;
+  pred.offset = next; pred.cur = 0; loadPredictions().catch((e) => flash(e.message));
+}
+$("pr-table").addEventListener("click", (e) => {
+  const th = e.target.closest("th[data-sort]"), tr = e.target.closest("tr[data-i]");
+  if (th) { pred.dir = pred.sort === th.dataset.sort && pred.dir === "asc" ? "desc" : "asc"; pred.sort = th.dataset.sort; pred.offset = 0; return load(); }
+  if (e.target.id === "pr-all") pred.rows.forEach((_, i) => toggle(i, e.target.checked));
+  else if (tr) { pred.cur = +tr.dataset.i; if (e.target.type === "checkbox") toggle(pred.cur); }
+  if (e.target.tagName === "INPUT") e.target.blur();
+  renderPredictions();
+});
+["pr-q", "pr-value", "pr-min", "pr-max"].forEach((id) => $(id).addEventListener("change", () => { pred.offset = 0; load(); }));
+$("pr-accept").addEventListener("click", acceptSelected);
+$("pr-prev").addEventListener("click", () => page(-1));
+$("pr-next").addEventListener("click", () => page(1));
+
 ["a-source", "a-min", "a-max", "a-q"].forEach((id) => $(id).addEventListener("change", loadAudit));
 
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => { mode = b.dataset.mode; skip = []; load(); }));
@@ -181,6 +260,19 @@ document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click
 document.addEventListener("keydown", async (e) => {
   if (picker || e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.ctrlKey || e.metaKey || e.altKey) return;
   const key = e.key.toLowerCase(), spender = config.spenders[key];
+  if (mode === "predictions") {
+    const row = pred.rows[pred.cur];
+    if (e.key === "ArrowDown") pred.cur = Math.min(pred.cur + 1, pred.rows.length - 1);
+    else if (e.key === "ArrowUp") pred.cur = Math.max(pred.cur - 1, 0);
+    else if (e.key === "PageDown" || e.key === "PageUp") { e.preventDefault(); return page(e.key === "PageDown" ? 1 : -1); }
+    else if (e.key === " " && row) toggle(pred.cur);
+    else if (spender && row) return act("/api/label", e.shiftKey && row.merchant ? { value: spender, merchant: row.merchant } : { value: spender, ids: [row.id] });
+    else if (key === "a") { e.preventDefault(); return acceptSelected(); }
+    else if (key === "u") return act("/api/undo", {});
+    else if (e.key === "Enter" && row) { e.preventDefault(); pred.selected.delete(row.id); return act("/api/label", { accept: [{ id: row.id, value: row.guess.value }] }); }
+    else return;
+    e.preventDefault(); return renderPredictions();
+  }
   if (mode === "audit") {
     const row = audit[auditCur];
     if (e.key === "ArrowDown") auditCur = Math.min(auditCur + 1, audit.length - 1);

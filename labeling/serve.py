@@ -20,6 +20,7 @@ class Labeler:
         self.backed_up = False
         self.session = 0
         self.version = 0  # bumps on every write, so open pages can tell their card is stale
+        self._summary: dict = {}
         self.notice = ""
         try:
             result = self.write(lambda: self.ws.sync(self.ws.rows))
@@ -73,17 +74,58 @@ class Labeler:
         for row_id in self.ws.rows:
             item = self.ws.view(row_id)
             conf = item["confidence"] if item["source"] == "model" else 1.0
-            if source == "unlabeled":
-                if item["spender"]:
-                    continue
-                conf = item["guess"]["confidence"]
-            elif source and item["source"] != source:
+            if source and item["source"] != source:
                 continue
             if not low <= conf <= high or (text and text not in (item["notes"] + item["account"]).upper()):
                 continue
             found.append(item)
         found.sort(key=lambda i: (i["confidence"] if i["confidence"] is not None else 1.0, i["date"]))
         return found[:300]
+
+    def summary(self) -> dict:
+        """The model version, its evaluation, and how many labels and merchants teach each spender."""
+        ws = self.ws
+        if self._summary.get("model") != ws.version:
+            merchants = {value: set() for value in ws.spenders}
+            counts = dict.fromkeys(ws.spenders, 0)
+            for row_id, _, value, _ in ws.examples:
+                counts[value] += 1
+                merchants[value].add(ws.merchant[row_id])
+            classes = {value: {"examples": counts[value], "merchants": len(merchants[value])} for value in ws.spenders}
+            self._summary = {**ws.evaluate(), "classes": classes, "warnings": [
+                f"{value} is barely learned: {c['examples']} label(s) from {c['merchants']} merchant(s), so its "
+                "predictions are unreliable until you label more of it." for value, c in classes.items() if c["merchants"] < 20
+            ]}
+        return self._summary
+
+    SORTS = {
+        "date": lambda ws, i: ws.rows[i]["activityDate"],
+        "description": lambda ws, i: (ws.rows[i].get("notes") or "").upper(),
+        "account": lambda ws, i: ws.accounts.get(ws.rows[i]["accountId"], {}).get("name", ""),
+        "amount": lambda ws, i: abs(float(ws.rows[i].get("amount") or 0)),
+        "category": lambda ws, i: ws.view(i)["category"],
+        "value": lambda ws, i: ws.guess[i]["value"],
+        "confidence": lambda ws, i: ws.guess[i]["confidence"],
+    }
+
+    def predictions(self, query: dict) -> dict:
+        """Every unlabeled row outside the blind check set, scored by the current model; one page of it."""
+        ws = self.ws
+        text = (query.get("q") or "").upper()
+        value = query.get("value") or ""
+        low, high = float(query.get("min") or 0), float(query.get("max") or 1)
+        held = set(ws.check_ids())
+        ids = [
+            i for i, row in ws.rows.items()
+            if i not in held and ws.unlabeled(i)
+            and (not value or ws.guess[i]["value"] == value) and low <= ws.guess[i]["confidence"] <= high
+            and (not text or text in f"{row.get('notes') or ''} {self.SORTS['account'](ws, i)}".upper())
+        ]
+        key = self.SORTS[query.get("sort") or "confidence"]
+        ids.sort(key=lambda i: key(ws, i), reverse=query.get("dir") == "desc")
+        offset, limit = int(query.get("offset") or 0), min(int(query.get("limit") or 100), 500)
+        return {"total": len(ids), "rows": [ws.view(i) for i in ids[offset:offset + limit]],
+                "version": self.version, "threshold": ws.threshold, "model": self.summary()}
 
     def handle(self, method: str, path: str, query: dict, body: dict):
         ws = self.ws
@@ -99,12 +141,16 @@ class Labeler:
                      "needWant": ws.need_want({"categoryIds": [i]})} for i, c in ws.categories.items()]
         if path == "/api/audit":
             return self.audit(query)
+        if path == "/api/predictions":
+            return self.predictions(query)
         if path == "/api/history":
             row_id = query["id"]
             return ws.ledger.history(row_id, ws.merchant.get(row_id, ""))
         if method != "POST":
             raise KeyError(path)
-        if path == "/api/label":
+        if path == "/api/label" and body.get("accept"):
+            result = self.write(lambda: ws.accept(body["accept"]))
+        elif path == "/api/label":
             result = self.write(lambda: ws.label(body.get("value"), ids=body.get("ids", []), merchant=body.get("merchant", ""),
                                                  note=body.get("note", ""), check=bool(body.get("check"))))
         elif path == "/api/category":

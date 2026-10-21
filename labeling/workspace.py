@@ -327,6 +327,24 @@ class Workspace:
             self.ledger.append([{**base, "activityId": i, "source": "user", **({"check": True} if check else {})} for i in ids])
         return self.sync(ids)
 
+    def accept(self, items: list[dict]) -> dict:
+        """Confirm predictions as user labels, keeping the model's confidence and reasons as provenance.
+
+        `items` carry the value the user saw, so a retrain in between cannot change what is confirmed.
+        """
+        action = uuid.uuid4().hex[:12]
+        entries = []
+        for item in items:
+            row_id, value = item["id"], item["value"]
+            if row_id not in self.rows or value not in self.spenders:
+                continue
+            guess = self.guess[row_id]
+            model = {k: guess[k] for k in ("confidence", "reasons", "model")} if guess["value"] == value else {}
+            entries.append({"field": FIELD, "activityId": row_id, "value": value, "source": "user", "accepted": True,
+                            "by": self.by, "action": action, **model})
+        self.ledger.append(entries)
+        return self.sync([e["activityId"] for e in entries])
+
     def categorize(self, category_id: str, *, ids=(), merchant: str = "") -> dict:
         action = uuid.uuid4().hex[:12]
         base = {"field": "category", "value": category_id, "by": self.by, "action": action}
@@ -392,14 +410,17 @@ class Workspace:
                       key=lambda i: hashlib.sha1(i.encode()).hexdigest())
         return pool[: int(self.config.get("checkSize", 100))]
 
+    def unlabeled(self, row_id: str) -> bool:
+        label = self.resolve(row_id)
+        return not self.foreign_event(row_id) and not (label and label["value"])
+
     def queue(self, mode: str = "queue") -> list[dict]:
         if mode == "check":
             done = {i for i, _ in self.check}
             return [{"key": f"#{i}", "ids": [i], "value": 0} for i in self.check_ids() if i not in done]
         groups: dict[str, dict] = {}
         for row_id, row in self.rows.items():
-            label = self.resolve(row_id)
-            if self.foreign_event(row_id) or (label and label["value"]):
+            if not self.unlabeled(row_id):
                 continue
             key = self.merchant[row_id] or f"#{row_id}"
             group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0})
