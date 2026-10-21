@@ -19,6 +19,7 @@ class Labeler:
         self.ws = workspace
         self.backed_up = False
         self.session = 0
+        self.version = 0  # bumps on every write, so open pages can tell their card is stale
         self.notice = ""
         try:
             result = self.write(lambda: self.ws.sync(self.ws.rows))
@@ -39,6 +40,7 @@ class Labeler:
                 self.ws.sync(self.ws.rows)
             finally:
                 self.ws.mark_fresh()
+                self.version += 1
             return result
 
     def card(self, mode: str, skip: set[str]) -> dict:
@@ -48,7 +50,7 @@ class Labeler:
         counts = {
             "groups": len(queue), "rows": sum(len(g["ids"]) for g in queue),
             "amount": round(sum(abs(float(rows[i].get("amount") or 0)) for g in queue for i in g["ids"]), 2),
-            "session": self.session, "total": len(rows), "notice": self.notice,
+            "session": self.session, "total": len(rows), "notice": self.notice, "version": self.version,
         }
         if group is None:
             return {"card": None, "counts": counts}
@@ -87,6 +89,8 @@ class Labeler:
         ws = self.ws
         if path == "/api/config":
             return {"spenders": ws.config["spenders"], "threshold": ws.threshold, "model": ws.version}
+        if path == "/api/version":
+            return {"version": self.version}
         if path == "/api/card":
             return self.card(query.get("mode", "queue"), set(filter(None, query.get("skip", "").split("\n"))))
         if path == "/api/categories":

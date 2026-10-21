@@ -61,7 +61,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const money = (n) => n.toLocaleString(undefined, { style: "currency", currency: "USD" });
-let config, mode = "queue", card = null, cur = 0, skip = [], note = "", categories = [], picker = null, audit = [], auditCur = 0;
+let seen = -1, config, mode = "queue", card = null, cur = 0, skip = [], note = "", categories = [], picker = null, audit = [], auditCur = 0;
 
 async function api(path, body) {
   const res = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
@@ -88,6 +88,7 @@ async function load() {
   if (mode === "audit") return loadAudit();
   const data = await api(`/api/card?mode=${mode}&skip=${encodeURIComponent(skip.join("\n"))}`);
   const c = data.counts;
+  seen = c.version;
   $("counts").textContent = `${c.rows.toLocaleString()} rows (${money(c.amount)}) left in ${c.groups.toLocaleString()} ${mode === "check" ? "check rows" : "merchants"} · ${c.session} labeled this session · model ${config.model}`;
   $("progress").style.width = `${Math.round(100 * (1 - c.rows / Math.max(c.total, 1)))}%`;
   if (c.notice && !$("notice").textContent) flash(c.notice);
@@ -159,6 +160,7 @@ $("note").addEventListener("keydown", (e) => {
 });
 
 async function loadAudit() {
+  seen = (await api("/api/version")).version;
   const q = new URLSearchParams({ source: $("a-source").value, min: $("a-min").value, max: $("a-max").value, q: $("a-q").value });
   audit = await api(`/api/audit?${q}`); auditCur = 0; renderAudit();
   $("counts").textContent = `${audit.length} row(s) shown, lowest confidence first (max 300)`;
@@ -202,6 +204,16 @@ document.addEventListener("keydown", async (e) => {
   else return;
   e.preventDefault();
 });
+
+// Labels may also arrive from outside this page; reload when the server's write version moves.
+async function refresh(force) {
+  if (document.hidden || picker || document.activeElement?.tagName === "INPUT") return;
+  const { version } = await api("/api/version");
+  if (force || version !== seen) await load();
+}
+window.addEventListener("focus", () => refresh(true).catch((e) => flash(e.message)));
+document.addEventListener("visibilitychange", () => refresh(true).catch((e) => flash(e.message)));
+setInterval(() => refresh(false).catch(() => {}), 3000);
 
 (async () => { config = await api("/api/config"); load(); })().catch((e) => flash(e.message));
 </script>
