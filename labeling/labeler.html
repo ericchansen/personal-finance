@@ -39,7 +39,7 @@
 </head>
 <body>
 <header>
-  <nav><button data-mode="queue">Queue</button><button data-mode="check">Check set</button><button data-mode="predictions">Predictions</button><button data-mode="audit">Audit</button></nav>
+  <nav><button data-mode="queue">Queue</button><button data-mode="predictions">Predictions</button><button data-mode="audit">Audit</button><button data-mode="check">Check set</button></nav>
   <span id="counts" class="muted"></span>
 </header>
 <div class="bar"><div id="progress" style="width:0"></div></div>
@@ -89,12 +89,14 @@ function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp
 function spenderKeys() { return Object.entries(config.spenders).map(([k, v]) => `<kbd>${k.toUpperCase()}</kbd> ${esc(v)}`).join(" "); }
 
 function legend() {
+  const views = `<span><kbd>Tab</kbd>/<kbd>Shift+Tab</kbd> next/previous view</span>`;
   const common = `${spenderKeys()} <span><kbd>Shift</kbd>+key labels the whole merchant, past and future</span>`;
   $("keys").innerHTML = mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
     : mode === "predictions" ? `${common} <span><kbd>Enter</kbd> accept prediction</span> <span><kbd>Space</kbd> select</span>
        <span><kbd>A</kbd> accept selected</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span> <span><kbd>PgUp</kbd><kbd>PgDn</kbd> page</span>`
     : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> need/want category</span>
        <span><kbd>'</kbd> note</span> <span><kbd>S</kbd> skip</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span>`;
+  $("keys").insertAdjacentHTML("afterbegin", `${views} `);
 }
 
 async function load() {
@@ -255,10 +257,18 @@ $("pr-next").addEventListener("click", () => page(1));
 
 ["a-source", "a-min", "a-max", "a-q"].forEach((id) => $(id).addEventListener("change", loadAudit));
 
-document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => { mode = b.dataset.mode; skip = []; load(); }));
+const MODES = [...document.querySelectorAll("nav button")].map((b) => b.dataset.mode);
+function show(next) { mode = next; skip = []; load().catch((e) => flash(e.message)); }
+document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => { show(b.dataset.mode); b.blur(); }));
 
 document.addEventListener("keydown", async (e) => {
   if (picker || e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === "Tab") {
+    // Views, not focus: leave focus on the page so the single-key shortcuts keep working.
+    e.preventDefault();
+    document.activeElement?.blur();
+    return show(MODES[(MODES.indexOf(mode) + (e.shiftKey ? MODES.length - 1 : 1)) % MODES.length]);
+  }
   const key = e.key.toLowerCase(), spender = config.spenders[key];
   if (mode === "predictions") {
     const row = pred.rows[pred.cur];
