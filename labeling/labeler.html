@@ -125,7 +125,7 @@ function legend() {
   $("keys").innerHTML = mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
     : mode === "predictions" ? `${common} <span><kbd>Enter</kbd> accept prediction</span> <span><kbd>Space</kbd> select</span>
        <span><kbd>A</kbd> accept selected</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span> <span><kbd>PgUp</kbd><kbd>PgDn</kbd> page</span>`
-    : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> need/want category</span>
+    : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> pick a Need/Want category (<kbd>Enter</kbd> accepts the highlighted one)</span>
        <span><kbd>'</kbd> note</span> <span><kbd>→</kbd>/<kbd>Space</kbd> next card</span> <span><kbd>←</kbd> previous card</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span>
        ${mode === "queue" ? "<span><kbd>O</kbd> order</span> <span><kbd>M</kbd> rename merchant (<kbd>Shift</kbd>+M: only this row's raw name)</span>" : ""} <span><kbd>Esc</kbd> close</span>`;
   $("keys").insertAdjacentHTML("afterbegin", `${views} `);
@@ -210,7 +210,7 @@ async function act(path, body) {
   try {
     const result = await api(path, body);
     if (result?.key && body?.merchant && pinned) pinned = result.key;  // a renamed card keeps showing under its new name
-    note = ""; await load(); if ($("notice").textContent === "Saving…") flash(""); return true; }
+    note = ""; await load(); if ($("notice").textContent === "Saving…") flash(""); return result || true; }
   catch (e) { flash(e.message); return false; }
   finally { busy = false; document.body.classList.remove("saving"); }
 }
@@ -271,20 +271,34 @@ $("rn-q").addEventListener("keydown", (e) => {
   closeOverlays(); act("/api/rename", body);
 });
 
+const categoryName = (c) => `${c.parent ? c.parent + " › " : ""}${c.name}`;
+// The picker says exactly what Enter will do; N/W pre-select a suggested built-in category.
 async function openPicker(filter, whole) {
-  picker = { filter, whole, cur: 0 };
-  $("p-hint").textContent = `${filter ? filter + " categories" : "all categories"}${whole && card.merchant ? `: native rule for ${card.merchant}` : ": this row"}`;
+  whole = whole && !!card.merchant;
+  picker = { filter, whole, cur: 0, suggested: null };
+  const n = whole ? card.rows.length + card.more : 1;
+  const action = `Set ${filter || "the category"} for ${whole ? `all ${n} rows of ${card.merchant}` : "this row"}`;
+  $("p-hint").textContent = `${action} · type to choose · Esc cancel`;
   $("p-q").value = ""; $("p-list").innerHTML = "";
   openOverlay("picker"); $("p-q").focus();
-  if (!categories.length) {
-    const path = (c) => `${c.parent || c.name} › ${c.parent ? c.name : ""}`;
-    categories = (await api("/api/categories")).sort((a, b) => path(a).localeCompare(path(b)));
+  // Fetched on every open, so categories added in Wealthfolio meanwhile appear.
+  const path = (c) => `${c.parent || c.name} › ${c.parent ? c.name : ""}`;
+  categories = (await api("/api/categories")).sort((a, b) => path(a).localeCompare(path(b)));
+  if (filter) {
+    const target = whole ? `merchant=${encodeURIComponent(card.merchant)}` : `id=${card.rows[cur].id}`;
+    const s = await api(`/api/category-suggest?${target}&needWant=${filter}`);
+    const suggested = categories.find((c) => c.id === s.categoryId);
+    if (!picker || !suggested) return picker && listPicker();
+    picker.suggested = suggested.id;
+    $("p-hint").textContent = `${action} · Enter = ${categoryName(suggested)} (${s.why}) · type to choose another · Esc cancel`;
   }
   if (picker) listPicker();
 }
 function pickerItems() {
   const q = $("p-q").value.toLowerCase();
-  return categories.filter((c) => (!picker.filter || c.needWant === picker.filter) && `${c.parent} ${c.name}`.toLowerCase().includes(q));
+  const found = categories.filter((c) => (!picker.filter || c.needWant === picker.filter) && `${c.parent} ${c.name}`.toLowerCase().includes(q));
+  const first = found.findIndex((c) => c.id === picker.suggested);
+  return first > 0 ? [found[first], ...found.slice(0, first), ...found.slice(first + 1)] : found;
 }
 function listPicker() {
   const items = pickerItems();
@@ -292,9 +306,12 @@ function listPicker() {
   $("p-list").innerHTML = items.map((c, i) => `<li data-i="${i}" class="${i === picker.cur ? "cur" : ""}">${esc(c.parent ? c.parent + " › " : "")}${esc(c.name)} <span class="muted">${esc(c.needWant || "")}</span></li>`).join("");
   $("p-list").querySelector(".cur")?.scrollIntoView({ block: "nearest" });
 }
-function choose(category) {
+async function choose(category) {
   const body = picker.whole && card.merchant ? { categoryId: category.id, merchant: card.merchant } : { categoryId: category.id, ids: [card.rows[cur].id] };
-  closeOverlays(); act("/api/category", body);
+  closeOverlays();
+  const result = await act("/api/category", body);
+  // Merchant rules only fill empty categories; rows that already had another one are left alone.
+  if (result?.kept) flash(`${categoryName(category)} set on ${result.categorized} row(s). ${result.kept} row(s) kept their existing category; change those one at a time with C, N or W.`);
 }
 function pickerKey(e) {
   const items = pickerItems();

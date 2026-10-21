@@ -16,7 +16,7 @@ after a native backup.
 |---|---|
 | Spender letter (from config) | Label the highlighted row; with **Shift**, the whole merchant, past and future |
 | **Enter** | Accept the guess |
-| **C** / **N** / **W** | Pick a category, a Need category, or a Want category (**Shift**: native rule for the merchant) |
+| **C** / **N** / **W** | Pick a category, or a Need or Want category with a suggested built-in one pre-selected (**Enter** accepts it; **Shift**: native rule for the merchant) |
 | **'** · **U** · **↑↓** | Note · undo · move between rows |
 | **→**/**Space** · **←** | Next card (asks once if the card is incomplete) · previous card |
 | **M** · **Shift+M** | Rename the merchant (an existing name merges; blank resets) · rename only this row's raw name, to split it out |

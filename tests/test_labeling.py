@@ -3,8 +3,11 @@
 import copy
 import json
 import re
+import os
 import shutil
+import socket
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -34,6 +37,7 @@ ACCOUNTS = [{"id": f"acct-{name}", "name": f"Synthetic {name}"} for name in ("an
 class FakeWealthfolio:
     def __init__(self):
         self.rows, self.event_types, self.events, self.rules, self.backups = {}, [], [], [], 0
+
 
     def add(self, row_id, account, notes, amount=20, day="2026-03-04", **extra):
         self.rows[row_id] = {
@@ -638,3 +642,61 @@ def test_the_labeled_banner_counts_only_hand_labels(world):
     assert card["labeled"] == [] and next(r for r in card["rows"] if r["id"] == "ann-hardware")["source"] == "account"
     app.handle("POST", "/api/label", {}, {"value": "Joint", "ids": ["shared-hardware-1"]})
     assert app.handle("GET", "/api/card", {"key": "HARDWARE STORE"}, {})["card"]["labeled"] == [("Joint", 1)]
+
+
+def test_merchant_categories_report_rows_that_keep_another_category(world):
+    fake, ws = world
+    ws.categorize("cat_food_coffee", ids=["shared-hardware-1"])
+    result = ws.categorize("cat_groceries", merchant="HARDWARE STORE")
+    assert result["kept"] == 1 and result["categorized"] == 1
+    assert ws.rows["shared-hardware-1"]["categoryIds"] == ["cat_food_coffee"]
+
+
+def test_need_and_want_suggest_a_built_in_category(world):
+    fake, ws = world
+    app = Labeler(ws)
+    suggest = lambda **q: app.handle("GET", "/api/category-suggest", q, {})
+    assert suggest(merchant="HARDWARE STORE", needWant="Need") == {"categoryId": "cat_groceries", "why": "first Need category", "rows": 2}
+    ws.categorize("cat_groceries", ids=["shared-hardware-1"])
+    assert suggest(merchant="HARDWARE STORE", needWant="Need")["why"] == "already used on this merchant"
+    ws.categorize("cat_food_coffee", ids=["ann-0"])
+    assert suggest(id="shared-coffee", needWant="Want") == {
+        "categoryId": "cat_food_coffee", "why": "most used on merchants with the same words", "rows": 1}
+    assert suggest(id="shared-coffee", needWant="Need")["categoryId"] == "cat_groceries"
+
+@pytest.mark.parametrize("host, alive, reclaimed", [
+    ("here", False, True),    # this host, process gone: abandoned
+    ("here", True, False),    # this host, process alive
+    ("other", False, False),  # another host (say the sync container): its PIDs mean nothing here
+    (None, False, False),     # an old lock without a host
+])
+def test_only_locks_abandoned_on_this_host_are_reclaimed(tmp_path, host, alive, reclaimed):
+    path = tmp_path / "maintenance" / "wealthfolio-write.lock"
+    path.parent.mkdir()
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    lock = {"holder": "crashed", "pid": os.getpid() if alive else dead.pid,
+            "host": {"here": socket.gethostname(), "other": "container-1"}.get(host)}
+    path.write_text(json.dumps({k: v for k, v in lock.items() if v is not None}), encoding="utf-8")
+    if reclaimed:
+        with write_lock(tmp_path, "next"):
+            assert json.loads(path.read_text(encoding="utf-8"))["holder"] == "next"
+        assert not path.exists()
+    else:
+        with pytest.raises(Locked, match="crashed"):
+            with write_lock(tmp_path, "next"):
+                pass
+        assert json.loads(path.read_text(encoding="utf-8"))["holder"] == "crashed"
+
+
+def test_shutdown_stops_the_server_between_requests(world):
+    fake, ws = world
+    server = make_server(ws)
+    runner = threading.Thread(target=server.serve_forever)
+    runner.start()
+    request = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/api/shutdown", data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request) as response:
+        assert response.status == 200
+    runner.join(timeout=5)
+    assert not runner.is_alive()
