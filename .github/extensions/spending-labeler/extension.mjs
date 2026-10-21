@@ -21,7 +21,8 @@ function start(dataDir) {
         child.stderr.on("data", (chunk) => { errors = (errors + chunk).slice(-2000); });
         child.stdout.once("data", (chunk) => {
             clearTimeout(timer);
-            done({ child, url: String(chunk).trim().split(/\r?\n/)[0] });
+            child.url = String(chunk).trim().split(/\r?\n/)[0];
+            done({ child, url: child.url });
         });
         child.once("exit", (code) => {
             clearTimeout(timer);
@@ -77,6 +78,20 @@ await joinSession({
     ],
 });
 
+// Ask each server to stop between requests, so a write in flight finishes and releases the shared
+// lock; kill only if that fails. A hard kill is still safe: the next writer reclaims a lock whose
+// process is gone.
+async function stopAll() {
+    await Promise.all([...children].map(async (child) => {
+        const exited = new Promise((resolve) => child.once("exit", resolve));
+        try {
+            if (child.url) await fetch(`${child.url}api/shutdown`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(10_000) });
+            await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 10_000))]);
+        } catch {}
+        if (children.has(child)) child.kill();
+    }));
+}
+for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => stopAll().finally(() => process.exit(0)));
 process.on("exit", () => {
     for (const child of children) child.kill();
 });

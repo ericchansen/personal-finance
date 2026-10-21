@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import signal
+import threading
 from collections import Counter
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -184,6 +186,10 @@ class Labeler:
             return self.audit(query)
         if path == "/api/predictions":
             return self.predictions(query)
+        if path == "/api/category-suggest":
+            ids = [query["id"]] if query.get("id") else [i for i, shown in ws.display.items() if shown == query.get("merchant")]
+            category, why = ws.suggest_category(ids, query.get("needWant") or None)
+            return {"categoryId": category, "why": why, "rows": len(ids)}
         if path == "/api/suggest":
             return self.suggest(query.get("merchant", ""))
         if path == "/api/history":
@@ -233,6 +239,10 @@ def make_server(workspace: Workspace, port: int = 0) -> HTTPServer:
             if method == "POST" and self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self._send(415, {"error": "JSON only"})
             url = urllib.parse.urlsplit(self.path)
+            if url.path == "/api/shutdown" and method == "POST":
+                # Requests are served one at a time, so any write in flight has finished and released the lock.
+                self._send(200, {})
+                return threading.Thread(target=self.server.shutdown, daemon=True).start()
             if url.path == "/":
                 return self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
             query = dict(urllib.parse.parse_qsl(url.query))
@@ -258,5 +268,11 @@ def make_server(workspace: Workspace, port: int = 0) -> HTTPServer:
 
 def serve(workspace: Workspace, port: int = 0) -> None:
     server = make_server(workspace, port)
+
+    def stop(*_):
+        raise SystemExit(0)  # unwinds a write in progress, which releases the lock
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
     print(f"http://127.0.0.1:{server.server_address[1]}/", flush=True)
     server.serve_forever()

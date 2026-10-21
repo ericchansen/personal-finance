@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import re
+import socket
 import uuid
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -33,16 +35,56 @@ class Locked(RuntimeError):
     pass
 
 
+def running(pid: int) -> bool:
+    """Whether a process exists on this host. Unknowable answers count as running."""
+    if os.name == "nt":  # os.kill would terminate the process on Windows
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process
+        code = ctypes.c_ulong()
+        alive = not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259  # STILL_ACTIVE
+        kernel.CloseHandle(handle)
+        return alive
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def abandoned(text: str) -> bool:
+    """A lock left by a process that died on this host. Locks from another host (say the sync container,
+    whose PIDs mean nothing here) or without a host are never judged abandoned."""
+    try:
+        lock = json.loads(text)
+        return lock.get("host") == socket.gethostname() and isinstance(lock.get("pid"), int) and not running(lock["pid"])
+    except ValueError:
+        return False
+
+
 @contextmanager
 def write_lock(data_dir: Path, holder: str):
-    """The shared write lock: exclusive create, and only ever remove our own."""
+    """The shared write lock: exclusive create, and only ever remove our own or an abandoned one."""
     path = data_dir / LOCK
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = json.dumps({"holder": holder, "pid": os.getpid(), "at": now()})
-    try:
-        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise Locked(path.read_text(encoding="utf-8", errors="replace")[:300]) from None
+    token = json.dumps({"holder": holder, "host": socket.gethostname(), "pid": os.getpid(), "at": now()})
+    for attempt in range(2):
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            held = path.read_text(encoding="utf-8", errors="replace")
+            if attempt or not abandoned(held):
+                raise Locked(held[:300]) from None
+            try:
+                if path.read_text(encoding="utf-8", errors="replace") == held:  # not someone's fresh lock
+                    path.unlink()
+            except FileNotFoundError:
+                pass  # exclusive create below still decides between two reclaimers
     with os.fdopen(handle, "w", encoding="utf-8") as out:
         out.write(token)
     try:
@@ -390,18 +432,36 @@ class Workspace:
         self.ledger.append(entries)
         return self.sync([e["activityId"] for e in entries])
 
+    def suggest_category(self, ids, need_want: str | None = None) -> tuple[str | None, str]:
+        """A built-in category to pre-select, and why: one already used on this merchant, else the one most
+        used on rows sharing a word with it, else the first top-level category of that need/want group."""
+        fits = lambda c: need_want is None or self.need_want({"categoryIds": [c]}) == need_want
+        keys = {self.merchant[i] for i in ids if self.merchant[i]}
+        same = [i for i, key in self.merchant.items() if key in keys] or list(ids)
+        words = {f for i in ids for f in self.features[i] if f.startswith("w:")}
+        similar = [i for i, found in self.features.items() if i not in same and words.intersection(found)]
+        for rows, why in ((same, "already used on this merchant"), (similar, "most used on merchants with the same words")):
+            votes = Counter(c for i in rows for c in self.rows[i]["categoryIds"] if fits(c))
+            if votes:
+                return votes.most_common(1)[0][0], why
+        top = sorted((c for c in self.categories.values() if not c.get("parentId") and fits(c["id"])), key=lambda c: c.get("sortOrder", 0))
+        return (top[0]["id"], f"first {need_want} category" if need_want else "first category") if top else (None, "")
+
     def categorize(self, category_id: str, *, ids=(), merchant: str = "") -> dict:
         action = uuid.uuid4().hex[:12]
         base = {"field": "category", "value": category_id, "by": self.by, "action": action}
         if merchant:
             # One native rule per raw key, so renaming or merging never changes what a rule matches.
             existing = {r["id"]: r for r in self.client.get("/spending/rules")}
-            entries, touched = [], {}
+            entries, touched, kept = [], {}, 0
             for key in self.keys_of(merchant):
                 pattern = merchant_pattern(key)
                 ids = [i for i, r in self.rows.items() if self.merchant[i] == key or re.search(pattern, r.get("notes") or "")]
                 self.refetch(ids)
                 previous = {i: None for i in ids if not self.rows[i]["categoryIds"]}
+                # Rules only fill empty categories; say how many of this merchant's rows keep another one.
+                kept += sum(1 for i in ids if self.merchant[i] == key and self.rows[i]["categoryIds"]
+                            and category_id not in self.rows[i]["categoryIds"])
                 rule_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"spending-labeler/{key}"))
                 rule = self.client.post("/spending/rules/upsert", {
                     "id": rule_id, "name": f"Merchant {key}", "pattern": pattern, "matchType": "regex",
@@ -413,7 +473,8 @@ class Workspace:
             self.client.post("/spending/rules/rerun", {"onlyUncategorized": True})
             self.ledger.append(entries)
             self.refetch(touched)
-            return {"rules": [e["ruleId"] for e in entries], "categorized": sum(1 for i in touched if self.rows[i]["categoryIds"])}
+            return {"rules": [e["ruleId"] for e in entries], "kept": kept,
+                    "categorized": sum(1 for i in touched if self.rows[i]["categoryIds"])}
         entries = []
         for row_id in ids:
             previous = (self.rows[row_id]["categoryIds"] or [None])[0]
