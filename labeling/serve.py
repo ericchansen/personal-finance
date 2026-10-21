@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -72,6 +73,11 @@ class Labeler:
             "rows": [self.ws.view(i, blind=blind) for i in ids[:60]], "more": max(0, len(ids) - 60),
             "labeledElsewhere": len(others),
             "total": round(sum(abs(float(rows[i].get("amount") or 0)) for i in ids), 2),
+            # The merchant's predictions and the same confidence the queue sorts by; hidden for blind checks.
+            "summary": None if blind else {
+                "predicted": Counter(self.ws.guess[i]["value"] for i in ids).most_common(),
+                "confidence": round(group["confidence"][0], 3),
+            },
         }}
 
     def audit(self, query: dict) -> list[dict]:
@@ -100,7 +106,7 @@ class Labeler:
                 counts[value] += 1
                 merchants[value].add(ws.merchant[row_id])
             classes = {value: {"examples": counts[value], "merchants": len(merchants[value])} for value in ws.spenders}
-            self._summary = {**ws.evaluate(), "classes": classes, "warnings": [
+            self._summary = {**ws.evaluate(), "classes": classes, "autoApply": ws.auto_apply, "warnings": [
                 f"{value} is barely learned: {c['examples']} label(s) from {c['merchants']} merchant(s), so its "
                 "predictions are unreliable until you label more of it." for value, c in classes.items() if c["merchants"] < 20
             ]}

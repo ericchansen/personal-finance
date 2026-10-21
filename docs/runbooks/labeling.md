@@ -36,4 +36,5 @@ and `eval-<version>.json`. `python -m labeling status` summarizes them.
 
 Label about 100 rows in the **Check set** tab, which shows shared-card rows without the guess
 and never trains on them. Then try `threshold` values in `config.json` with
-`python -m labeling apply --dry-run` and keep the lowest whose `checkSet.precisionAtThreshold` is at least 0.95.
+`python -m labeling apply --dry-run` and keep the lowest whose `checkSet.precisionAtThreshold` is at least 0.95. Until the check set has
+`minCheckLabels` (default 30) confident labels at that precision, no prediction is applied automatically.

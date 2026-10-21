@@ -38,6 +38,13 @@
   #picker li { padding: 2px 6px; cursor: pointer; }
   #picker li.cur { background: var(--true-color-blue-muted, #ddf4ff); }
   .hidden { display: none !important; }
+  .conf { display: inline-block; width: 44px; height: 6px; margin-right: 6px; border-radius: 3px; vertical-align: middle; overflow: hidden;
+          background: var(--border-color-default, #d0d7de); }
+  .conf i { display: block; height: 100%; }
+  .conf.low i { background: var(--true-color-red, #cf222e); }
+  .conf.mid i { background: var(--true-color-yellow, #bf8700); }
+  .conf.high i { background: var(--true-color-green, #1a7f37); }
+  .labeled { font-weight: var(--font-weight-semibold, 600); }
 </style>
 </head>
 <body>
@@ -127,20 +134,37 @@ async function load() {
   render();
 }
 
+// Confidence as a percentage plus a short bar banded low/medium/high, so it scans at a glance.
+function confCell(c) {
+  if (c == null) return "";
+  const band = c < 0.65 ? "low" : c < 0.85 ? "mid" : "high";
+  return `<span class="conf ${band}" title="${band} confidence"><i style="width:${Math.round(c * 100)}%"></i></span>${Math.round(c * 100)}%`;
+}
+// A row's spender: its label (with source) when it has one, otherwise the model's prediction.
+function spenderCells(r) {
+  if (r.spender) return `<td class="labeled">${esc(r.spender)} <span class="pill">${esc(r.source)}</span></td><td class="num">${confCell(r.confidence)}</td><td></td>`;
+  const g = r.guess;
+  return `<td>${esc(g.value)}</td><td class="num">${confCell(g.confidence)}</td><td class="desc muted" title="${esc(g.reasons.join("\n"))}">${esc(g.reasons[0] || "")}</td>`;
+}
+
 function render() {
   if (!card) { $("main").innerHTML = `<h1>Nothing left to label here.</h1>`; return; }
-  const row = card.rows[cur], g = row.guess;
+  const row = card.rows[cur], s = card.summary, n = card.rows.length + card.more;
   const title = card.merchant || row.notes || `(no description) ${row.type.toLowerCase()}`;
   $("main").innerHTML = `
     <h1>${esc(title)}</h1>
-    <div class="muted">${card.rows.length + card.more} unlabeled row(s), ${money(card.total)}${card.labeledElsewhere ? `, ${card.labeledElsewhere} more from this merchant already labeled` : ""}</div>
+    <div class="muted">${n} unlabeled row(s), ${money(card.total)}${card.labeledElsewhere ? `, ${card.labeledElsewhere} more from this merchant already labeled` : ""}</div>
     <p>${card.blind ? `<span class="pill">blind check: no guess shown</span>`
-      : `<span class="guess">Guess <b>${esc(g.value)}</b> ${(g.confidence * 100).toFixed(0)}%</span>
-         <ul class="reasons muted">${g.reasons.map((r) => `<li>${esc(r)}</li>`).join("") || "<li>no informative features yet</li>"}</ul>`}</p>
+      : `<span class="guess">Predicted <b>${esc(s.predicted[0][0])}</b> ${confCell(s.confidence)}</span>
+         <span class="muted">${n} rows: ${s.predicted.map(([v, c]) => `${c} ${esc(v)}`).join(" / ")} predicted · merchant confidence is the amount-weighted mean</span>
+         <div class="muted">Why the highlighted row looks like ${esc(row.guess.value)}:</div>
+         <ul class="reasons muted">${row.guess.reasons.map((r) => `<li>${esc(r)}</li>`).join("") || "<li>no informative features yet</li>"}</ul>`}</p>
     ${note ? `<p>Note: <i>${esc(note)}</i></p>` : ""}
-    <table><tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Category</th><th>Need/Want</th></tr>
+    <table><tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Category</th><th>Need/Want</th>
+      ${card.blind ? "" : "<th>Prediction</th><th class=\"num\">Confidence</th><th>Top reason</th>"}</tr>
     ${card.rows.map((r, i) => `<tr class="${i === cur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td>
-      <td class="desc">${esc(r.notes)}</td><td>${esc(r.category) || '<span class="muted">none</span>'}</td><td>${esc(r.needWant) || ""}</td></tr>`).join("")}
+      <td class="desc">${esc(r.notes)}</td><td>${esc(r.category) || '<span class="muted">none</span>'}</td><td>${esc(r.needWant) || ""}</td>
+      ${card.blind ? "" : spenderCells(r)}</tr>`).join("")}
     </table>${card.more ? `<p class="muted">and ${card.more} more</p>` : ""}`;
 }
 
@@ -247,7 +271,8 @@ async function loadPredictions() {
   const classes = Object.entries(m.classes).map(([v, c]) => `${v} ${c.examples.toLocaleString()} labels / ${c.merchants} merchants`).join(" · ");
   $("pr-model").innerHTML = `Model <b>${esc(m.model)}</b>, trained on ${m.examples.toLocaleString()} labels (${esc(classes)}).
     Accuracy: later period ${pct(m.laterPeriod)}, unseen merchants ${pct(m["unseenMerchants.purchaser"])}, blind check set ${pct(m.checkSet)}.
-    Labels apply automatically only at ${Math.round(data.threshold * 100)}%+ confidence. ${m.warnings.map((w) => `<b>${esc(w)}</b>`).join(" ")}`;
+    ${m.autoApply ? `Predictions at ${Math.round(data.threshold * 100)}%+ confidence apply automatically.`
+      : `Predictions apply automatically only after the blind check set shows at least 95% precision at ${Math.round(data.threshold * 100)}%+ confidence.`} ${m.warnings.map((w) => `<b>${esc(w)}</b>`).join(" ")}`;
   $("counts").textContent = `${data.total.toLocaleString()} unlabeled row(s) match · ${pred.selected.size} selected`;
   renderPredictions();
 }
@@ -259,7 +284,7 @@ function renderPredictions() {
     pred.rows.map((r, i) => `<tr class="${i === pred.cur ? "cur" : ""}" data-i="${i}">
       <td><input type="checkbox" data-i="${i}" ${pred.selected.has(r.id) ? "checked" : ""}></td><td>${r.date}</td>
       <td class="desc">${esc(r.notes)}</td><td>${esc(r.account)}</td><td class="num">${money(r.amount)}</td><td>${esc(r.category)}</td>
-      <td>${esc(r.guess.value)}</td><td class="num">${Math.round(r.guess.confidence * 100)}%</td>
+      <td>${esc(r.guess.value)}</td><td class="num">${confCell(r.guess.confidence)}</td>
       <td class="desc muted" title="${esc(r.guess.reasons.join("\n"))}">${esc(r.guess.reasons[0] || "")}</td></tr>`).join("");
   $("pr-accept").textContent = `Accept selected (${pred.selected.size})`;
   $("pr-page").textContent = pred.total ? `${pred.offset + 1}–${pred.offset + pred.rows.length} of ${pred.total.toLocaleString()}` : "none";

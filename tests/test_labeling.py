@@ -116,7 +116,7 @@ def world(tmp_path):
             "acct-ann": {"default": "Ann"}, "acct-ben": {"default": "Ben"},
             "acct-checking": {"default": "Ben", "patterns": {r"(?i)\bATM\b": "Joint"}},
         },
-        "checkAccounts": ["acct-shared"], "checkSize": 2,
+        "checkAccounts": ["acct-shared"], "checkSize": 2, "minCheckLabels": 0,
     }), encoding="utf-8")
     ws = Workspace(tmp_path, fake, by="test")
     setup(ws)
@@ -185,7 +185,10 @@ def test_naive_bayes_calibrates_monotonically_and_explains():
         [(["w:A", "w:Z"] if i == 0 else ["w:A"], "Ann", 1.0) for i in range(30)] + [(["w:J"], "Joint", 1.0)])
     best, _, reasons, _ = tiny.predict(["w:J", "w:Z"])
     assert best == "Joint" and [f for f, _, _ in reasons] == ["w:J"]
-    assert model.calibration == sorted(model.calibration)
+    platt = nb.NaiveBayes(["Ann", "Ben"])
+    platt.fit_calibration([(p / 100, i < p - 20) for p in range(40, 100) for i in range(100)])
+    grid = [platt.calibrate(p / 100) for p in range(40, 100)]
+    assert grid == sorted(grid) and len(set(grid)) > 40 and abs(platt.calibrate(0.9) - 0.7) < 0.05
     assert version == nb.train(["Ann", "Ben", "Joint"], list(reversed(examples)))[1]
     assert nb.metrics([("Ann", 0.95, "Ann"), ("Ben", 0.5, "Ann")], 0.9)["precisionAtThreshold"] == 1.0
 
@@ -470,7 +473,7 @@ def test_rereading_picks_up_changes_made_outside_the_labeler(world):
 def test_confidence_orders_break_calibration_ties_with_the_raw_posterior(world):
     fake, ws = world
     model = nb.NaiveBayes(["Ann", "Ben"]).fit([(["w:A"], "Ann", 1.0)] * 9 + [(["w:A"], "Ben", 1.0), (["w:B"], "Ben", 1.0)])
-    model.calibration = [0.6] * nb.BINS
+    model.calibration = [0.0, nb.logit(0.6)]
     sure, unsure = model.predict(["w:A", "w:A"]), model.predict(["w:B"])
     assert sure[1] == unsure[1] == 0.6 and sure[3] != unsure[3]
     for i, raw in ((1, 0.70), (2, 0.55), (3, 0.90)):
@@ -497,3 +500,48 @@ def test_empty_notes_fall_back_to_a_private_export_description(world):
     ws.load()
     assert ws.merchant["legacy"] == "RIVER HOMES" and ws.view("legacy")["notes"] == "ACH Withdrawal RIVER HOMES 0099"
     assert ws.merchant["blank"] == "" and fake.rows["legacy"]["notes"] is None
+
+
+
+def test_filler_words_are_not_features_and_weak_evidence_never_leads():
+    row = {"activityType": "WITHDRAWAL", "notes": "Unique Vac Rep of Sand XXXX4115 TO THE CO", "amount": "9", "activityDate": "2026-03-02"}
+    words = {f for f in features(row) if f.startswith("w:")}
+    assert words == {"w:UNIQUE", "w:VAC", "w:REP", "w:SAND"}
+    model = nb.NaiveBayes(["Ann", "Ben"]).fit(
+        [(["w:RARE", "w:COMMON"], "Ann", 1.0)] + [(["w:COMMON"], "Ann", 1.0)] * 9 + [(["w:OTHER"], "Ben", 1.0)] * 30)
+    _, _, reasons, _ = model.predict(["w:RARE", "w:COMMON"])
+    assert [f for f, _, _ in reasons] == ["w:COMMON", "w:RARE"]
+
+
+
+def test_model_labels_wait_for_check_set_evidence(world):
+    fake, ws = world
+    fake.add("card-coffee", "card", "SQ *EAST COFFEE SPRINGFIELD ZZ", amount=6)
+    ws.config["minCheckLabels"] = 2
+    ws.refresh()
+    assert not ws.auto_apply and ws.resolve("card-coffee") is None
+    ws.sync(ws.rows)
+    assert fake.rows["card-coffee"]["eventId"] is None
+    for row_id in ws.check_ids():
+        ws.ledger.append([{"field": "spender", "activityId": row_id, "value": ws.guess[row_id]["value"],
+                           "source": "user", "check": True, "by": "t"}])
+    ws.threshold = min(ws.guess[i]["confidence"] for i in [*ws.check_ids(), "card-coffee"])
+    ws.train()
+    assert ws.auto_apply and ws.resolve("card-coffee")["source"] == "model"
+
+
+def test_queue_cards_show_each_row_prediction_and_the_merchant_summary(world):
+    fake, ws = world
+    for i in range(3):
+        fake.add(f"vendor-{i}", "card", f"RIVER VENDOR {i}", amount=10 * (i + 1))
+    ws.refresh()
+    app = Labeler(ws)
+    card = app.handle("GET", "/api/card", {"order": "merchant"}, {})["card"]
+    while card["merchant"] != "RIVER VENDOR":
+        card = app.handle("GET", "/api/card", {"order": "merchant", "skip": card["key"]}, {})["card"]
+    group = next(g for g in ws.queue(order="merchant") if g["key"] == "RIVER VENDOR")
+    assert sum(count for _, count in card["summary"]["predicted"]) == len(group["ids"]) == 3
+    assert card["summary"]["confidence"] == round(group["confidence"][0], 3)
+    assert all(r["guess"]["value"] in ws.spenders and r["guess"]["reasons"] is not None for r in card["rows"])
+    blind = app.handle("GET", "/api/card", {"mode": "check"}, {})["card"]
+    assert blind["summary"] is None and all(r["guess"] is None for r in blind["rows"])
