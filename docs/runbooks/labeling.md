@@ -18,6 +18,7 @@ after a native backup.
 | **Enter** | Accept the guess |
 | **C** / **N** / **W** | Pick a category, a Need category, or a Want category (**Shift**: native rule for the merchant) |
 | **'** · **S** · **U** · **↑↓** | Note · skip · undo · move between rows |
+| **O** · **Tab** · **Esc** | Cycle the queue order (remembered) · next view (**Shift+Tab** back) · close a picker or box |
 
 **Predictions** lists every unlabeled row with the model's guess and confidence. Sort by any
 column and filter; **Enter** accepts a guess, and **Space** then **A** accepts the selected rows.

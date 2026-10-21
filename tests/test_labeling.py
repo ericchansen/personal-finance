@@ -3,13 +3,17 @@
 import copy
 import json
 import re
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import labeling
 from labeling import model as nb
 from labeling.__main__ import setup
 from labeling.features import features, merchant_key, merchant_pattern
@@ -403,3 +407,46 @@ def test_accepting_predictions_confirms_them_with_model_provenance(world):
     assert first["id"] not in {r["id"] for r in app.handle("GET", "/api/predictions", {}, {})["rows"]}
     app.handle("POST", "/api/undo", {}, {})
     assert fake.rows[first["id"]]["eventId"] is None
+
+@pytest.mark.parametrize("order, first", [
+    ("impact", "BIG OLD"), ("amount", "BIG OLD"), ("newest", "NEW SMALL"), ("oldest", "BIG OLD"),
+    ("merchant", "BIG OLD"), ("low-confidence", None), ("high-confidence", None),
+])
+def test_queue_orders_keep_deferred_merchants_last(world, order, first):
+    fake, ws = world
+    fake.add("old", "shared", "BIG OLD 1", amount=900, day="2023-05-01")
+    fake.add("new", "shared", "NEW SMALL 1", amount=2, day="2026-04-01")
+    fake.add("deferred", "shared", "ZZ DEFER 1", amount=5000, day="2026-05-01")
+    ws.refresh()
+    ws.config["deferMerchants"] = ["^ZZ DEFER"]
+    keys = [g["key"] for g in ws.queue(order=order)]
+    assert keys[-1] == "ZZ DEFER" and (first is None or keys[0] == first)
+    if order.endswith("confidence"):
+        conf = [max(ws.guess[i]["confidence"] for i in g["ids"]) for g in ws.queue(order=order)[:-1]]
+        assert conf == sorted(conf, reverse=order == "high-confidence")
+
+
+def test_rows_that_do_not_count_as_spending_need_no_spender(world):
+    fake, ws = world
+    fake.add("funding", "shared", "WALLET FUNDING 1", amount=50, visibleSpendingAmount=0)
+    ws.refresh()
+    assert not ws.unlabeled("funding")
+    assert "WALLET FUNDING" not in {g["key"] for g in ws.queue()}
+    assert "funding" not in {r["id"] for r in Labeler(ws).handle("GET", "/api/predictions", {"limit": "500"}, {})["rows"]}
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="needs node")
+def test_typing_and_open_overlays_swallow_shortcuts():
+    page = Path(labeling.__file__).with_name("labeler.html").read_text(encoding="utf-8")
+    source = re.search(r"function routeKey\(.*?\n}", page, re.S).group(0)
+    cases = [
+        ("e", {}, "shortcut"), ("Tab", {}, "shortcut"), ("e", {"modifier": True}, "ignore"),
+        ("e", {"typing": True}, "ignore"), ("Enter", {"typing": True}, "ignore"), ("Escape", {"typing": True}, "close"),
+        ("e", {"overlay": "note"}, "ignore"), ("Escape", {"overlay": "note"}, "close"),
+        ("e", {"overlay": "picker"}, "type"), ("u", {"overlay": "picker", "typing": True}, "type"),
+        ("ArrowDown", {"overlay": "picker"}, "picker"), ("Enter", {"overlay": "picker"}, "picker"),
+        ("Escape", {"overlay": "picker"}, "close"),
+    ]
+    script = f"{source}\nconsole.log(JSON.stringify({json.dumps([[k, s] for k, s, _ in cases])}.map(([k, s]) => routeKey(k, s))));"
+    routes = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
+    assert routes == [expected for *_, expected in cases]

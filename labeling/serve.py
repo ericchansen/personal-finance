@@ -44,8 +44,8 @@ class Labeler:
                 self.version += 1
             return result
 
-    def card(self, mode: str, skip: set[str]) -> dict:
-        queue = self.ws.queue(mode)
+    def card(self, mode: str, skip: set[str], order: str = "impact") -> dict:
+        queue = self.ws.queue(mode, order)
         group = next((g for g in queue if g["key"] not in skip), None)
         rows = self.ws.rows
         counts = {
@@ -134,7 +134,8 @@ class Labeler:
         if path == "/api/version":
             return {"version": self.version}
         if path == "/api/card":
-            return self.card(query.get("mode", "queue"), set(filter(None, query.get("skip", "").split("\n"))))
+            return self.card(query.get("mode", "queue"), set(filter(None, query.get("skip", "").split("\n"))),
+                             query.get("order", "impact"))
         if path == "/api/categories":
             names = {i: c["name"] for i, c in ws.categories.items()}
             return [{"id": i, "name": c["name"], "parent": names.get(c.get("parentId") or "", ""),

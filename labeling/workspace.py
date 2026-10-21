@@ -411,10 +411,19 @@ class Workspace:
         return pool[: int(self.config.get("checkSize", 100))]
 
     def unlabeled(self, row_id: str) -> bool:
+        """Needs a spender: counts as spending (Wealthfolio's excluded categories do not) and has none."""
+        if self.rows[row_id].get("visibleSpendingAmount", 1) == 0:
+            return False
         label = self.resolve(row_id)
         return not self.foreign_event(row_id) and not (label and label["value"])
 
-    def queue(self, mode: str = "queue") -> list[dict]:
+    # Queue orders: the merchant aggregate to sort by, and whether larger comes first.
+    ORDERS = {
+        "impact": ("value", True), "low-confidence": ("confidence", False), "high-confidence": ("confidence", True),
+        "newest": ("last", True), "oldest": ("first", False), "amount": ("total", True), "merchant": ("key", False),
+    }
+
+    def queue(self, mode: str = "queue", order: str = "impact") -> list[dict]:
         if mode == "check":
             done = {i for i, _ in self.check}
             return [{"key": f"#{i}", "ids": [i], "value": 0} for i in self.check_ids() if i not in done]
@@ -423,12 +432,17 @@ class Workspace:
             if not self.unlabeled(row_id):
                 continue
             key = self.merchant[row_id] or f"#{row_id}"
-            group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0})
+            day, amount, confidence = row["activityDate"][:10], abs(float(row.get("amount") or 0)), self.guess[row_id]["confidence"]
+            group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0, "total": 0.0, "confidence": 0.0, "first": day, "last": day})
             group["ids"].append(row_id)
-            group["value"] += (1 - self.guess[row_id]["confidence"]) * abs(float(row.get("amount") or 0))
+            group["value"] += (1 - confidence) * amount
+            group["total"] += amount
+            group["confidence"] = max(group["confidence"], confidence)
+            group["first"], group["last"] = min(group["first"], day), max(group["last"], day)
+        field, descending = self.ORDERS.get(order, self.ORDERS["impact"])
+        ordered = sorted(groups.values(), key=lambda g: g[field], reverse=descending)
         defer = [re.compile(p) for p in self.config.get("deferMerchants", [])]
-        later = lambda key: any(p.search(key) for p in defer)
-        return sorted(groups.values(), key=lambda g: (later(g["key"]), -g["value"]))
+        return sorted(ordered, key=lambda g: any(p.search(g["key"]) for p in defer))
 
     def view(self, row_id: str, *, blind: bool = False) -> dict:
         row = self.rows[row_id]
