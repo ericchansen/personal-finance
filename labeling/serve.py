@@ -117,20 +117,26 @@ class Labeler:
         }}
 
     def audit(self, query: dict) -> list[dict]:
-        source = query.get("source", "")
+        """Labeled rows, filtered by who made the spender or category label (you, an agent, a model, Wealthfolio)."""
+        origin = query.get("origin", "")
         low, high = float(query.get("min") or 0), float(query.get("max") or 1)
         text = (query.get("q") or "").upper()
         found = []
         for row_id in self.ws.rows:
             item = self.ws.view(row_id)
-            conf = item["confidence"] if item["source"] == "model" else 1.0
-            if source and item["source"] != source:
+            if origin and origin not in (item.get("spenderOrigin"), item.get("categoryOrigin")):
                 continue
-            if not low <= conf <= high or (text and text not in (item["notes"] + item["account"]).upper()):
+            if not (item["spender"] or item["category"]) or (item["confidence"] is not None and not low <= item["confidence"] <= high):
+                continue
+            if text and text not in (item["notes"] + item["account"] + item["name"]).upper():
                 continue
             found.append(item)
-        found.sort(key=lambda i: (i["confidence"] if i["confidence"] is not None else 1.0, i["date"]))
-        return found[:300]
+        found.sort(key=lambda i: (i["confidence"] if i["confidence"] is not None else 1.0, i["name"], i["date"]))
+        return found[:1000]
+
+    def origins(self) -> list[str]:
+        views = (self.ws.view(i) for i in self.ws.rows)
+        return sorted({o for v in views for o in (v.get("spenderOrigin"), v.get("categoryOrigin")) if o})
 
     def summary(self) -> dict:
         """The model version, its evaluation, and how many labels and merchants teach each spender."""
@@ -195,6 +201,8 @@ class Labeler:
                      "needWant": ws.need_want({"categoryIds": [i]})} for i, c in ws.categories.items()]
         if path == "/api/audit":
             return self.audit(query)
+        if path == "/api/origins":
+            return self.origins()
         if path == "/api/rules":
             return ws.rules_list()
         if path == "/api/predictions":
