@@ -26,6 +26,10 @@ after a native backup.
 column and filter; **Enter** accepts a guess, and **Space** then **A** accepts the selected rows.
 **Audit** filters labels by source and confidence; **H** shows a row's history.
 
+**Rules** lists every rule: Wealthfolio's category rules (including presets), which Wealthfolio applies on
+import, and the labeler's merchant spender labels and names, applied after each daily sync. Each card lists
+the rules for its merchant. **X** twice removes one; a removed Wealthfolio rule can be restored with **U**.
+
 A card stays on screen after labeling. It is complete when every row has a spender and a category
 (which gives need or want); a merchant labeled by hand stays queued until it has both.
 

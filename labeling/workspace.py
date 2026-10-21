@@ -28,6 +28,32 @@ SPENDING = "spending_categories"
 LOCK = Path("maintenance") / "wealthfolio-write.lock"
 FIELD = "spender"
 NAME = "merchant-name"  # ledger field: a display name for a raw merchant key
+RULE_FIELDS = ("id", "name", "pattern", "matchType", "taxonomyId", "categoryId", "activityType", "amountOp", "amountValue",
+               "amountValue2", "priority", "isGlobal", "accountId", "presetId", "presetRuleKey", "presetVersion")
+AMOUNT_OPS = {"eq": lambda a, v, w: a == v, "gt": lambda a, v, w: a > v, "gte": lambda a, v, w: a >= v,
+              "lt": lambda a, v, w: a < v, "lte": lambda a, v, w: a <= v,
+              "between": lambda a, v, w: w is not None and v <= a <= w}
+
+
+def rule_matches(rule: dict, row: dict, notes: str) -> bool:
+    """Wealthfolio 3.10's categorization matcher (`match_compiled`), for one rule and one activity."""
+    if not rule.get("isGlobal") and rule.get("accountId") != row["accountId"]:
+        return False
+    if rule.get("activityType") and rule["activityType"] != row["activityType"]:
+        return False
+    if rule.get("amountOp"):
+        if rule.get("amountValue") is None or not AMOUNT_OPS[rule["amountOp"]](
+                abs(float(row.get("amount") or 0)), float(rule["amountValue"]),
+                None if rule.get("amountValue2") is None else float(rule["amountValue2"])):
+            return False
+    pattern, kind = rule.get("pattern") or "", rule.get("matchType")
+    if kind == "regex":
+        try:
+            return re.search(pattern, notes) is not None
+        except re.error:
+            return False  # Rust-only syntax; Wealthfolio would evaluate it, so this is a best effort
+    upper, wanted = notes.upper(), pattern.upper()
+    return {"contains": wanted in upper, "starts_with": upper.startswith(wanted), "exact": upper == wanted}.get(kind, False)
 TRAIN_WEIGHT = {"user": 1.0, "wealthfolio-ui": 1.0, "merchant": 1.0, "cardmember": 0.3, "account": 0.3}
 
 
@@ -174,6 +200,7 @@ class Workspace:
                 current = self.rows[row["id"]]
                 current["eventId"] = row.get("eventId")
                 current["categoryIds"] = self._categories(row)
+                current["assignments"], current["splits"] = row["assignments"], row["splits"]
                 self.features[row["id"]] = self._row_features(row["id"])
 
     def signature(self) -> int:
@@ -197,6 +224,16 @@ class Workspace:
                         if (line.get(source.get("merchant", "")) or "").strip():
                             names[key] = line[source["merchant"]].strip()
         return descriptions, names
+
+    def match_rules(self) -> None:
+        """Which native rule Wealthfolio would apply to each row (it records only that *a* rule did)."""
+        self.rules = sorted(self.client.get("/spending/rules"), key=lambda r: -r.get("priority", 0))
+        self.rule_by_id = {r["id"]: r for r in self.rules}
+        self.native = {}
+        for row_id, row in self.rows.items():
+            rule = next((r for r in self.rules if r.get("categoryId") and rule_matches(r, row, row["sourceNotes"])), None)
+            if rule:
+                self.native[row_id] = rule["id"]
 
     def _identify(self) -> None:
         """Each row's merchant identity: the name given in the labeler, else its raw key."""
@@ -228,12 +265,14 @@ class Workspace:
         self.rows = {}
         for row in spending_rows(self.client):
             row["categoryIds"] = self._categories(row)
-            if not (row.get("notes") or "").strip():
+            row["sourceNotes"] = row.get("notes") or ""  # what Wealthfolio's rules see
+            if not row["sourceNotes"].strip():
                 row["notes"] = self.descriptions.get(row.get("idempotencyKey") or "")
             self.rows[row["id"]] = row
         self.merchant = {i: merchant_key(r.get("notes")) for i, r in self.rows.items()}
         self._identify()
         self.cardmember = self._cardmembers()
+        self.match_rules()
         self.train()
 
     def _cardmembers(self) -> dict[str, dict]:
@@ -473,13 +512,16 @@ class Workspace:
             self.client.post("/spending/rules/rerun", {"onlyUncategorized": True})
             self.ledger.append(entries)
             self.refetch(touched)
+            self.match_rules()
             return {"rules": [e["ruleId"] for e in entries], "kept": kept,
                     "categorized": sum(1 for i in touched if self.rows[i]["categoryIds"])}
         entries = []
         for row_id in ids:
             previous = (self.rows[row_id]["categoryIds"] or [None])[0]
-            self.client.put(f"/spending/activities/{row_id}/assignments", {"taxonomyId": SPENDING, "categoryId": category_id})
+            assigned = self.client.put(f"/spending/activities/{row_id}/assignments", {"taxonomyId": SPENDING, "categoryId": category_id})
             self.rows[row_id]["categoryIds"] = [category_id]
+            self.rows[row_id]["assignments"] = [assigned if isinstance(assigned, dict) and assigned.get("categoryId")
+                                                else {"taxonomyId": SPENDING, "categoryId": category_id, "source": "manual"}]
             entries.append({**base, "activityId": row_id, "source": "user", "previous": {row_id: previous}})
         self.ledger.append(entries)
         return {"categorized": len(entries)}
@@ -501,6 +543,23 @@ class Workspace:
         self.train()
         return {"recorded": len(entries), "key": self.names.get(keys[0], keys[0])}
 
+    def remove_rule(self, rule_id: str) -> dict:
+        """Delete a Wealthfolio rule (undo restores it). Rows it already categorized keep their category."""
+        rule = self.rule_by_id[rule_id]
+        self.client.delete(f"/spending/rules/{rule_id}")
+        self.ledger.append([{"field": "rule-removed", "ruleId": rule_id, "previousRule": rule, "value": None,
+                             "source": "user", "by": self.by, "action": uuid.uuid4().hex[:12]}])
+        self.match_rules()
+        return {"removed": rule_id}
+
+    def remove_label(self, seq: int) -> dict:
+        """Withdraw a merchant-wide spender label; rows fall back to their next source (account, model, none)."""
+        entry = next(e for e in self.ledger.live if e["seq"] == seq and e.get("merchant") and e["field"] == FIELD)
+        self.ledger.append([{"field": FIELD, "reverts": seq, "by": self.by, "note": "removed in the Rules view"}])
+        ids = [i for i, key in self.merchant.items() if key == entry["merchant"]]
+        self.train()
+        return self.sync(ids)
+
     def undo(self) -> dict:
         entries = self.ledger.last_action(self.by)
         if not entries:
@@ -512,10 +571,11 @@ class Workspace:
             touched |= set(entry.get("previous", {})) | ({entry["activityId"]} if entry.get("activityId") else set())
         self.refetch(touched & set(self.rows))
         for entry in entries:
+            if entry["field"] == "rule-removed":
+                self.client.post("/spending/rules/upsert", {k: entry["previousRule"].get(k) for k in RULE_FIELDS})
             if entry["field"] == "category":
                 if entry.get("previousRule"):
-                    keep = ("id", "name", "pattern", "matchType", "taxonomyId", "categoryId", "priority", "isGlobal", "accountId")
-                    self.client.post("/spending/rules/upsert", {k: entry["previousRule"].get(k) for k in keep})
+                    self.client.post("/spending/rules/upsert", {k: entry["previousRule"].get(k) for k in RULE_FIELDS})
                 elif entry.get("ruleId"):
                     self.client.delete(f"/spending/rules/{entry['ruleId']}")
                 for row_id, previous in entry["previous"].items():
@@ -526,6 +586,8 @@ class Workspace:
         self.ledger.append([{"field": e["field"], "reverts": e["seq"], "by": self.by} for e in entries])
         if any(e["field"] == NAME for e in entries):
             self._identify()
+        if any(e["field"] in ("category", "rule-removed") for e in entries):
+            self.match_rules()
         if any(e["field"] == "category" for e in entries):
             self.refetch(touched & set(self.rows))
         self.train()
@@ -605,11 +667,73 @@ class Workspace:
             "needWant": self.need_want(row),
             "spender": label["value"] if label else None,
             "source": label["source"] if label else None,
+            **self.explain(row_id, label),
             "confidence": label.get("confidence") if label else None,
             "reasons": label.get("reasons", []) if label else [],
             "note": label.get("note") if label else None,
             "guess": None if blind else {k: guess[k] for k in ("value", "confidence", "reasons")},
         }
+
+    def explain(self, row_id: str, label: dict | None) -> dict:
+        """Plain-language sources for a row's spender and category, with details for a tooltip."""
+        found = {}
+        if label:
+            source, when = label["source"], f" · set {label['at'][:10]}" if label.get("at") else ""
+            found["spenderBy"] = {
+                "merchant": f"all {self.display[row_id]}", "user": "this row (accepted prediction)" if label.get("accepted") else "this row",
+                "wealthfolio-ui": "set in Wealthfolio", "account": "account default", "cardmember": "cardmember on statement",
+                "model": f"model {round((label.get('confidence') or 0) * 100)}%",
+            }[source]
+            found["spenderWhy"] = {
+                "merchant": f"Labeler rule: every {self.display[row_id]} charge, past and future; applied after each daily sync",
+                "user": "Labeled by hand for this row only", "wealthfolio-ui": "Edited in Wealthfolio, which wins over the labeler",
+                "account": "Default for this account", "cardmember": "The card issuer's file names the cardmember",
+                "model": "The model's prediction",
+            }[source] + when + "".join(f" · {r}" for r in label.get("reasons", [])) + (f" · note: {label['note']}" if label.get("note") else "")
+        row = self.rows[row_id]
+        assignment = next((a for a in row["assignments"] if a["taxonomyId"] == SPENDING), None)
+        if row["splits"]:
+            found["categoryBy"], found["categoryWhy"] = "split", "Split across categories in Wealthfolio"
+        elif assignment:
+            rule = self.rule_by_id.get(self.native.get(row_id, ""))
+            if assignment.get("source") == "rule":
+                ours = rule and rule["categoryId"] == assignment["categoryId"]
+                found["categoryBy"] = ("preset" if rule.get("presetId") else "rule") if ours else "rule"
+                found["categoryWhy"] = (f"Wealthfolio rule '{rule['name']}' ({self.rule_pattern(rule)}), applied by Wealthfolio on import"
+                                        if ours else "Set by a Wealthfolio rule that no longer matches this row")
+            else:
+                found["categoryBy"] = assignment.get("source") or "manual"
+                found["categoryWhy"] = "Set by hand, in Wealthfolio or the labeler" if found["categoryBy"] == "manual" else f"Source: {found['categoryBy']}"
+        return found
+
+    def rule_pattern(self, rule: dict) -> str:
+        """How a rule matches, in words: labeler rules by merchant, others by their own pattern."""
+        key = next((e["merchant"] for e in self.ledger.live if e["field"] == "category" and e.get("ruleId") == rule["id"]), None)
+        return f"merchant {key}" if key else f"{rule['matchType']} {rule['pattern']}"
+
+    def rules_list(self) -> list[dict]:
+        """Every rule that decides labels: Wealthfolio's category rules (with presets) and the labeler's merchant rules."""
+        mine = {e.get("ruleId") for e in self.ledger.live if e["field"] == "category" and e.get("ruleId")}
+        matched = Counter(self.native.values())
+        found = [{
+            "id": r["id"], "kind": "Category", "sets": self.categories.get(r.get("categoryId") or "", {}).get("name", r.get("categoryId")),
+            "pattern": self.rule_pattern(r), "rows": matched[r["id"]], "name": r["name"],
+            "source": "labeler (in Wealthfolio)" if r["id"] in mine else "preset" if r.get("presetId") else "Wealthfolio",
+            "where": "Wealthfolio", "at": (r.get("updatedAt") or r.get("createdAt") or "")[:10],
+        } for r in self.rules if r.get("categoryId")]
+        for (field, key), entries in self.ledger.by_merchant.items():
+            if field in (FIELD, NAME) and entries[-1].get("value"):
+                entry = entries[-1]
+                found.append({
+                    "id": f"{field}:{entry['seq']}", "kind": "Spender" if field == FIELD else "Name", "sets": entry["value"],
+                    "pattern": f"merchant {key}", "rows": sum(1 for k in self.merchant.values() if k == key), "name": self.names.get(key, key),
+                    "source": "labeler", "where": "labeler", "at": entry["at"][:10], "merchant": key,
+                })
+        return found
+
+    def card_rules(self, ids) -> list[dict]:
+        keys, rules = {self.merchant[i] for i in ids}, {self.native[i] for i in ids if i in self.native}
+        return [r for r in self.rules_list() if r.get("merchant") in keys or r["id"] in rules]
 
     def status(self) -> dict:
         counts: dict[str, int] = {}

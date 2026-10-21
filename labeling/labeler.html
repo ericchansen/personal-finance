@@ -19,7 +19,7 @@
   .reasons { margin: 4px 0 0; padding-left: 18px; }
   table { border-collapse: collapse; width: 100%; margin-top: 12px; }
   td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-color-default, #d0d7de); white-space: nowrap; }
-  td.desc { white-space: normal; }
+  td.desc { white-space: normal; overflow-wrap: anywhere; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   th[data-sort] { cursor: pointer; user-select: none; }
   .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
@@ -45,6 +45,10 @@
   .conf.mid i { background: var(--true-color-yellow, #bf8700); }
   .conf.high i { background: var(--true-color-green, #1a7f37); }
   .labeled { font-weight: var(--font-weight-semibold, 600); }
+  .rules { margin: 4px 0 8px; padding: 6px 10px; border-left: 3px solid var(--border-color-default, #d0d7de); }
+  .rules div { margin: 2px 0; }
+  .where { font-size: 12px; padding: 0 5px; border-radius: 4px; background: var(--true-color-blue-muted, #ddf4ff); }
+  button.link { background: none; border: 0; padding: 0 4px; color: var(--true-color-blue, #0969da); cursor: pointer; font: inherit; }
   .pill.ok { background: var(--true-color-green-muted, #dafbe1); }
   .pill.bad { background: var(--true-color-red-muted, #ffebe9); }
   .miss { color: var(--true-color-red, #cf222e); }
@@ -53,7 +57,7 @@
 </head>
 <body>
 <header>
-  <nav><button data-mode="queue">Queue</button><button data-mode="predictions">Predictions</button><button data-mode="audit">Audit</button><button data-mode="check">Check set</button></nav>
+  <nav><button data-mode="queue">Queue</button><button data-mode="predictions">Predictions</button><button data-mode="audit">Audit</button><button data-mode="rules">Rules</button><button data-mode="check">Check set</button></nav>
   <select id="order" title="Queue order (O)"></select>
   <span id="counts" class="muted"></span>
 </header>
@@ -71,6 +75,11 @@
   <span class="muted">Up and Down select a row, spender keys relabel it, H shows its history.</span>
   <table id="a-table"></table>
   <pre id="a-history" class="muted"></pre>
+</div>
+<div id="rules" class="hidden">
+  <div class="controls"><input id="ru-q" placeholder="filter rules"> <span class="muted">Wealthfolio rules set categories on import;
+    labeler rules set the spender after each daily sync. <kbd>X</kbd> twice removes the highlighted rule.</span></div>
+  <table id="ru-table"></table>
 </div>
 <div id="pred" class="hidden">
   <div id="pr-model" class="muted"></div>
@@ -122,7 +131,8 @@ function spenderKeys() { return Object.entries(config.spenders).map(([k, v]) => 
 function legend() {
   const views = `<span><kbd>Tab</kbd>/<kbd>Shift+Tab</kbd> next/previous view</span> <span><kbd>R</kbd> refresh</span>`;
   const common = `${spenderKeys()} <span><kbd>Shift</kbd>+key labels the whole merchant, past and future</span>`;
-  $("keys").innerHTML = mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
+  $("keys").innerHTML = mode === "rules" ? `<span><kbd>↑</kbd><kbd>↓</kbd> rule</span> <span><kbd>X</kbd> twice: remove</span> <span><kbd>U</kbd> undo</span>`
+    : mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
     : mode === "predictions" ? `${common} <span><kbd>Enter</kbd> accept prediction</span> <span><kbd>Space</kbd> select</span>
        <span><kbd>A</kbd> accept selected</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span> <span><kbd>PgUp</kbd><kbd>PgDn</kbd> page</span>`
     : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> pick a Need/Want category (<kbd>Enter</kbd> accepts the highlighted one)</span>
@@ -138,11 +148,13 @@ async function load() {
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
   $("audit").classList.toggle("hidden", mode !== "audit");
   $("pred").classList.toggle("hidden", mode !== "predictions");
+  $("rules").classList.toggle("hidden", mode !== "rules");
   $("order").classList.toggle("hidden", mode !== "queue");
-  $("main").classList.toggle("hidden", mode === "audit" || mode === "predictions");
+  $("main").classList.toggle("hidden", ["audit", "predictions", "rules"].includes(mode));
   legend();
   if (mode === "audit") return loadAudit();
   if (mode === "predictions") return loadPredictions();
+  if (mode === "rules") return loadRules();
   const data = await api(`/api/card?mode=${mode}&order=${$("order").value}&skip=${encodeURIComponent(skip.join("\n"))}${pinned ? `&key=${encodeURIComponent(pinned)}` : ""}`);
   if (mine !== loads) return;
   if (pinned && !data.card) { pinned = null; return load(); }
@@ -164,7 +176,7 @@ function confCell(c) {
 }
 // A row's spender: its label (with source) when it has one, otherwise the model's prediction.
 function spenderCells(r) {
-  if (r.spender) return `<td class="labeled">${esc(r.spender)} <span class="pill">${esc(r.source)}</span></td><td class="num">${confCell(r.confidence)}</td><td></td>`;
+  if (r.spender) return `<td class="labeled" title="${esc(r.spenderWhy)}">${esc(r.spender)} <span class="muted">· ${esc(r.spenderBy)}</span></td><td class="num">${confCell(r.confidence)}</td><td></td>`;
   const g = r.guess;
   return `<td>${esc(g.value)}</td><td class="num">${confCell(g.confidence)}</td><td class="desc muted" title="${esc(g.reasons.join("\n"))}">${esc(g.reasons[0] || "")}</td>`;
 }
@@ -186,7 +198,9 @@ function render() {
     <div class="muted">${n} row(s), ${money(card.total)}${card.labeledElsewhere ? `, ${card.labeledElsewhere} more from this merchant already labeled` : ""}</div>
     ${card.keys.length > 1 || (card.keys[0] && card.keys[0] !== card.merchant) ? `<div class="muted">includes: ${card.keys.map(esc).join(", ")}
       · <kbd>Shift</kbd>+<kbd>M</kbd> on a row renames just its raw name, to split it out</div>` : ""}
-    ${status}${done || ""}
+    ${status}${card.rules.length ? `<div class="rules"><b>Rules for this merchant</b>
+      ${card.rules.map((r, i) => `<div><kbd>${i + 1}</kbd> ${ruleText(r)} <button class="link" data-rule="${i}">remove</button></div>`).join("")}
+      <div class="muted"><kbd>X</kbd> then a number removes a rule (press the number twice to confirm).</div></div>` : ""}${done || ""}
     <p>${card.blind ? `<span class="pill">blind check: no guess shown</span>` : labeled >= n ? ""
       : `<span class="guess">Predicted <b>${esc(s.predicted[0][0])}</b> ${confCell(s.confidence)}</span>
          <span class="muted">${n} rows: ${s.predicted.map(([v, c]) => `${c} ${esc(v)}`).join(" / ")} predicted · merchant confidence is the amount-weighted mean</span>
@@ -196,7 +210,7 @@ function render() {
     <table><tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Category</th><th>Need/Want</th>
       ${card.blind ? "" : "<th>Spender / prediction</th><th class=\"num\">Confidence</th><th>Top reason</th>"}</tr>
     ${card.rows.map((r, i) => `<tr class="${i === cur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td>
-      <td class="desc">${esc(r.notes)}</td><td>${r.category ? esc(r.category) : '<span class="miss">✗ none</span>'}</td><td>${r.category ? esc(r.needWant || "—") : ""}</td>
+      <td class="desc">${esc(r.notes)}</td><td title="${esc(r.categoryWhy || "")}">${r.category ? `${esc(r.category)} <span class="muted">· ${esc(r.categoryBy || "")}</span>` : '<span class="miss">✗ none</span>'}</td><td>${r.category ? esc(r.needWant || "—") : ""}</td>
       ${card.blind ? "" : spenderCells(r)}</tr>`).join("")}
     </table>${card.more ? `<p class="muted">and ${card.more} more</p>` : ""}`;
 }
@@ -247,6 +261,7 @@ function openOverlay(id) { $(id).classList.remove("hidden"); $("backdrop").class
 function closeOverlays() {
   picker = null;
   ["picker", "note", "rename", "backdrop"].forEach((id) => $(id).classList.add("hidden"));
+  if (armed || removing) { armed = null; removing = false; flash(""); }
   document.activeElement?.blur();
 }
 $("backdrop").addEventListener("click", closeOverlays);
@@ -410,6 +425,52 @@ $("pr-accept").addEventListener("click", acceptSelected);
 $("pr-prev").addEventListener("click", () => page(-1));
 $("pr-next").addEventListener("click", () => page(1));
 
+// Rules, written out plainly: what each sets, for which charges, where it lives and who applies it.
+function ruleText(r) {
+  const at = r.at ? ` · set ${esc(r.at)}` : "";
+  if (r.kind === "Spender") return `Spender → <b>${esc(r.sets)}</b> · all ${esc(r.name)} charges, past and future · <span class="where">labeler rule</span> applied after each daily sync${at}`;
+  if (r.kind === "Name") return `Name → <b>${esc(r.sets)}</b> for ${esc(r.pattern.replace("merchant ", ""))} · <span class="where">labeler</span>${at}`;
+  return `Category → <b>${esc(r.sets)}</b> · ${r.source === "preset" ? "preset rule" : "rule"} '${esc(r.name)}' (${esc(r.pattern)}) · <span class="where">Wealthfolio › Settings › Rules</span> applied by Wealthfolio on import${at}`;
+}
+function removeWarning(r) {
+  if (r.kind === "Spender") return `Withdraw "Spender → ${r.sets}" for all ${r.name} charges? Rows fall back to account defaults or predictions; Shift+key re-applies it.`;
+  if (r.kind === "Name") return `Reset the name "${r.sets}"? U undoes.`;
+  return `Delete Wealthfolio rule '${r.name}'? Rows it already categorized keep their category; U restores the rule.`;
+}
+let armed = null, removing = false;  // a rule awaiting its confirming second press; card number-entry mode
+async function removeRule(r) {
+  if (!r) return;
+  if (armed !== r.id) { armed = r.id; return flash(`${removeWarning(r)} Press again to confirm.`); }
+  armed = null; removing = false; flash("");
+  await act("/api/rules/remove", { id: r.id });
+}
+$("main").addEventListener("click", (e) => { const b = e.target.closest("button[data-rule]"); if (b) removeRule(card.rules[+b.dataset.rule]); });
+
+let rules = [], rulesCur = 0;
+async function loadRules() {
+  const mine = loads;
+  const data = await api("/api/rules");
+  if (mine !== loads) return;
+  const q = $("ru-q").value.toLowerCase();
+  rules = data.filter((r) => `${r.kind} ${r.sets} ${r.pattern} ${r.name} ${r.source}`.toLowerCase().includes(q))
+    .sort((a, b) => a.kind.localeCompare(b.kind) || b.rows - a.rows);
+  rulesCur = Math.min(rulesCur, Math.max(rules.length - 1, 0));
+  $("counts").textContent = `${rules.length} rule(s)`;
+  renderRules();
+}
+function renderRules() {
+  $("ru-table").innerHTML = `<tr><th>Sets</th><th>Applies to</th><th class="num">Rows</th><th>Source</th><th>Lives in</th><th>Set</th><th></th></tr>` +
+    rules.map((r, i) => `<tr class="${i === rulesCur ? "cur" : ""}"><td>${esc(r.kind)} → <b>${esc(r.sets)}</b></td>
+      <td class="desc">${r.kind === "Category" ? `'${esc(r.name)}' · ` : ""}${esc(r.pattern)}</td><td class="num">${r.rows}</td><td>${esc(r.source)}</td>
+      <td class="muted" title="${r.where === "Wealthfolio" ? "Settings › Rules in Wealthfolio; applied by Wealthfolio when activity is imported" : "The labeler's ledger; applied after each daily sync"}">${esc(r.where)}</td><td>${esc(r.at)}</td><td><button class="link" data-rules="${i}">remove</button></td></tr>`).join("");
+}
+$("ru-table").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-rules]"), tr = e.target.closest("tr");
+  if (b) return removeRule(rules[+b.dataset.rules]);
+  if (tr && tr.rowIndex > 0) { rulesCur = tr.rowIndex - 1; renderRules(); }
+});
+$("ru-q").addEventListener("change", () => loadRules().catch((e) => flash(e.message)));
+
 ["a-source", "a-min", "a-max", "a-q"].forEach((id) => $(id).addEventListener("change", loadAudit));
 
 const MODES = [...document.querySelectorAll("nav button")].map((b) => b.dataset.mode);
@@ -453,6 +514,14 @@ document.addEventListener("keydown", async (e) => {
     else return;
     e.preventDefault(); return renderPredictions();
   }
+  if (mode === "rules") {
+    if (e.key === "ArrowDown") rulesCur = Math.min(rulesCur + 1, rules.length - 1);
+    else if (e.key === "ArrowUp") rulesCur = Math.max(rulesCur - 1, 0);
+    else if (key === "x") { e.preventDefault(); return removeRule(rules[rulesCur]); }
+    else if (key === "u") return act("/api/undo", {});
+    else return;
+    e.preventDefault(); return renderRules();
+  }
   if (mode === "audit") {
     const row = audit[auditCur];
     if (e.key === "ArrowDown") auditCur = Math.min(auditCur + 1, audit.length - 1);
@@ -472,6 +541,8 @@ document.addEventListener("keydown", async (e) => {
   else if (e.key === "ArrowLeft") previousCard();
   else if (key === "u") act("/api/undo", {});
   else if (key === "m" && mode === "queue") openRename(!e.shiftKey);
+  else if (key === "x" && card.rules.length) { removing = true; armed = null; flash(`Remove which rule? Press 1–${card.rules.length}; Esc cancels.`); }
+  else if (removing && /^[1-9]$/.test(e.key)) removeRule(card.rules[+e.key - 1]);
   else if (key === "o" && mode === "queue") {
     const i = ORDERS.findIndex(([v]) => v === $("order").value);
     setOrder(ORDERS[(i + (e.shiftKey ? ORDERS.length - 1 : 1)) % ORDERS.length][0]);
