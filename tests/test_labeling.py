@@ -339,7 +339,7 @@ def test_canvas_api_labels_audits_and_backs_up_once(world):
     assert card["merchant"] == "HARDWARE STORE" and card["rows"][0]["guess"]["value"] in ws.spenders
     app.handle("POST", "/api/label", {}, {"value": "Ben", "ids": [card["rows"][0]["id"]]})
     assert app.handle("GET", "/api/card", {}, {})["counts"]["session"] == 1
-    audit = app.handle("GET", "/api/audit", {"source": "model", "max": "1"}, {})
+    audit = app.handle("GET", "/api/audit", {"origin": "Spender model", "max": "1"}, {})
     assert "shared-coffee" in [r["id"] for r in audit]
     assert all(shown(fake, r["id"]) == r["spender"] for r in audit)
     assert app.handle("GET", "/api/card", {"mode": "check"}, {})["card"]["blind"] is True
@@ -750,6 +750,14 @@ def test_rules_are_explained_listed_and_removable(world):
     assert hardware["spenderBy"] == "all HARDWARE STORE" and "past and future" in hardware["spenderWhy"] and hardware["categoryBy"] == "rule"
     ws.categorize("cat_groceries", ids=["shared-coffee"])
     assert ws.view("shared-coffee")["categoryBy"] == "manual"
+
+    # Every label names its originator, so one originator's labels can be reviewed and fixed together.
+    assert (coffee["categoryOrigin"], coffee["spenderOrigin"]) == ("Wealthfolio preset", "Account default")
+    assert (hardware["categoryOrigin"], hardware["spenderOrigin"]) == ("test", "test")
+    assert ws.view("shared-coffee")["categoryOrigin"] == "test"
+    assert [ws.origin({"by": b, "source": "user"}) for b in ("labeling serve", "categorizer agent", "labeling llm")] == ["You", "Categorizer agent", "Local LLM"]
+    assert {"Wealthfolio preset", "Account default", "test"} <= set(app.handle("GET", "/api/origins", {}, {}))
+    assert {r["id"] for r in app.handle("GET", "/api/audit", {"origin": "Wealthfolio preset"}, {})} >= {"ann-0"}
 
     listed = {(r["kind"], r["source"]): r for r in app.handle("GET", "/api/rules", {}, {})}
     assert listed[("Category", "preset")]["rows"] == 13 and listed[("Category", "labeler (in Wealthfolio)")]["sets"] == "Groceries"

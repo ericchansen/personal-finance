@@ -694,7 +694,7 @@ class Workspace:
 
     def explain(self, row_id: str, label: dict | None) -> dict:
         """Plain-language sources for a row's spender and category, with details for a tooltip."""
-        found = {}
+        found = {"spenderOrigin": self.origin(label) if label else None}
         if label:
             source, when = label["source"], f" · set {label['at'][:10]}" if label.get("at") else ""
             found["spenderBy"] = {
@@ -711,7 +711,7 @@ class Workspace:
         row = self.rows[row_id]
         assignment = next((a for a in row["assignments"] if a["taxonomyId"] == SPENDING), None)
         if row["splits"]:
-            found["categoryBy"], found["categoryWhy"] = "split", "Split across categories in Wealthfolio"
+            found["categoryBy"], found["categoryWhy"], found["categoryOrigin"] = "split", "Split across categories in Wealthfolio", "Wealthfolio"
         elif assignment:
             rule = self.rule_by_id.get(self.native.get(row_id, ""))
             if assignment.get("source") == "rule":
@@ -719,10 +719,23 @@ class Workspace:
                 found["categoryBy"] = ("preset" if rule.get("presetId") else "rule") if ours else "rule"
                 found["categoryWhy"] = (f"Wealthfolio rule '{rule['name']}' ({self.rule_pattern(rule)}), applied by Wealthfolio on import"
                                         if ours else "Set by a Wealthfolio rule that no longer matches this row")
+                made = ours and next((e for e in reversed(self.ledger.live) if e["field"] == "category" and e.get("ruleId") == rule["id"]), None)
+                found["categoryOrigin"] = self.origin(made) if made else "Wealthfolio preset" if ours and rule.get("presetId") else "Wealthfolio rule"
             else:
                 found["categoryBy"] = assignment.get("source") or "manual"
                 found["categoryWhy"] = "Set by hand, in Wealthfolio or the labeler" if found["categoryBy"] == "manual" else f"Source: {found['categoryBy']}"
+                made = (self.ledger.by_activity.get(("category", row_id)) or [None])[-1]
+                found["categoryOrigin"] = self.origin(made) if made else "You (in Wealthfolio)"
+            found["categoryWhy"] += f" · originator: {found['categoryOrigin']}"
         return found
+
+    # Who made a label, so labels from one originator can be reviewed and fixed together.
+    ORIGINS = {"labeling serve": "You", "coordinator for user": "You", "categorizer agent": "Categorizer agent",
+               "labeling llm": "Local LLM"}
+    BY_SOURCE = {"model": "Spender model", "account": "Account default", "cardmember": "Card issuer", "wealthfolio-ui": "You (in Wealthfolio)"}
+
+    def origin(self, entry: dict) -> str:
+        return self.BY_SOURCE.get(entry.get("source")) or self.ORIGINS.get(entry.get("by", ""), entry.get("by") or "unknown")
 
     def rule_pattern(self, rule: dict) -> str:
         """How a rule matches, in words: labeler rules by merchant, others by their own pattern."""
