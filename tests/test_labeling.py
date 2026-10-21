@@ -619,3 +619,22 @@ def test_rename_suggestions_prefer_the_payee_then_an_export_name(world):
     ws.raw["legacy:9"] = {"payee": "Island Resorts Travel"}
     assert app.handle("GET", "/api/suggest", {"merchant": "UNIQUE VAC"}, {})["suggestion"] == "Island Resorts Travel"
     assert app.handle("GET", "/api/suggest", {"merchant": "HARDWARE STORE"}, {})["suggestion"] == "HARDWARE STORE"
+
+def test_uninformative_features_and_reasons_are_dropped(world):
+    fake, ws = world
+    row = {"activityType": "WITHDRAWAL", "notes": "CORNER DELI", "amount": "9", "activityDate": "2026-03-02"}
+    assert not any(f.startswith("type:") for f in features(row))
+    assert "type:credit" in features({**row, "activityType": "CREDIT"})
+    model = nb.NaiveBayes(["Ann", "Ben"]).fit([(["w:EVERY", "w:ANN"], "Ann", 1.0)] * 20 + [(["w:EVERY"], "Ben", 1.0)] * 20)
+    assert [f for f, _, _ in model.predict(["w:EVERY", "w:ANN"])[2]] == ["w:ANN"]
+
+
+def test_the_labeled_banner_counts_only_hand_labels(world):
+    fake, ws = world
+    fake.add("ann-hardware", "ann", "HARDWARE STORE 0412", amount=8)
+    ws.refresh()
+    app = Labeler(ws)
+    card = app.handle("GET", "/api/card", {"key": "HARDWARE STORE"}, {})["card"]
+    assert card["labeled"] == [] and next(r for r in card["rows"] if r["id"] == "ann-hardware")["source"] == "account"
+    app.handle("POST", "/api/label", {}, {"value": "Joint", "ids": ["shared-hardware-1"]})
+    assert app.handle("GET", "/api/card", {"key": "HARDWARE STORE"}, {})["card"]["labeled"] == [("Joint", 1)]
