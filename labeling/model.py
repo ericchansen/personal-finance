@@ -57,7 +57,7 @@ class NaiveBayes:
              for f in dict.fromkeys(found) if f in self.vocab),
             key=lambda item: -item[1],
         )
-        return best, self.calibrate(probs[best]), [item for item in lift[:3] if item[1] > 0]
+        return best, self.calibrate(probs[best]), [item for item in lift if item[1] > 0 and item[2] > 0][:3]
 
     def calibrate(self, p: float) -> float:
         value = self.calibration[min(int(p * BINS), BINS - 1)]

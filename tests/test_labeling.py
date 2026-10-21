@@ -177,6 +177,10 @@ def test_naive_bayes_calibrates_monotonically_and_explains():
     model, version = nb.train(["Ann", "Ben", "Joint"], examples)
     value, confidence, lift = model.predict(["m:new", "w:COFFEE"])
     assert value == "Ann" and confidence > 0.8 and lift[0][0] == "w:COFFEE" and lift[0][2] == 30
+    tiny = nb.NaiveBayes(["Ann", "Joint"]).fit(
+        [(["w:A", "w:Z"] if i == 0 else ["w:A"], "Ann", 1.0) for i in range(30)] + [(["w:J"], "Joint", 1.0)])
+    best, _, reasons = tiny.predict(["w:J", "w:Z"])
+    assert best == "Joint" and [f for f, _, _ in reasons] == ["w:J"]
     assert model.calibration == sorted(model.calibration)
     assert version == nb.train(["Ann", "Ben", "Joint"], list(reversed(examples)))[1]
     assert nb.metrics([("Ann", 0.95, "Ann"), ("Ben", 0.5, "Ann")], 0.9)["precisionAtThreshold"] == 1.0
@@ -353,3 +357,49 @@ def test_every_write_bumps_the_version_open_pages_poll(world):
     assert app.handle("GET", "/api/version", {}, {})["version"] == start + 1
     app.handle("POST", "/api/undo", {}, {})
     assert app.handle("GET", "/api/card", {}, {})["counts"]["version"] == start + 2
+
+def test_predictions_list_unlabeled_rows_sorted_filtered_and_paged(world):
+    fake, ws = world
+    for i in range(5):
+        fake.add(f"shared-misc-{i}", "shared", f"MISC VENDOR {i}", amount=10 + i, day=f"2026-03-0{i + 1}")
+    ws.refresh()
+    app = Labeler(ws)
+    held = set(ws.check_ids())
+    expected = {i for i in ws.rows if ws.unlabeled(i)} - held
+    page = app.handle("GET", "/api/predictions", {"sort": "amount", "dir": "desc", "limit": "3"}, {})
+    assert page["total"] == len(expected) >= 5 and len(page["rows"]) == 3
+    amounts = [r["amount"] for r in page["rows"]]
+    assert amounts == sorted(amounts, reverse=True) and {r["id"] for r in page["rows"]} <= expected
+    rest = app.handle("GET", "/api/predictions", {"sort": "amount", "dir": "desc", "offset": "3", "limit": "100"}, {})
+    assert {r["id"] for r in page["rows"] + rest["rows"]} == expected
+    target = sorted(i for i in expected if i.startswith("shared-misc"))[0]
+    needle = fake.rows[target]["notes"].lower()
+    assert [r["id"] for r in app.handle("GET", "/api/predictions", {"q": needle}, {})["rows"]] == [target]
+    value = page["rows"][0]["guess"]["value"]
+    assert all(r["guess"]["value"] == value for r in app.handle("GET", "/api/predictions", {"value": value}, {})["rows"])
+    assert app.handle("GET", "/api/predictions", {"min": "1.01"}, {})["total"] == 0
+    model = page["model"]
+    assert model["model"] == ws.version and model["classes"]["Joint"]["merchants"] < 20
+    assert any(w.startswith("Joint is barely learned") for w in model["warnings"])
+
+
+def test_accepting_predictions_confirms_them_with_model_provenance(world):
+    fake, ws = world
+    for i in range(5):
+        fake.add(f"shared-misc-{i}", "shared", f"MISC VENDOR {i}", amount=10 + i)
+    ws.refresh()
+    app = Labeler(ws)
+    rows = app.handle("GET", "/api/predictions", {"limit": "2"}, {})["rows"]
+    first, second = rows
+    other = next(v for v in ws.spenders if v != second["guess"]["value"])
+    app.handle("POST", "/api/label", {}, {"accept": [
+        {"id": first["id"], "value": first["guess"]["value"]}, {"id": second["id"], "value": other},
+    ]})
+    entries = {e["activityId"]: e for e in ws.ledger.entries if e.get("accepted")}
+    assert entries[first["id"]]["source"] == "user" and entries[first["id"]]["confidence"] == first["guess"]["confidence"]
+    assert entries[first["id"]]["reasons"] == first["guess"]["reasons"] and entries[first["id"]]["model"]
+    assert "confidence" not in entries[second["id"]]
+    assert shown(fake, first["id"]) == first["guess"]["value"] and shown(fake, second["id"]) == other
+    assert first["id"] not in {r["id"] for r in app.handle("GET", "/api/predictions", {}, {})["rows"]}
+    app.handle("POST", "/api/undo", {}, {})
+    assert fake.rows[first["id"]]["eventId"] is None

@@ -19,6 +19,8 @@ after a native backup.
 | **C** / **N** / **W** | Pick a category, a Need category, or a Want category (**Shift**: native rule for the merchant) |
 | **'** · **S** · **U** · **↑↓** | Note · skip · undo · move between rows |
 
+**Predictions** lists every unlabeled row with the model's guess and confidence. Sort by any
+column and filter; **Enter** accepts a guess, and **Space** then **A** accepts the selected rows.
 **Audit** filters labels by source and confidence; **H** shows a row's history.
 
 ## Private files (`<data>/labels/`)
