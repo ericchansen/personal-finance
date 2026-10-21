@@ -299,6 +299,54 @@ def test_client_refuses_non_loopback(url):
         WealthfolioClient(url)
 
 
+@pytest.mark.parametrize("expired_twice, outcome", [(False, "retried"), (True, "raises")])
+def test_client_signs_in_again_once_when_the_session_expires(expired_twice, outcome):
+    """A long-running client (the labeler) outlives its session; one re-login and retry, never a loop."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from importers.simplefin.wealthfolio_client import WealthfolioError
+
+    seen = {"logins": 0, "expired": 2 if expired_twice else 1}
+
+    class Wealthfolio(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, status, body, cookie=False):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            if cookie:
+                self.send_header("Set-Cookie", f"wf_session=s{seen['logins']}; Path=/")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            seen["logins"] += 1
+            self.reply(200, {}, cookie=True)
+
+        def do_GET(self):
+            if seen["expired"]:
+                seen["expired"] -= 1
+                return self.reply(401, {"code": 401, "message": "Unauthorized"})
+            self.reply(200, [{"id": "acct"}])
+
+    server = HTTPServer(("127.0.0.1", 0), Wealthfolio)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = WealthfolioClient(f"http://127.0.0.1:{server.server_address[1]}")
+        client.login("synthetic")
+        if outcome == "retried":
+            assert client.list_accounts() == [{"id": "acct"}] and seen["logins"] == 2
+        else:
+            with pytest.raises(WealthfolioError, match="401"):
+                client.list_accounts()
+            assert seen["logins"] == 2
+    finally:
+        server.shutdown()
+
+
 def test_posted_income_and_spending_are_not_marked_as_external_reconciliation():
     creates, _ = plan([transaction(), transaction("salary", amount="100")])
     assert all(json.loads(row["metadata"])["flow"]["is_external"] is False for row in creates)
