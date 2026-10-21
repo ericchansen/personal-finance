@@ -68,13 +68,8 @@ def connect(data_dir: Path, base_url: str) -> WealthfolioClient:
 
 
 def spending_rows(client) -> list[dict]:
-    rows, offset = [], 0
-    while True:
-        items = client.post("/spending/cash-activities/search", {"offset": offset, "limit": 1000})["items"]
-        rows += [row for row in items if row["cashFlowBucket"] == "spending"]
-        offset += len(items)
-        if len(items) < 1000:
-            return rows
+    """One unpaged read (about half a second); the paged search costs over a second per 1,000 rows."""
+    return [row for row in client.get("/spending/cash-activities") if row["cashFlowBucket"] == "spending"]
 
 
 def ofx_cardmembers(path: Path, patterns: dict[str, str]) -> list[tuple[str, float, str, str]]:
@@ -97,9 +92,6 @@ class Workspace:
         self.dir = data_dir / "labels"
         self.client = client
         self.by = by
-        self.config = json.loads((self.dir / "config.json").read_text(encoding="utf-8"))
-        self.spenders: list[str] = list(self.config["spenders"].values())
-        self.threshold = float(self.config.get("threshold", 0.9))
         self.raw = raw_index(data_dir)
         self.zone = client.display_timezone()
         self.load()
@@ -111,6 +103,10 @@ class Workspace:
         return tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else None for p in paths)
 
     def load(self) -> None:
+        """Read the private config, ledger, and Wealthfolio rows, then retrain."""
+        self.config = json.loads((self.dir / "config.json").read_text(encoding="utf-8"))
+        self.spenders: list[str] = list(self.config["spenders"].values())
+        self.threshold = float(self.config.get("threshold", 0.9))
         self.ledger = Ledger(self.dir / "ledger.jsonl")
         applied = self.dir / "applied.json"
         self.applied: dict[str, str | None] = json.loads(applied.read_text(encoding="utf-8")) if applied.exists() else {}
@@ -128,21 +124,18 @@ class Workspace:
     def refetch(self, ids) -> None:
         """Re-read these rows' current event and categories, so recent UI edits are seen."""
         wanted = set(ids)
-        needles = {self.merchant[i].split()[0].lower() for i in wanted if self.merchant.get(i)}
-        for needle in needles:
-            offset = 0
-            while True:
-                items = self.client.post("/spending/cash-activities/search",
-                                         {"offset": offset, "limit": 1000, "search": needle})["items"]
-                for row in items:
-                    if row["id"] in wanted:
-                        current = self.rows[row["id"]]
-                        current["eventId"] = row.get("eventId")
-                        current["categoryIds"] = self._categories(row)
-                        self.features[row["id"]] = features(current, self.raw.get(current.get("idempotencyKey") or ""), self.zone)
-                offset += len(items)
-                if len(items) < 1000:
-                    break
+        for row in spending_rows(self.client):
+            if row["id"] in wanted and row["id"] in self.rows:
+                current = self.rows[row["id"]]
+                current["eventId"] = row.get("eventId")
+                current["categoryIds"] = self._categories(row)
+                self.features[row["id"]] = features(current, self.raw.get(current.get("idempotencyKey") or ""), self.zone)
+
+    def signature(self) -> int:
+        """Changes whenever anything the labeler shows or decides from changes."""
+        return hash((json.dumps(self.config, sort_keys=True), self._stamp(), tuple(
+            (i, r.get("updatedAt"), r.get("eventId"), r.get("visibleSpendingAmount"), tuple(r["categoryIds"]))
+            for i, r in sorted(self.rows.items()))))
 
     @staticmethod
     def _categories(row: dict) -> list[str]:

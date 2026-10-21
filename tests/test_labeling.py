@@ -33,7 +33,7 @@ ACCOUNTS = [{"id": f"acct-{name}", "name": f"Synthetic {name}"} for name in ("an
 
 class FakeWealthfolio:
     def __init__(self):
-        self.rows, self.event_types, self.events, self.rules, self.backups, self.searches = {}, [], [], [], 0, 0
+        self.rows, self.event_types, self.events, self.rules, self.backups = {}, [], [], [], 0
 
     def add(self, row_id, account, notes, amount=20, day="2026-03-04", **extra):
         self.rows[row_id] = {
@@ -55,13 +55,10 @@ class FakeWealthfolio:
             "/spending/event-types": self.event_types,
             "/spending/events": self.events,
             "/spending/rules": self.rules,
+            "/spending/cash-activities": copy.deepcopy(list(self.rows.values())),
         }[path]
 
     def post(self, path, body):
-        if path == "/spending/cash-activities/search":
-            self.searches += 1
-            rows = [r for r in self.rows.values() if body.get("search", "") in (r["notes"] or "").lower()]
-            return {"items": copy.deepcopy(rows[body["offset"]: body["offset"] + body["limit"]])}
         if path == "/spending/event-types":
             self.event_types.append({"id": f"type-{body['name']}", **body})
             return self.event_types[-1]
@@ -450,3 +447,18 @@ def test_typing_and_open_overlays_swallow_shortcuts():
     script = f"{source}\nconsole.log(JSON.stringify({json.dumps([[k, s] for k, s, _ in cases])}.map(([k, s]) => routeKey(k, s))));"
     routes = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
     assert routes == [expected for *_, expected in cases]
+
+
+def test_rereading_picks_up_changes_made_outside_the_labeler(world):
+    fake, ws = world
+    app = Labeler(ws)
+    start = app.handle("GET", "/api/version", {}, {})["version"]
+    assert app.handle("GET", "/api/refresh", {}, {})["version"] == start
+    assert "HARDWARE STORE" in {g["key"] for g in ws.queue()}
+    for row_id in ("shared-hardware-1", "shared-hardware-2"):
+        fake.rows[row_id]["visibleSpendingAmount"] = 0
+    assert app.handle("GET", "/api/refresh", {}, {})["version"] == start + 1
+    assert "HARDWARE STORE" not in {g["key"] for g in ws.queue()}
+    config = json.loads((ws.dir / "config.json").read_text(encoding="utf-8"))
+    (ws.dir / "config.json").write_text(json.dumps({**config, "threshold": 0.99}), encoding="utf-8")
+    assert app.handle("GET", "/api/refresh", {}, {})["version"] == start + 2 and ws.threshold == 0.99

@@ -97,7 +97,7 @@ function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp
 function spenderKeys() { return Object.entries(config.spenders).map(([k, v]) => `<kbd>${k.toUpperCase()}</kbd> ${esc(v)}`).join(" "); }
 
 function legend() {
-  const views = `<span><kbd>Tab</kbd>/<kbd>Shift+Tab</kbd> next/previous view</span>`;
+  const views = `<span><kbd>Tab</kbd>/<kbd>Shift+Tab</kbd> next/previous view</span> <span><kbd>R</kbd> refresh</span>`;
   const common = `${spenderKeys()} <span><kbd>Shift</kbd>+key labels the whole merchant, past and future</span>`;
   $("keys").innerHTML = mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
     : mode === "predictions" ? `${common} <span><kbd>Enter</kbd> accept prediction</span> <span><kbd>Space</kbd> select</span>
@@ -320,6 +320,7 @@ document.addEventListener("keydown", async (e) => {
     return show(MODES[(MODES.indexOf(mode) + (e.shiftKey ? MODES.length - 1 : 1)) % MODES.length]);
   }
   const key = e.key.toLowerCase(), spender = config.spenders[key];
+  if (key === "r" && !spender) { e.preventDefault(); return refresh(true, true).catch((err) => flash(err.message)); }
   if (mode === "predictions") {
     const row = pred.rows[pred.cur];
     if (e.key === "ArrowDown") pred.cur = Math.min(pred.cur + 1, pred.rows.length - 1);
@@ -361,15 +362,17 @@ document.addEventListener("keydown", async (e) => {
   e.preventDefault();
 });
 
-// Labels may also arrive from outside this page; reload when the server's write version moves.
-async function refresh(force) {
+// Labels and rows also change outside this page. The cheap version poll catches labeler writes;
+// a re-read from Wealthfolio (on focus, every minute, or R) catches everything else.
+async function refresh(force, reread) {
   if (document.hidden || overlay() || ["INPUT", "SELECT"].includes(document.activeElement?.tagName)) return;
-  const { version } = await api("/api/version");
+  const { version } = await api(reread ? "/api/refresh" : "/api/version");
   if (force || version !== seen) await load();
 }
-window.addEventListener("focus", () => refresh(true).catch((e) => flash(e.message)));
-document.addEventListener("visibilitychange", () => refresh(true).catch((e) => flash(e.message)));
-setInterval(() => refresh(false).catch(() => {}), 3000);
+window.addEventListener("focus", () => refresh(true, true).catch((e) => flash(e.message)));
+document.addEventListener("visibilitychange", () => refresh(true, true).catch((e) => flash(e.message)));
+setInterval(() => refresh(false, false).catch(() => {}), 3000);
+setInterval(() => refresh(false, true).catch(() => {}), 60000);
 
 (async () => { config = await api("/api/config"); load(); })().catch((e) => flash(e.message));
 </script>
