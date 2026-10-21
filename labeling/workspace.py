@@ -17,6 +17,7 @@ import uuid
 from collections import Counter
 from contextlib import contextmanager
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 
 from importers.simplefin.wealthfolio_client import WealthfolioClient
@@ -35,6 +36,12 @@ AMOUNT_OPS = {"eq": lambda a, v, w: a == v, "gt": lambda a, v, w: a > v, "gte": 
               "between": lambda a, v, w: w is not None and v <= a <= w}
 
 
+@lru_cache(maxsize=None)
+def compiled(pattern: str) -> re.Pattern:
+    """`re`'s own cache holds 512 patterns; a merchant rule per key soon outgrows it and recompiles every row."""
+    return re.compile(pattern)
+
+
 def rule_matches(rule: dict, row: dict, notes: str) -> bool:
     """Wealthfolio 3.10's categorization matcher (`match_compiled`), for one rule and one activity."""
     if not rule.get("isGlobal") and rule.get("accountId") != row["accountId"]:
@@ -49,7 +56,7 @@ def rule_matches(rule: dict, row: dict, notes: str) -> bool:
     pattern, kind = rule.get("pattern") or "", rule.get("matchType")
     if kind == "regex":
         try:
-            return re.search(pattern, notes) is not None
+            return compiled(pattern).search(notes) is not None
         except re.error:
             return False  # Rust-only syntax; Wealthfolio would evaluate it, so this is a best effort
     upper, wanted = notes.upper(), pattern.upper()
