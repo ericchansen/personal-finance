@@ -19,6 +19,7 @@ after a native backup.
 | **C** / **N** / **W** | Pick a category, a Need category, or a Want category (**Shift**: native rule for the merchant) |
 | **'** · **U** · **↑↓** | Note · undo · move between rows |
 | **→**/**Space** · **←** | Next card (asks once if the card is incomplete) · previous card |
+| **M** · **Shift+M** | Rename the merchant (an existing name merges; blank resets) · rename only this row's raw name, to split it out |
 | **O** · **Tab** · **R** · **Esc** | Cycle the queue order (remembered) · next view (**Shift+Tab** back) · re-read Wealthfolio · close a picker or box |
 
 **Predictions** lists every unlabeled row with the model's guess and confidence. Sort by any
@@ -32,8 +33,9 @@ A card stays on screen after labeling. It is complete when every row has a spend
 
 `config.json` (spenders and keys, threshold, account defaults, cardmember files,
 check accounts, `deferMerchants` regexes that move merchants to the end of the queue,
-`descriptionFiles` exports that supply descriptions for rows with empty notes),
-`ledger.jsonl` (append-only reasons and history), `applied.json`, `model.json`,
+`descriptionFiles` exports that supply descriptions for rows with empty notes and, with a `merchant`
+column, rename suggestions),
+`ledger.jsonl` (append-only reasons and history, including merchant names), `applied.json`, `model.json`,
 and `eval-<version>.json`. `python -m labeling status` summarizes them.
 
 ## Threshold

@@ -53,13 +53,23 @@ class Labeler:
             self.version += 1
         return {"version": self.version}
 
+    def suggest(self, name: str) -> dict:
+        """A clean name to pre-fill: the SimpleFIN payee if any row has one, else a private export's merchant name."""
+        ws, rows = self.ws, [self.ws.rows[i] for i, shown in self.ws.display.items() if shown == name]
+        for lookup in ((ws.raw.get(r.get("idempotencyKey") or "") or {}).get("payee") for r in rows), \
+                      (ws.export_names.get(r.get("idempotencyKey") or "") for r in rows):
+            votes = Counter(filter(None, lookup))
+            if votes:
+                return {"suggestion": votes.most_common(1)[0][0], "names": sorted(set(ws.names.values()))}
+        return {"suggestion": name, "names": sorted(set(ws.names.values()))}
+
     def card(self, mode: str, skip: set[str], order: str = "impact", key: str = "") -> dict:
         """The next card in the queue, or with `key` the card just labeled, so it stays on screen."""
         queue = self.ws.queue(mode, order)
         group = next((g for g in queue if g["key"] not in skip), None)
         if key:
             ids = [key[1:]] if key.startswith("#") and key[1:] in self.ws.rows else [
-                i for i, k in self.ws.merchant.items() if k == key and self.ws.rows[i].get("visibleSpendingAmount", 1) != 0]
+                i for i, k in self.ws.display.items() if k == key and self.ws.rows[i].get("visibleSpendingAmount", 1) != 0]
             group = next((g for g in queue if g["key"] == key), {"key": key, "ids": ids}) if ids else None
             if group:
                 group = {**group, "ids": ids}
@@ -75,9 +85,10 @@ class Labeler:
         ids = sorted(group["ids"], key=lambda i: rows[i]["activityDate"], reverse=True)
         views = [self.ws.view(i, blind=blind) for i in ids]
         merchant = "" if group["key"].startswith("#") else group["key"]
-        others = [i for i, key in self.ws.merchant.items() if merchant and key == merchant and i not in group["ids"]]
+        others = [i for i, key in self.ws.display.items() if merchant and key == merchant and i not in group["ids"]]
         return {"counts": counts, "card": {
             "key": group["key"], "merchant": merchant, "blind": blind,
+            "keys": self.ws.keys_of(merchant) if merchant else [],
             "rows": views[:60], "more": max(0, len(ids) - 60),
             # A card is complete when every row has a spender and a category (which gives need/want).
             "missing": {"spender": sum(not v["spender"] for v in views), "category": 0 if blind else sum(not v["category"] for v in views)},
@@ -145,7 +156,7 @@ class Labeler:
             i for i, row in ws.rows.items()
             if i not in held and ws.unlabeled(i)
             and (not value or ws.guess[i]["value"] == value) and low <= ws.guess[i]["confidence"] <= high
-            and (not text or text in f"{row.get('notes') or ''} {self.SORTS['account'](ws, i)}".upper())
+            and (not text or text in f"{ws.display[i]} {row.get('notes') or ''} {self.SORTS['account'](ws, i)}".upper())
         ]
         key = self.SORTS[query.get("sort") or "confidence"]
         ids.sort(key=lambda i: key(ws, i), reverse=query.get("dir") == "desc")
@@ -172,6 +183,8 @@ class Labeler:
             return self.audit(query)
         if path == "/api/predictions":
             return self.predictions(query)
+        if path == "/api/suggest":
+            return self.suggest(query.get("merchant", ""))
         if path == "/api/history":
             row_id = query["id"]
             return ws.ledger.history(row_id, ws.merchant.get(row_id, ""))
@@ -182,6 +195,8 @@ class Labeler:
         elif path == "/api/label":
             result = self.write(lambda: ws.label(body.get("value"), ids=body.get("ids", []), merchant=body.get("merchant", ""),
                                                  note=body.get("note", ""), check=bool(body.get("check"))))
+        elif path == "/api/rename":
+            result = self.write(lambda: ws.rename(body.get("name", ""), merchant=body.get("merchant", ""), row_id=body.get("id", "")))
         elif path == "/api/category":
             result = self.write(lambda: ws.categorize(body["categoryId"], ids=body.get("ids", []), merchant=body.get("merchant", "")))
         elif path == "/api/undo":

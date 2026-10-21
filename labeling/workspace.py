@@ -25,6 +25,7 @@ from labeling.ledger import Ledger, now, strongest
 SPENDING = "spending_categories"
 LOCK = Path("maintenance") / "wealthfolio-write.lock"
 FIELD = "spender"
+NAME = "merchant-name"  # ledger field: a display name for a raw merchant key
 TRAIN_WEIGHT = {"user": 1.0, "wealthfolio-ui": 1.0, "merchant": 1.0, "cardmember": 0.3, "account": 0.3}
 
 
@@ -108,7 +109,7 @@ class Workspace:
         self.config = json.loads((self.dir / "config.json").read_text(encoding="utf-8"))
         self.spenders: list[str] = list(self.config["spenders"].values())
         self.threshold = float(self.config.get("threshold", 0.9))
-        self.descriptions = self._descriptions()
+        self.descriptions, self.export_names = self._exports()
         self.ledger = Ledger(self.dir / "ledger.jsonl")
         applied = self.dir / "applied.json"
         self.applied: dict[str, str | None] = json.loads(applied.read_text(encoding="utf-8")) if applied.exists() else {}
@@ -131,7 +132,7 @@ class Workspace:
                 current = self.rows[row["id"]]
                 current["eventId"] = row.get("eventId")
                 current["categoryIds"] = self._categories(row)
-                self.features[row["id"]] = features(current, self.raw.get(current.get("idempotencyKey") or ""), self.zone)
+                self.features[row["id"]] = self._row_features(row["id"])
 
     def signature(self) -> int:
         """Changes whenever anything the labeler shows or decides from changes."""
@@ -139,17 +140,36 @@ class Workspace:
             (i, r.get("updatedAt"), r.get("eventId"), r.get("visibleSpendingAmount"), tuple(r["categoryIds"]))
             for i, r in sorted(self.rows.items()))))
 
-    def _descriptions(self) -> dict[str, str]:
-        """Original descriptions from private exports, keyed like idempotency keys, for rows with empty notes."""
-        found = {}
+    def _exports(self) -> tuple[dict[str, str], dict[str, str]]:
+        """From private exports, keyed like idempotency keys: original descriptions (for rows with empty
+        notes) and, when the export has a merchant column, merchant names to suggest when renaming."""
+        descriptions, names = {}, {}
         for source in self.config.get("descriptionFiles", []):
             path = self.data_dir / source["file"]
             if path.exists():
                 with path.open(encoding="utf-8-sig", newline="") as handle:
                     for line in csv.DictReader(handle):
+                        key = source["key"].format(**line)
                         if (line.get(source["text"]) or "").strip():
-                            found[source["key"].format(**line)] = line[source["text"]].strip()
-        return found
+                            descriptions[key] = line[source["text"]].strip()
+                        if (line.get(source.get("merchant", "")) or "").strip():
+                            names[key] = line[source["merchant"]].strip()
+        return descriptions, names
+
+    def _identify(self) -> None:
+        """Each row's merchant identity: the name given in the labeler, else its raw key."""
+        self.names = {key: entries[-1]["value"] for (field, key), entries in self.ledger.by_merchant.items()
+                      if field == NAME and entries[-1]["value"]}
+        self.display = {i: self.names.get(key, key) for i, key in self.merchant.items()}
+        self.features = {i: self._row_features(i) for i in self.rows}
+
+    def _row_features(self, row_id: str) -> list[str]:
+        row = self.rows[row_id]
+        return features(row, self.raw.get(row.get("idempotencyKey") or ""), self.zone, self.display[row_id].upper())
+
+    def keys_of(self, name: str) -> list[str]:
+        """The raw merchant keys shown under a display name (a raw key is its own name until renamed)."""
+        return sorted({self.merchant[i] for i, shown in self.display.items() if shown == name and self.merchant[i]}) or [name]
 
     @staticmethod
     def _categories(row: dict) -> list[str]:
@@ -170,7 +190,7 @@ class Workspace:
                 row["notes"] = self.descriptions.get(row.get("idempotencyKey") or "")
             self.rows[row["id"]] = row
         self.merchant = {i: merchant_key(r.get("notes")) for i, r in self.rows.items()}
-        self.features = {i: features(r, self.raw.get(r.get("idempotencyKey") or ""), self.zone) for i, r in self.rows.items()}
+        self._identify()
         self.cardmember = self._cardmembers()
         self.train()
 
@@ -339,10 +359,11 @@ class Workspace:
         action = uuid.uuid4().hex[:12]
         base = {"field": FIELD, "value": value, "by": self.by, "action": action, **({"note": note} if note else {})}
         if merchant:
-            ids = [i for i, key in self.merchant.items() if key == merchant]
+            keys = self.keys_of(merchant)
+            ids = [i for i, key in self.merchant.items() if key in keys]
             self.refetch(ids)
-            entry = {**base, "merchant": merchant, "source": "merchant"}
-            entries = [] if self.repeats(self.ledger.by_merchant.get((FIELD, merchant), []), entry) else [entry]
+            entries = [entry for entry in ({**base, "merchant": key, "source": "merchant"} for key in keys)
+                       if not self.repeats(self.ledger.by_merchant.get((FIELD, entry["merchant"]), []), entry)]
         else:
             entries = [entry for entry in ({**base, "activityId": i, "source": "user", **({"check": True} if check else {})} for i in ids)
                        if not self.repeats(self.ledger.by_activity.get((FIELD, entry["activityId"]), []), entry)]
@@ -373,21 +394,26 @@ class Workspace:
         action = uuid.uuid4().hex[:12]
         base = {"field": "category", "value": category_id, "by": self.by, "action": action}
         if merchant:
-            pattern = merchant_pattern(merchant)
-            ids = [i for i, r in self.rows.items() if self.merchant[i] == merchant or re.search(pattern, r.get("notes") or "")]
-            self.refetch(ids)
-            previous = {i: None for i in ids if not self.rows[i]["categoryIds"]}
-            rule_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"spending-labeler/{merchant}"))
-            before = next((r for r in self.client.get("/spending/rules") if r["id"] == rule_id), None)
-            rule = self.client.post("/spending/rules/upsert", {
-                "id": rule_id, "name": f"Merchant {merchant}", "pattern": pattern, "matchType": "regex",
-                "taxonomyId": SPENDING, "categoryId": category_id, "priority": 100, "isGlobal": True,
-            })
+            # One native rule per raw key, so renaming or merging never changes what a rule matches.
+            existing = {r["id"]: r for r in self.client.get("/spending/rules")}
+            entries, touched = [], {}
+            for key in self.keys_of(merchant):
+                pattern = merchant_pattern(key)
+                ids = [i for i, r in self.rows.items() if self.merchant[i] == key or re.search(pattern, r.get("notes") or "")]
+                self.refetch(ids)
+                previous = {i: None for i in ids if not self.rows[i]["categoryIds"]}
+                rule_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"spending-labeler/{key}"))
+                rule = self.client.post("/spending/rules/upsert", {
+                    "id": rule_id, "name": f"Merchant {key}", "pattern": pattern, "matchType": "regex",
+                    "taxonomyId": SPENDING, "categoryId": category_id, "priority": 100, "isGlobal": True,
+                })
+                entries.append({**base, "merchant": key, "source": "merchant", "ruleId": rule["id"],
+                                "previousRule": existing.get(rule_id), "previous": previous})
+                touched.update(previous)
             self.client.post("/spending/rules/rerun", {"onlyUncategorized": True})
-            self.ledger.append([{**base, "merchant": merchant, "source": "merchant", "ruleId": rule["id"],
-                                 "previousRule": before, "previous": previous}])
-            self.refetch(previous)
-            return {"rule": rule["id"], "categorized": sum(1 for i in previous if self.rows[i]["categoryIds"])}
+            self.ledger.append(entries)
+            self.refetch(touched)
+            return {"rules": [e["ruleId"] for e in entries], "categorized": sum(1 for i in touched if self.rows[i]["categoryIds"])}
         entries = []
         for row_id in ids:
             previous = (self.rows[row_id]["categoryIds"] or [None])[0]
@@ -396,6 +422,23 @@ class Workspace:
             entries.append({**base, "activityId": row_id, "source": "user", "previous": {row_id: previous}})
         self.ledger.append(entries)
         return {"categorized": len(entries)}
+
+    def rename(self, name: str, *, merchant: str = "", row_id: str = "") -> dict:
+        """Name a merchant (every raw key under `merchant`) or split one row's raw key out under a new name.
+
+        Only the display name changes: labels and category rules stay keyed by raw key. Keys given the
+        same name merge into one merchant; a blank name, or the raw key itself, goes back to the raw key.
+        """
+        keys = self.keys_of(merchant) if merchant else [self.merchant[row_id]]
+        name = " ".join(name.split())
+        action = uuid.uuid4().hex[:12]
+        entries = [entry for entry in ({"field": NAME, "merchant": key, "value": name if name and name != key else None,
+                                         "source": "user", "by": self.by, "action": action} for key in keys if key)
+                   if not self.repeats(self.ledger.by_merchant.get((NAME, entry["merchant"]), []), entry)]
+        self.ledger.append(entries)
+        self._identify()
+        self.train()
+        return {"recorded": len(entries), "key": self.names.get(keys[0], keys[0])}
 
     def undo(self) -> dict:
         entries = self.ledger.last_action(self.by)
@@ -420,6 +463,8 @@ class Workspace:
                     elif row_id in self.rows and entry["value"] in self.rows[row_id]["categoryIds"]:
                         self.client.delete(f"/spending/activities/{row_id}/assignments/{SPENDING}")
         self.ledger.append([{"field": e["field"], "reverts": e["seq"], "by": self.by} for e in entries])
+        if any(e["field"] == NAME for e in entries):
+            self._identify()
         if any(e["field"] == "category" for e in entries):
             self.refetch(touched & set(self.rows))
         self.train()
@@ -467,11 +512,12 @@ class Workspace:
         for row_id, row in self.rows.items():
             if not self.incomplete(row_id):
                 continue
-            key = self.merchant[row_id] or f"#{row_id}"
+            key = self.display[row_id] or f"#{row_id}"
             day, amount, (confidence, raw) = row["activityDate"][:10], abs(float(row.get("amount") or 0)), self.guess[row_id]["rank"]
             group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0, "total": 0.0, "weighted": [0.0, 0.0, 0.0],
                                             "first": day, "last": day})
             group["ids"].append(row_id)
+            group.setdefault("keys", set()).add(self.merchant[row_id] or key)
             group["value"] += (1 - confidence) * amount if self.unlabeled(row_id) else amount
             group["total"] += amount
             weight = max(amount, 0.01)
@@ -484,7 +530,7 @@ class Workspace:
         field, descending = self.ORDERS.get(order, self.ORDERS["impact"])
         ordered = sorted(groups.values(), key=lambda g: g[field], reverse=descending)
         defer = [re.compile(p) for p in self.config.get("deferMerchants", [])]
-        return sorted(ordered, key=lambda g: any(p.search(g["key"]) for p in defer))
+        return sorted(ordered, key=lambda g: any(p.search(k) for p in defer for k in g["keys"]))
 
     def view(self, row_id: str, *, blind: bool = False) -> dict:
         row = self.rows[row_id]
@@ -493,7 +539,7 @@ class Workspace:
         return {
             "id": row_id, "date": row["activityDate"][:10], "amount": float(row.get("amount") or 0),
             "type": row["activityType"], "account": self.accounts.get(row["accountId"], {}).get("name", ""),
-            "notes": row.get("notes") or "", "merchant": self.merchant[row_id],
+            "notes": row.get("notes") or "", "merchant": self.merchant[row_id], "name": self.display[row_id],
             "category": ", ".join(self.categories.get(c, {}).get("name", c) for c in row["categoryIds"]),
             "needWant": self.need_want(row),
             "spender": label["value"] if label else None,
