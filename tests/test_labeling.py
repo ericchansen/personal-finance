@@ -573,3 +573,49 @@ def test_a_labeled_card_stays_on_screen_until_moved_on(world):
     assert card["key"] == "HARDWARE STORE" and card["labeled"] == [("Joint", 2)]
     assert all(r["spender"] == "Joint" and r["source"] == "merchant" for r in card["rows"])
     assert app.handle("GET", "/api/card", {"key": "NO SUCH SHOP"}, {})["card"] is None
+
+def test_renaming_merges_and_splits_merchants_without_losing_labels_or_categories(world):
+    fake, ws = world
+    fake.add("kiosk", "shared", "TINY KIOSK 1", amount=4)
+    ws.refresh()
+    app = Labeler(ws)
+    app.handle("POST", "/api/label", {}, {"value": "Joint", "merchant": "HARDWARE STORE"})
+    app.handle("POST", "/api/category", {}, {"categoryId": "cat_groceries", "merchant": "HARDWARE STORE"})
+    hardware = [i for i, k in ws.merchant.items() if k == "HARDWARE STORE"]
+    before = {i: (ws.resolve(i)["value"], ws.resolve(i)["source"], fake.rows[i]["eventId"], ws.rows[i]["categoryIds"]) for i in hardware}
+    rules = copy.deepcopy(fake.rules)
+
+    assert app.handle("POST", "/api/rename", {}, {"name": "Corner Hardware", "merchant": "HARDWARE STORE"})["key"] == "Corner Hardware"
+    assert app.handle("POST", "/api/rename", {}, {"name": "Corner Hardware", "merchant": "TINY KIOSK"})["recorded"] == 1
+    after = {i: (ws.resolve(i)["value"], ws.resolve(i)["source"], fake.rows[i]["eventId"], ws.rows[i]["categoryIds"]) for i in hardware}
+    assert after == before and fake.rules == rules, "a name never touches labels, events, categories, or rules"
+    assert "m:CORNER HARDWARE" in ws.features["kiosk"] and "m:CORNER HARDWARE" in ws.features[hardware[0]]
+    card = app.handle("GET", "/api/card", {"key": "Corner Hardware"}, {})["card"]
+    assert card["keys"] == ["HARDWARE STORE", "TINY KIOSK"] and {r["id"] for r in card["rows"]} == {*hardware, "kiosk"}
+    assert {r["name"] for r in card["rows"]} == {"Corner Hardware"} and {r["notes"] for r in card["rows"]} == {"HARDWARE STORE 0412", "TINY KIOSK 1"}
+    assert app.handle("GET", "/api/suggest", {"merchant": "Corner Hardware"}, {})["names"] == ["Corner Hardware"]
+
+    app.handle("POST", "/api/label", {}, {"value": "Ben", "merchant": "Corner Hardware"})
+    assert {e["merchant"] for e in ws.ledger.live if e.get("value") == "Ben"} == {"HARDWARE STORE", "TINY KIOSK"}
+
+    app.handle("POST", "/api/rename", {}, {"name": "Kiosk", "id": "kiosk"})
+    assert ws.display["kiosk"] == "Kiosk" and ws.keys_of("Corner Hardware") == ["HARDWARE STORE"]
+    app.handle("POST", "/api/undo", {}, {})
+    assert ws.display["kiosk"] == "Corner Hardware"
+    app.handle("POST", "/api/rename", {}, {"name": "", "merchant": "Corner Hardware"})
+    assert ws.display[hardware[0]] == "HARDWARE STORE" and ws.display["kiosk"] == "TINY KIOSK"
+    assert {i: ws.rows[i]["categoryIds"] for i in hardware} == {i: v[3] for i, v in before.items()}
+
+
+def test_rename_suggestions_prefer_the_payee_then_an_export_name(world):
+    fake, ws = world
+    fake.add("vac", "shared", "UNIQUE VAC REP 1", amount=900, idempotencyKey="legacy:9")
+    (ws.data_dir / "export.csv").write_text("Id,Original Statement,Merchant\n9,UNIQUE VAC REP 1,Island Resorts\n", encoding="utf-8")
+    ws.config["descriptionFiles"] = [{"file": "export.csv", "key": "legacy:{Id}", "text": "Original Statement", "merchant": "Merchant"}]
+    ws.descriptions, ws.export_names = ws._exports()
+    ws.refresh()
+    app = Labeler(ws)
+    assert app.handle("GET", "/api/suggest", {"merchant": "UNIQUE VAC"}, {})["suggestion"] == "Island Resorts"
+    ws.raw["legacy:9"] = {"payee": "Island Resorts Travel"}
+    assert app.handle("GET", "/api/suggest", {"merchant": "UNIQUE VAC"}, {})["suggestion"] == "Island Resorts Travel"
+    assert app.handle("GET", "/api/suggest", {"merchant": "HARDWARE STORE"}, {})["suggestion"] == "HARDWARE STORE"

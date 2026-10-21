@@ -65,11 +65,12 @@ def raw_index(data_dir: Path) -> dict[str, dict]:
     return index
 
 
-def features(row: dict, raw: dict | None = None, zone=timezone.utc) -> list[str]:
+def features(row: dict, raw: dict | None = None, zone=timezone.utc, merchant: str | None = None) -> list[str]:
+    """`merchant` overrides the identity derived from the description (a name given in the labeler)."""
     raw = raw or {}
     notes = row.get("notes")
     found = [f"type:{row['activityType'].lower()}"]
-    key = merchant_key(notes)
+    key = merchant_key(notes) if merchant is None else merchant
     if key:
         found.append(f"m:{key}")
         found += [f"w:{word}" for word in dict.fromkeys(tokens(notes))
