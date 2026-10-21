@@ -4,6 +4,7 @@
     python -m labeling apply    # reconcile, retrain, and auto-apply labels (also runs daily)
     python -m labeling status   # labels by source and confidence, plus the latest evaluation
     python -m labeling serve    # the labeler canvas backend (prints its loopback URL)
+    python -m labeling llm      # propose categories for uncategorized merchants with a local model (--eval first)
 
 Private inputs and outputs live in <data>/labels/; see docs/runbooks/labeling.md.
 """
@@ -58,11 +59,15 @@ def latest_eval(ws: Workspace) -> dict | None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m labeling", description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("setup", "apply", "status", "serve"))
+    parser.add_argument("command", choices=("setup", "apply", "status", "serve", "llm"))
     parser.add_argument("--data-dir", default=os.environ.get("FINANCE_DATA"), required=not os.environ.get("FINANCE_DATA"))
     parser.add_argument("--base-url", default=os.environ.get("WEALTHFOLIO_URL", "http://127.0.0.1:8088"))
     parser.add_argument("--dry-run", action="store_true", help="apply: report what would change")
     parser.add_argument("--port", type=int, default=0, help="serve: loopback port (0 picks a free one)")
+    parser.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"), help="llm: loopback only")
+    parser.add_argument("--model", default=os.environ.get("LABELING_MODEL", "qwen3.8:27b"), help="llm: a local Ollama model")
+    parser.add_argument("--eval", action="store_true", help="llm: score merchants whose category is known")
+    parser.add_argument("--limit", type=int, help="llm: ask about at most this many merchants")
     args = parser.parse_args(argv)
     data_dir = Path(args.data_dir)
     if not (data_dir / "labels" / "config.json").exists():
@@ -78,6 +83,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "status":
         print(json.dumps({**ws.status(), "eval": latest_eval(ws)}, indent=2))
+        return 0
+    if args.command == "llm":
+        from labeling import llm
+        client = llm.Ollama(args.ollama_url, args.model)
+        log = lambda line: print(line, file=sys.stderr, flush=True)
+        print(json.dumps(llm.run(ws, client, evaluate_only=args.eval, limit=args.limit, log=log), indent=2))
         return 0
     if args.command == "apply" and args.dry_run:
         print(json.dumps(apply(ws, True), indent=2))

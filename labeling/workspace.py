@@ -21,7 +21,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from importers.simplefin.wealthfolio_client import WealthfolioClient
-from labeling import model as nb
+from labeling import llm, model as nb
 from labeling.features import describe, features, merchant_key, merchant_pattern, raw_index
 from labeling.ledger import Ledger, now, strongest
 
@@ -479,17 +479,25 @@ class Workspace:
         return self.sync([e["activityId"] for e in entries])
 
     def suggest_category(self, ids, need_want: str | None = None) -> tuple[str | None, str]:
-        """A built-in category to pre-select, and why: one already used on this merchant, else the one most
-        used on rows sharing a word with it, else the first top-level category of that need/want group."""
+        """A built-in category to pre-select, and why: one already used on this merchant, else the local
+        model's proposal, else the one most used on rows sharing a word with it, else the first top-level
+        category of that need/want group."""
         fits = lambda c: need_want is None or self.need_want({"categoryIds": [c]}) == need_want
         keys = {self.merchant[i] for i in ids if self.merchant[i]}
         same = [i for i, key in self.merchant.items() if key in keys] or list(ids)
+        votes = Counter(c for i in same for c in self.rows[i]["categoryIds"] if fits(c))
+        if votes:
+            return votes.most_common(1)[0][0], "already used on this merchant"
+        proposed = llm.proposals(self)
+        found = next((p for key in sorted(keys) if (p := proposed.get(key)) and p["categoryId"] and fits(p["categoryId"])), None)
+        if found:
+            sure = f" · {found['confidence']:.2f}" if found["confidence"] is not None else ""
+            return found["categoryId"], f"local model {found['model']}{sure}: {found['rationale']}"
         words = {f for i in ids for f in self.features[i] if f.startswith("w:")}
         similar = [i for i, found in self.features.items() if i not in same and words.intersection(found)]
-        for rows, why in ((same, "already used on this merchant"), (similar, "most used on merchants with the same words")):
-            votes = Counter(c for i in rows for c in self.rows[i]["categoryIds"] if fits(c))
-            if votes:
-                return votes.most_common(1)[0][0], why
+        votes = Counter(c for i in similar for c in self.rows[i]["categoryIds"] if fits(c))
+        if votes:
+            return votes.most_common(1)[0][0], "most used on merchants with the same words"
         top = sorted((c for c in self.categories.values() if not c.get("parentId") and fits(c["id"])), key=lambda c: c.get("sortOrder", 0))
         return (top[0]["id"], f"first {need_want} category" if need_want else "first category") if top else (None, "")
 
