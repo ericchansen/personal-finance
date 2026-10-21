@@ -55,6 +55,16 @@ class Labeler:
             self.version += 1
         return {"version": self.version}
 
+    def remove_rule(self, rule_id: str) -> dict:
+        """Remove a rule from the Rules view or a card: a Wealthfolio rule, a merchant spender label, or a name."""
+        field, _, seq = rule_id.partition(":")
+        if field == "spender" and seq.isdigit():
+            return self.ws.remove_label(int(seq))
+        if field == "merchant-name" and seq.isdigit():
+            key = next(e["merchant"] for e in self.ws.ledger.live if e["seq"] == int(seq))
+            return self.ws.rename("", row_id=next(i for i, k in self.ws.merchant.items() if k == key))
+        return self.ws.remove_rule(rule_id)
+
     def suggest(self, name: str) -> dict:
         """A clean name to pre-fill: the SimpleFIN payee if any row has one, else a private export's merchant name."""
         ws, rows = self.ws, [self.ws.rows[i] for i, shown in self.ws.display.items() if shown == name]
@@ -102,6 +112,7 @@ class Labeler:
                 "confidence": round(group["confidence"][0], 3) if "confidence" in group else None,
             },
             # Labels made by hand; defaults show only as each row's source tag.
+            "rules": [] if blind else self.ws.card_rules(ids),
             "labeled": Counter(v["spender"] for v in views if v["spender"] and v["source"] in ("user", "merchant")).most_common(),
         }}
 
@@ -184,6 +195,8 @@ class Labeler:
                      "needWant": ws.need_want({"categoryIds": [i]})} for i, c in ws.categories.items()]
         if path == "/api/audit":
             return self.audit(query)
+        if path == "/api/rules":
+            return ws.rules_list()
         if path == "/api/predictions":
             return self.predictions(query)
         if path == "/api/category-suggest":
@@ -202,6 +215,8 @@ class Labeler:
         elif path == "/api/label":
             result = self.write(lambda: ws.label(body.get("value"), ids=body.get("ids", []), merchant=body.get("merchant", ""),
                                                  note=body.get("note", ""), check=bool(body.get("check"))))
+        elif path == "/api/rules/remove":
+            result = self.write(lambda: self.remove_rule(body["id"]))
         elif path == "/api/rename":
             result = self.write(lambda: ws.rename(body.get("name", ""), merchant=body.get("merchant", ""), row_id=body.get("id", "")))
         elif path == "/api/category":

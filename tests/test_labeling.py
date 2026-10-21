@@ -700,3 +700,49 @@ def test_shutdown_stops_the_server_between_requests(world):
         assert response.status == 200
     runner.join(timeout=5)
     assert not runner.is_alive()
+
+@pytest.mark.parametrize("rule, notes, expected", [
+    ({"matchType": "contains", "pattern": "kettle"}, "SQ *BLUE KETTLE", True),
+    ({"matchType": "starts_with", "pattern": "sq *"}, "SQ *BLUE KETTLE", True),
+    ({"matchType": "exact", "pattern": "sq *blue"}, "SQ *BLUE KETTLE", False),
+    ({"matchType": "regex", "pattern": "(?i)blue\\s+kettle$"}, "SQ *BLUE KETTLE", True),
+    ({"matchType": "contains", "pattern": "KETTLE", "isGlobal": False, "accountId": "other"}, "SQ *BLUE KETTLE", False),
+    ({"matchType": "contains", "pattern": "KETTLE", "activityType": "CREDIT"}, "SQ *BLUE KETTLE", False),
+    ({"matchType": "contains", "pattern": "KETTLE", "amountOp": "between", "amountValue": 5, "amountValue2": 7}, "SQ *BLUE KETTLE", True),
+    ({"matchType": "contains", "pattern": "KETTLE", "amountOp": "gt", "amountValue": 50}, "SQ *BLUE KETTLE", False),
+])
+def test_native_rules_match_like_wealthfolio(rule, notes, expected):
+    from labeling.workspace import rule_matches
+    row = {"accountId": "acct-ann", "activityType": "WITHDRAWAL", "amount": "-6"}
+    assert rule_matches({"isGlobal": True, **rule}, row, notes) is expected
+
+
+def test_rules_are_explained_listed_and_removable(world):
+    fake, ws = world
+    fake.rules.append({"id": "preset-1", "name": "Coffee shops", "pattern": "COFFEE", "matchType": "contains", "taxonomyId": "spending_categories",
+                       "categoryId": "cat_food_coffee", "priority": 50, "isGlobal": True, "presetId": "us", "updatedAt": "2026-08-01T00:00:00"})
+    fake.post("/spending/rules/rerun", {})
+    ws.refresh()
+    app = Labeler(ws)
+    app.handle("POST", "/api/label", {}, {"value": "Joint", "merchant": "HARDWARE STORE"})
+    app.handle("POST", "/api/category", {}, {"categoryId": "cat_groceries", "merchant": "HARDWARE STORE"})
+
+    coffee = ws.view("ann-0")
+    assert (coffee["categoryBy"], coffee["spenderBy"]) == ("preset", "account default") and "Coffee shops" in coffee["categoryWhy"]
+    hardware = ws.view("shared-hardware-1")
+    assert hardware["spenderBy"] == "all HARDWARE STORE" and "past and future" in hardware["spenderWhy"] and hardware["categoryBy"] == "rule"
+    ws.categorize("cat_groceries", ids=["shared-coffee"])
+    assert ws.view("shared-coffee")["categoryBy"] == "manual"
+
+    listed = {(r["kind"], r["source"]): r for r in app.handle("GET", "/api/rules", {}, {})}
+    assert listed[("Category", "preset")]["rows"] == 13 and listed[("Category", "labeler (in Wealthfolio)")]["sets"] == "Groceries"
+    card = app.handle("GET", "/api/card", {"key": "HARDWARE STORE"}, {})["card"]
+    assert {r["kind"] for r in card["rules"]} == {"Spender", "Category"}
+
+    app.handle("POST", "/api/rules/remove", {}, {"id": "preset-1"})
+    assert "preset-1" not in {r["id"] for r in fake.rules} and ws.rows["ann-0"]["categoryIds"] == ["cat_food_coffee"]
+    app.handle("POST", "/api/undo", {}, {})
+    assert "preset-1" in {r["id"] for r in fake.rules} and next(r for r in fake.rules if r["id"] == "preset-1")["presetId"] == "us"
+    spender = listed[("Spender", "labeler")]
+    app.handle("POST", "/api/rules/remove", {}, {"id": spender["id"]})
+    assert ws.resolve("shared-hardware-1") is None or ws.resolve("shared-hardware-1")["source"] != "merchant"
