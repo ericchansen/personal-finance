@@ -227,9 +227,10 @@ class Workspace:
         self.model, self.version = nb.train(self.spenders, examples)
         self.guess = {}
         for row_id, found in self.features.items():
-            value, confidence, lift = self.model.predict(found)
+            value, confidence, lift, raw = self.model.predict(found)
             self.guess[row_id] = {
                 "source": "model", "value": value, "confidence": confidence, "model": self.version,
+                "rank": (confidence, raw),
                 "reasons": [f"{describe(f, names)} (seen {count}x as {value})" for f, _, count in lift],
             }
         self.examples, self.check = examples, check
@@ -425,13 +426,19 @@ class Workspace:
             if not self.unlabeled(row_id):
                 continue
             key = self.merchant[row_id] or f"#{row_id}"
-            day, amount, confidence = row["activityDate"][:10], abs(float(row.get("amount") or 0)), self.guess[row_id]["confidence"]
-            group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0, "total": 0.0, "confidence": 0.0, "first": day, "last": day})
+            day, amount, (confidence, raw) = row["activityDate"][:10], abs(float(row.get("amount") or 0)), self.guess[row_id]["rank"]
+            group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0, "total": 0.0, "weighted": [0.0, 0.0, 0.0],
+                                            "first": day, "last": day})
             group["ids"].append(row_id)
             group["value"] += (1 - confidence) * amount
             group["total"] += amount
-            group["confidence"] = max(group["confidence"], confidence)
+            weight = max(amount, 0.01)
+            group["weighted"] = [group["weighted"][0] + weight, group["weighted"][1] + weight * confidence, group["weighted"][2] + weight * raw]
             group["first"], group["last"] = min(group["first"], day), max(group["last"], day)
+        for group in groups.values():
+            # A merchant's confidence: the amount-weighted mean over its rows, calibrated first, raw as tie-break.
+            weight, confidence, raw = group.pop("weighted")
+            group["confidence"] = (confidence / weight, raw / weight)
         field, descending = self.ORDERS.get(order, self.ORDERS["impact"])
         ordered = sorted(groups.values(), key=lambda g: g[field], reverse=descending)
         defer = [re.compile(p) for p in self.config.get("deferMerchants", [])]
