@@ -64,9 +64,10 @@ class WealthfolioClient:
         self.api = f"{self.base}/api/v1"
         self.timeout = timeout
         self._jar = http.cookiejar.CookieJar()
+        self._password: str | None = None
         self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._jar))
 
-    def _request(self, method: str, path: str, payload: Any = None) -> Any:
+    def _request(self, method: str, path: str, payload: Any = None, retry: bool = True) -> Any:
         body = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(self.api + path, data=body, method=method)
         req.add_header("Content-Type", "application/json")
@@ -76,6 +77,10 @@ class WealthfolioClient:
             with self._opener.open(req, timeout=self.timeout) as response:
                 raw = response.read().decode()
         except urllib.error.HTTPError as exc:
+            # Sessions expire; a long-running client signs in again once and retries.
+            if exc.code == 401 and retry and self._password is not None and path != "/auth/login":
+                self.login(self._password)
+                return self._request(method, path, payload, retry=False)
             raise WealthfolioError(exc.code, path, exc.read().decode()) from None
         if not raw:
             return None
@@ -98,6 +103,7 @@ class WealthfolioClient:
 
     def login(self, password: str) -> None:
         self.post("/auth/login", {"password": password})
+        self._password = password
         if not any(c.name == "wf_session" for c in self._jar):
             raise WealthfolioError(401, "/auth/login", "no session cookie returned")
 
