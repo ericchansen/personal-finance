@@ -44,6 +44,14 @@ class Labeler:
                 self.version += 1
             return result
 
+    def reread(self) -> dict:
+        """Pick up changes made outside the labeler (Wealthfolio, other sessions, the private config)."""
+        before = self.ws.signature()
+        self.ws.load()
+        if self.ws.signature() != before:
+            self.version += 1
+        return {"version": self.version}
+
     def card(self, mode: str, skip: set[str], order: str = "impact") -> dict:
         queue = self.ws.queue(mode, order)
         group = next((g for g in queue if g["key"] not in skip), None)
@@ -133,6 +141,8 @@ class Labeler:
             return {"spenders": ws.config["spenders"], "threshold": ws.threshold, "model": ws.version}
         if path == "/api/version":
             return {"version": self.version}
+        if path == "/api/refresh":
+            return self.reread()
         if path == "/api/card":
             return self.card(query.get("mode", "queue"), set(filter(None, query.get("skip", "").split("\n"))),
                              query.get("order", "impact"))
