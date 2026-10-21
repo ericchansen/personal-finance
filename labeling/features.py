@@ -12,7 +12,7 @@ TOKEN = re.compile(r"[A-Z][A-Z0-9'&]*")
 # Processor and bank wording that precedes the real merchant name.
 NOISE = {
     "SQ", "TST", "SP", "PAYPAL", "PP", "POS", "DEBIT", "PURCHASE", "CHECKCARD", "CARD",
-    "WEB", "INITIATED", "PAYMENT", "AT", "ACH", "RECURRING",
+    "WEB", "INITIATED", "PAYMENT", "AT", "ACH", "RECURRING", "WITHDRAWAL", "DEPOSIT", "ELECTRONIC", "PREAUTHORIZED",
 }
 DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 KINDS = {"m": "merchant", "w": "word", "mcc": "MCC", "type": "type"}

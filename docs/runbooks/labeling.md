@@ -27,7 +27,8 @@ column and filter; **Enter** accepts a guess, and **Space** then **A** accepts t
 ## Private files (`<data>/labels/`)
 
 `config.json` (spenders and keys, threshold, account defaults, cardmember files,
-check accounts, `deferMerchants` regexes that move merchants to the end of the queue),
+check accounts, `deferMerchants` regexes that move merchants to the end of the queue,
+`descriptionFiles` exports that supply descriptions for rows with empty notes),
 `ledger.jsonl` (append-only reasons and history), `applied.json`, `model.json`,
 and `eval-<version>.json`. `python -m labeling status` summarizes them.
 
