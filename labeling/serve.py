@@ -53,9 +53,16 @@ class Labeler:
             self.version += 1
         return {"version": self.version}
 
-    def card(self, mode: str, skip: set[str], order: str = "impact") -> dict:
+    def card(self, mode: str, skip: set[str], order: str = "impact", key: str = "") -> dict:
+        """The next card in the queue, or with `key` the card just labeled, so it stays on screen."""
         queue = self.ws.queue(mode, order)
         group = next((g for g in queue if g["key"] not in skip), None)
+        if key:
+            ids = [key[1:]] if key.startswith("#") and key[1:] in self.ws.rows else [
+                i for i, k in self.ws.merchant.items() if k == key and self.ws.rows[i].get("visibleSpendingAmount", 1) != 0]
+            group = next((g for g in queue if g["key"] == key), {"key": key, "ids": ids}) if ids else None
+            if group:
+                group = {**group, "ids": ids}
         rows = self.ws.rows
         counts = {
             "groups": len(queue), "rows": sum(len(g["ids"]) for g in queue),
@@ -66,18 +73,22 @@ class Labeler:
             return {"card": None, "counts": counts}
         blind = mode == "check"
         ids = sorted(group["ids"], key=lambda i: rows[i]["activityDate"], reverse=True)
+        views = [self.ws.view(i, blind=blind) for i in ids]
         merchant = "" if group["key"].startswith("#") else group["key"]
         others = [i for i, key in self.ws.merchant.items() if merchant and key == merchant and i not in group["ids"]]
         return {"counts": counts, "card": {
             "key": group["key"], "merchant": merchant, "blind": blind,
-            "rows": [self.ws.view(i, blind=blind) for i in ids[:60]], "more": max(0, len(ids) - 60),
+            "rows": views[:60], "more": max(0, len(ids) - 60),
+            # A card is complete when every row has a spender and a category (which gives need/want).
+            "missing": {"spender": sum(not v["spender"] for v in views), "category": 0 if blind else sum(not v["category"] for v in views)},
             "labeledElsewhere": len(others),
             "total": round(sum(abs(float(rows[i].get("amount") or 0)) for i in ids), 2),
             # The merchant's predictions and the same confidence the queue sorts by; hidden for blind checks.
             "summary": None if blind else {
                 "predicted": Counter(self.ws.guess[i]["value"] for i in ids).most_common(),
-                "confidence": round(group["confidence"][0], 3),
+                "confidence": round(group["confidence"][0], 3) if "confidence" in group else None,
             },
+            "labeled": Counter(v["spender"] for v in views if v["spender"]).most_common(),
         }}
 
     def audit(self, query: dict) -> list[dict]:
@@ -118,6 +129,7 @@ class Labeler:
         "account": lambda ws, i: ws.accounts.get(ws.rows[i]["accountId"], {}).get("name", ""),
         "amount": lambda ws, i: abs(float(ws.rows[i].get("amount") or 0)),
         "category": lambda ws, i: ws.view(i)["category"],
+        "needWant": lambda ws, i: ws.view(i)["needWant"] or "",
         "value": lambda ws, i: ws.guess[i]["value"],
         "confidence": lambda ws, i: ws.guess[i]["rank"],
     }
@@ -151,7 +163,7 @@ class Labeler:
             return self.reread()
         if path == "/api/card":
             return self.card(query.get("mode", "queue"), set(filter(None, query.get("skip", "").split("\n"))),
-                             query.get("order", "impact"))
+                             query.get("order", "impact"), query.get("key", ""))
         if path == "/api/categories":
             names = {i: c["name"] for i, c in ws.categories.items()}
             return [{"id": i, "name": c["name"], "parent": names.get(c.get("parentId") or "", ""),

@@ -330,16 +330,24 @@ class Workspace:
                 self._save_applied()
         return result
 
+    def repeats(self, entries: list[dict], entry: dict) -> bool:
+        """A repeated decision (say a double key press) changes nothing, so it is not recorded again."""
+        mine = [e for e in entries if e["source"] == entry["source"]]
+        return bool(mine) and all(mine[-1].get(k) == entry.get(k) for k in ("value", "note", "check"))
+
     def label(self, value: str | None, *, ids=(), merchant: str = "", note: str = "", check: bool = False) -> dict:
         action = uuid.uuid4().hex[:12]
         base = {"field": FIELD, "value": value, "by": self.by, "action": action, **({"note": note} if note else {})}
         if merchant:
             ids = [i for i, key in self.merchant.items() if key == merchant]
             self.refetch(ids)
-            self.ledger.append([{**base, "merchant": merchant, "source": "merchant"}])
+            entry = {**base, "merchant": merchant, "source": "merchant"}
+            entries = [] if self.repeats(self.ledger.by_merchant.get((FIELD, merchant), []), entry) else [entry]
         else:
-            self.ledger.append([{**base, "activityId": i, "source": "user", **({"check": True} if check else {})} for i in ids])
-        return self.sync(ids)
+            entries = [entry for entry in ({**base, "activityId": i, "source": "user", **({"check": True} if check else {})} for i in ids)
+                       if not self.repeats(self.ledger.by_activity.get((FIELD, entry["activityId"]), []), entry)]
+        self.ledger.append(entries)
+        return {**self.sync(ids), "recorded": len(entries)}
 
     def accept(self, items: list[dict]) -> dict:
         """Confirm predictions as user labels, keeping the model's confidence and reasons as provenance.
@@ -354,8 +362,10 @@ class Workspace:
                 continue
             guess = self.guess[row_id]
             model = {k: guess[k] for k in ("confidence", "reasons", "model")} if guess["value"] == value else {}
-            entries.append({"field": FIELD, "activityId": row_id, "value": value, "source": "user", "accepted": True,
-                            "by": self.by, "action": action, **model})
+            entry = {"field": FIELD, "activityId": row_id, "value": value, "source": "user", "accepted": True,
+                     "by": self.by, "action": action, **model}
+            if not self.repeats(self.ledger.by_activity.get((FIELD, row_id), []), entry):
+                entries.append(entry)
         self.ledger.append(entries)
         return self.sync([e["activityId"] for e in entries])
 
@@ -424,6 +434,18 @@ class Workspace:
                       key=lambda i: hashlib.sha1(i.encode()).hexdigest())
         return pool[: int(self.config.get("checkSize", 100))]
 
+    def incomplete(self, row_id: str) -> bool:
+        """Still needs work: no spender, or a spender set by hand but no category (so no need/want yet).
+
+        Account and cardmember defaults without a category are not queued; there are thousands.
+        """
+        if self.unlabeled(row_id):
+            return True
+        row = self.rows[row_id]
+        if row.get("visibleSpendingAmount", 1) == 0 or self.foreign_event(row_id) or row["categoryIds"]:
+            return False
+        return self.resolve(row_id)["source"] in ("user", "merchant", "wealthfolio-ui")
+
     def unlabeled(self, row_id: str) -> bool:
         """Needs a spender: counts as spending (Wealthfolio's excluded categories do not) and has none."""
         if self.rows[row_id].get("visibleSpendingAmount", 1) == 0:
@@ -443,14 +465,14 @@ class Workspace:
             return [{"key": f"#{i}", "ids": [i], "value": 0} for i in self.check_ids() if i not in done]
         groups: dict[str, dict] = {}
         for row_id, row in self.rows.items():
-            if not self.unlabeled(row_id):
+            if not self.incomplete(row_id):
                 continue
             key = self.merchant[row_id] or f"#{row_id}"
             day, amount, (confidence, raw) = row["activityDate"][:10], abs(float(row.get("amount") or 0)), self.guess[row_id]["rank"]
             group = groups.setdefault(key, {"key": key, "ids": [], "value": 0.0, "total": 0.0, "weighted": [0.0, 0.0, 0.0],
                                             "first": day, "last": day})
             group["ids"].append(row_id)
-            group["value"] += (1 - confidence) * amount
+            group["value"] += (1 - confidence) * amount if self.unlabeled(row_id) else amount
             group["total"] += amount
             weight = max(amount, 0.01)
             group["weighted"] = [group["weighted"][0] + weight, group["weighted"][1] + weight * confidence, group["weighted"][2] + weight * raw]

@@ -45,6 +45,10 @@
   .conf.mid i { background: var(--true-color-yellow, #bf8700); }
   .conf.high i { background: var(--true-color-green, #1a7f37); }
   .labeled { font-weight: var(--font-weight-semibold, 600); }
+  .pill.ok { background: var(--true-color-green-muted, #dafbe1); }
+  .pill.bad { background: var(--true-color-red-muted, #ffebe9); }
+  .miss { color: var(--true-color-red, #cf222e); }
+  body.saving main, body.saving #pred, body.saving #audit { opacity: .45; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -91,6 +95,15 @@ const ORDERS = [["impact", "Biggest impact"], ["low-confidence", "Lowest confide
   ["newest", "Newest first"], ["oldest", "Oldest first"], ["amount", "Largest amount"], ["merchant", "Merchant A–Z"]];
 const store = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
 const pred = { rows: [], total: 0, sort: "confidence", dir: "asc", offset: 0, cur: 0, selected: new Map() };
+let busy = false, pinned = null;  // a write in flight; the card to keep showing after labeling it
+let confirmSkip = null;  // the incomplete card whose skip was asked about once
+const needWantCell = (r) => (r.category ? esc(r.needWant || "—") : '<span class="miss" title="No category, so no need/want">✗ none</span>');
+function missingText() {
+  const m = card.missing, parts = [];
+  if (m.spender) parts.push(`Spender not set on ${m.spender} row${m.spender === 1 ? "" : "s"}`);
+  if (m.category) parts.push(`Need/Want not set on ${m.category} row${m.category === 1 ? "" : "s"}`);
+  return parts.join(", ");
+}
 let seen = -1, config, mode = "queue", card = null, cur = 0, skip = [], note = "", categories = [], picker = null, audit = [], auditCur = 0;
 
 async function api(path, body) {
@@ -110,7 +123,7 @@ function legend() {
     : mode === "predictions" ? `${common} <span><kbd>Enter</kbd> accept prediction</span> <span><kbd>Space</kbd> select</span>
        <span><kbd>A</kbd> accept selected</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span> <span><kbd>PgUp</kbd><kbd>PgDn</kbd> page</span>`
     : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> need/want category</span>
-       <span><kbd>'</kbd> note</span> <span><kbd>S</kbd> skip</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span>
+       <span><kbd>'</kbd> note</span> <span><kbd>→</kbd>/<kbd>Space</kbd> next card</span> <span><kbd>←</kbd> previous card</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span>
        ${mode === "queue" ? "<span><kbd>O</kbd> order</span>" : ""} <span><kbd>Esc</kbd> close</span>`;
   $("keys").insertAdjacentHTML("afterbegin", `${views} `);
 }
@@ -124,13 +137,15 @@ async function load() {
   legend();
   if (mode === "audit") return loadAudit();
   if (mode === "predictions") return loadPredictions();
-  const data = await api(`/api/card?mode=${mode}&order=${$("order").value}&skip=${encodeURIComponent(skip.join("\n"))}`);
+  const data = await api(`/api/card?mode=${mode}&order=${$("order").value}&skip=${encodeURIComponent(skip.join("\n"))}${pinned ? `&key=${encodeURIComponent(pinned)}` : ""}`);
+  if (pinned && !data.card) { pinned = null; return load(); }
   const c = data.counts;
   seen = c.version;
   $("counts").textContent = `${c.rows.toLocaleString()} rows (${money(c.amount)}) left in ${c.groups.toLocaleString()} ${mode === "check" ? "check rows" : "merchants"} · ${c.session} labeled this session · model ${config.model}`;
   $("progress").style.width = `${Math.round(100 * (1 - c.rows / Math.max(c.total, 1)))}%`;
   if (c.notice && !$("notice").textContent) flash(c.notice);
-  card = data.card; cur = 0;
+  const same = card && data.card && card.key === data.card.key;
+  card = data.card; cur = same ? Math.min(cur, card.rows.length - 1) : 0;
   render();
 }
 
@@ -151,35 +166,61 @@ function render() {
   if (!card) { $("main").innerHTML = `<h1>Nothing left to label here.</h1>`; return; }
   const row = card.rows[cur], s = card.summary, n = card.rows.length + card.more;
   const title = card.merchant || row.notes || `(no description) ${row.type.toLowerCase()}`;
+  const labeled = card.labeled.reduce((sum, [, c]) => sum + c, 0);
+  const m = card.missing, complete = !m.spender && !m.category;
+  const chip = (name, missing) => `<span class="pill ${missing ? "bad" : "ok"}">${name} ${missing ? `✗ ${missing} missing` : "✓"}</span>`;
+  const status = `<p>${chip("Spender", m.spender)} ${card.blind ? "" : chip("Need/Want", m.category)}
+    ${complete ? `<b>Complete.</b>` : `<span class="muted">Rows marked ✗ still need it: ${card.blind ? "a spender key" : "spender keys, then <kbd>N</kbd>/<kbd>W</kbd> or <kbd>C</kbd> (<kbd>Shift</kbd> for the whole merchant)"}.</span>`}</p>`;
+  const done = labeled && `<p><span class="guess labeled">Labeled ${card.labeled.length === 1 ? `${labeled} row${labeled === 1 ? "" : "s"} ${esc(card.labeled[0][0])}`
+      : card.labeled.map(([v, c]) => `${c} ${esc(v)}`).join(" / ")}</span>
+    <span class="muted"><kbd>→</kbd> or <kbd>Space</kbd> for next · <kbd>←</kbd> previous · <kbd>U</kbd> to undo</span></p>`;
   $("main").innerHTML = `
     <h1>${esc(title)}</h1>
-    <div class="muted">${n} unlabeled row(s), ${money(card.total)}${card.labeledElsewhere ? `, ${card.labeledElsewhere} more from this merchant already labeled` : ""}</div>
-    <p>${card.blind ? `<span class="pill">blind check: no guess shown</span>`
+    <div class="muted">${n} row(s), ${money(card.total)}${card.labeledElsewhere ? `, ${card.labeledElsewhere} more from this merchant already labeled` : ""}</div>
+    ${status}${done || ""}
+    <p>${card.blind ? `<span class="pill">blind check: no guess shown</span>` : labeled >= n ? ""
       : `<span class="guess">Predicted <b>${esc(s.predicted[0][0])}</b> ${confCell(s.confidence)}</span>
          <span class="muted">${n} rows: ${s.predicted.map(([v, c]) => `${c} ${esc(v)}`).join(" / ")} predicted · merchant confidence is the amount-weighted mean</span>
          <div class="muted">Why the highlighted row looks like ${esc(row.guess.value)}:</div>
          <ul class="reasons muted">${row.guess.reasons.map((r) => `<li>${esc(r)}</li>`).join("") || "<li>no informative features yet</li>"}</ul>`}</p>
     ${note ? `<p>Note: <i>${esc(note)}</i></p>` : ""}
     <table><tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Category</th><th>Need/Want</th>
-      ${card.blind ? "" : "<th>Prediction</th><th class=\"num\">Confidence</th><th>Top reason</th>"}</tr>
+      ${card.blind ? "" : "<th>Spender / prediction</th><th class=\"num\">Confidence</th><th>Top reason</th>"}</tr>
     ${card.rows.map((r, i) => `<tr class="${i === cur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td>
-      <td class="desc">${esc(r.notes)}</td><td>${esc(r.category) || '<span class="muted">none</span>'}</td><td>${esc(r.needWant) || ""}</td>
+      <td class="desc">${esc(r.notes)}</td><td>${r.category ? esc(r.category) : '<span class="miss">✗ none</span>'}</td><td>${r.category ? esc(r.needWant || "—") : ""}</td>
       ${card.blind ? "" : spenderCells(r)}</tr>`).join("")}
     </table>${card.more ? `<p class="muted">and ${card.more} more</p>` : ""}`;
 }
 
+// One write at a time: keys and clicks are dropped until it lands, so a double press cannot
+// label twice or label the next card. After writing, the queue stays on the same card.
 async function act(path, body) {
-  try { await api(path, body); flash(""); } catch (e) { flash(e.message); return false; }
-  note = "";
-  await load();
-  return true;
+  if (busy) return false;
+  if (card && (mode === "queue" || mode === "check")) pinned = card.key;
+  busy = true; document.body.classList.add("saving"); flash("Saving…");
+  try { await api(path, body); note = ""; await load(); if ($("notice").textContent === "Saving…") flash(""); return true; }
+  catch (e) { flash(e.message); return false; }
+  finally { busy = false; document.body.classList.remove("saving"); }
 }
 
-function label(value, whole) {
-  const row = card.rows[cur];
-  if (whole && card.merchant && !card.blind) return act("/api/label", { value, merchant: card.merchant, note });
-  return act("/api/label", { value, ids: [row.id], note, check: card.blind });
+async function label(value, whole) {
+  const at = cur;
+  const ok = whole && card.merchant && !card.blind ? await act("/api/label", { value, merchant: card.merchant, note })
+    : await act("/api/label", { value, ids: [card.rows[cur].id], note, check: card.blind });
+  const next = ok && !whole && card ? card.rows.findIndex((r, i) => i > at && !r.spender) : -1;
+  if (next >= 0) { cur = next; render(); }
 }
+// Moving on from an incomplete card asks once, so a half-labeled merchant is never left by accident.
+function nextCard() {
+  if (!card) return;
+  if (mode === "queue" && (card.missing.spender || card.missing.category) && confirmSkip !== card.key) {
+    confirmSkip = card.key;
+    return flash(`${missingText()}. Press → or Space again to skip anyway.`);
+  }
+  confirmSkip = null; flash("");
+  skip.push(card.key); pinned = null; load().catch((e) => flash(e.message));
+}
+function previousCard() { if (skip.length) { pinned = skip.pop(); load().catch((e) => flash(e.message)); } }
 
 // Which handler a key goes to: typing and open overlays swallow shortcuts; Esc always closes.
 function routeKey(key, { overlay, typing, modifier }) {
@@ -239,7 +280,7 @@ $("note").addEventListener("keydown", (e) => {
 
 ORDERS.forEach(([value, name]) => $("order").add(new Option(name, value)));
 $("order").value = ORDERS.some(([v]) => v === store.get("labeler.order")) ? store.get("labeler.order") : "impact";
-function setOrder(value) { $("order").value = value; store.set("labeler.order", value); skip = []; load().catch((e) => flash(e.message)); }
+function setOrder(value) { $("order").value = value; store.set("labeler.order", value); skip = []; pinned = null; load().catch((e) => flash(e.message)); }
 $("order").addEventListener("change", () => { setOrder($("order").value); $("order").blur(); });
 
 async function loadAudit() {
@@ -249,17 +290,17 @@ async function loadAudit() {
   $("counts").textContent = `${audit.length} row(s) shown, lowest confidence first (max 300)`;
 }
 function renderAudit() {
-  $("a-table").innerHTML = `<tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Spender</th><th>Source</th><th class="num">Conf.</th><th>Reasons</th></tr>` +
+  $("a-table").innerHTML = `<tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Need/Want</th><th>Spender</th><th>Source</th><th class="num">Conf.</th><th>Reasons</th></tr>` +
     audit.map((r, i) => {
       const value = r.spender ?? (r.guess ? `${r.guess.value}?` : ""), conf = r.confidence ?? r.guess?.confidence;
       const why = (r.reasons.length ? r.reasons : r.guess?.reasons || []).join("; ");
       return `<tr class="${i === auditCur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td><td class="desc">${esc(r.notes)}</td>
-        <td>${esc(value)}</td><td>${esc(r.source || "")}</td><td class="num">${conf == null ? "" : (conf * 100).toFixed(0) + "%"}</td><td class="desc muted">${esc(why)}${r.note ? ` · note: ${esc(r.note)}` : ""}</td></tr>`;
+        <td>${needWantCell(r)}</td><td>${esc(value)}</td><td>${esc(r.source || "")}</td><td class="num">${conf == null ? "" : (conf * 100).toFixed(0) + "%"}</td><td class="desc muted">${esc(why)}${r.note ? ` · note: ${esc(r.note)}` : ""}</td></tr>`;
     }).join("");
 }
 const pct = (x) => (x && x.n ? `${Math.round(x.accuracy * 100)}% (n=${x.n})` : "n/a");
 const COLUMNS = [["date", "Date"], ["description", "Description"], ["account", "Account"], ["amount", "Amount", "num"],
-  ["category", "Category"], ["value", "Prediction"], ["confidence", "Confidence", "num"]];
+  ["category", "Category"], ["needWant", "Need/Want"], ["value", "Prediction"], ["confidence", "Confidence", "num"]];
 
 async function loadPredictions() {
   const q = new URLSearchParams({ q: $("pr-q").value, value: $("pr-value").value, min: $("pr-min").value, max: $("pr-max").value,
@@ -283,7 +324,7 @@ function renderPredictions() {
   $("pr-table").innerHTML = `<tr><th><input type="checkbox" id="pr-all" title="Select this page"></th>${head}<th>Top reason</th></tr>` +
     pred.rows.map((r, i) => `<tr class="${i === pred.cur ? "cur" : ""}" data-i="${i}">
       <td><input type="checkbox" data-i="${i}" ${pred.selected.has(r.id) ? "checked" : ""}></td><td>${r.date}</td>
-      <td class="desc">${esc(r.notes)}</td><td>${esc(r.account)}</td><td class="num">${money(r.amount)}</td><td>${esc(r.category)}</td>
+      <td class="desc">${esc(r.notes)}</td><td>${esc(r.account)}</td><td class="num">${money(r.amount)}</td><td>${esc(r.category)}</td><td>${needWantCell(r)}</td>
       <td>${esc(r.guess.value)}</td><td class="num">${confCell(r.guess.confidence)}</td>
       <td class="desc muted" title="${esc(r.guess.reasons.join("\n"))}">${esc(r.guess.reasons[0] || "")}</td></tr>`).join("");
   $("pr-accept").textContent = `Accept selected (${pred.selected.size})`;
@@ -320,10 +361,11 @@ $("pr-next").addEventListener("click", () => page(1));
 ["a-source", "a-min", "a-max", "a-q"].forEach((id) => $(id).addEventListener("change", loadAudit));
 
 const MODES = [...document.querySelectorAll("nav button")].map((b) => b.dataset.mode);
-function show(next) { mode = next; skip = []; load().catch((e) => flash(e.message)); }
+function show(next) { mode = next; skip = []; pinned = null; load().catch((e) => flash(e.message)); }
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => { show(b.dataset.mode); b.blur(); }));
 
 document.addEventListener("keydown", async (e) => {
+  if (busy) { e.preventDefault(); return; }
   const modifier = e.ctrlKey || e.metaKey || e.altKey;
   const route = routeKey(e.key, { overlay: overlay(), typing: ["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName), modifier });
   if (route === "close") return closeOverlays();
@@ -363,7 +405,7 @@ document.addEventListener("keydown", async (e) => {
     const row = audit[auditCur];
     if (e.key === "ArrowDown") auditCur = Math.min(auditCur + 1, audit.length - 1);
     else if (e.key === "ArrowUp") auditCur = Math.max(auditCur - 1, 0);
-    else if (spender && row) { try { await api("/api/label", { value: spender, ids: [row.id] }); } catch (err) { return flash(err.message); } return loadAudit(); }
+    else if (spender && row) return act("/api/label", { value: spender, ids: [row.id] });
     else if (key === "h" && row) { $("a-history").textContent = JSON.stringify(await api(`/api/history?id=${row.id}`), null, 1); return; }
     else return;
     e.preventDefault(); return renderAudit();
@@ -374,7 +416,8 @@ document.addEventListener("keydown", async (e) => {
   else if (key === "c") openPicker(null, e.shiftKey);
   else if (key === "n") openPicker("Need", e.shiftKey);
   else if (key === "w") openPicker("Want", e.shiftKey);
-  else if (key === "s") { skip.push(card.key); load(); }
+  else if (key === "s" || e.key === " " || e.key === "ArrowRight") nextCard();
+  else if (e.key === "ArrowLeft") previousCard();
   else if (key === "u") act("/api/undo", {});
   else if (key === "o" && mode === "queue") {
     const i = ORDERS.findIndex(([v]) => v === $("order").value);
@@ -390,7 +433,7 @@ document.addEventListener("keydown", async (e) => {
 // Labels and rows also change outside this page. The cheap version poll catches labeler writes;
 // a re-read from Wealthfolio (on focus, every minute, or R) catches everything else.
 async function refresh(force, reread) {
-  if (document.hidden || overlay() || ["INPUT", "SELECT"].includes(document.activeElement?.tagName)) return;
+  if (busy || document.hidden || overlay() || ["INPUT", "SELECT"].includes(document.activeElement?.tagName)) return;
   const { version } = await api(reread ? "/api/refresh" : "/api/version");
   if (force || version !== seen) await load();
 }
