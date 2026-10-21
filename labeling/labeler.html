@@ -15,8 +15,17 @@
   .notice { padding: 6px 10px; border-radius: 6px; background: var(--true-color-yellow-muted, #fff8c5); margin-bottom: 8px; }
   .notice:empty { display: none; }
   h1 { font-size: var(--text-title-large, 24px); line-height: 1.2; margin: 0; }
-  .guess { display: inline-flex; gap: 8px; align-items: center; padding: 4px 10px; border-radius: 999px; background: var(--true-color-blue-muted, #ddf4ff); }
-  .reasons { margin: 4px 0 0; padding-left: 18px; }
+  .meta { margin: 2px 0 14px; }
+  /* The card's one job: who spent it, and need or want. Two slots, side by side. */
+  .decide { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin-bottom: 6px; }
+  .slot { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border-color-default, #d0d7de); }
+  .slot.todo { border-color: var(--true-color-blue, #0969da); }
+  .slot.ok { background: var(--true-color-green-muted, #dafbe1); border-color: transparent; }
+  .slot-name { font-size: 12px; color: var(--text-color-muted, #656d76); }
+  .slot-body { font-size: 16px; margin: 2px 0; }
+  .slot-keys { font-size: 12px; color: var(--text-color-muted, #656d76); }
+  .next { margin: 4px 0 0; }
+  .sub { font-size: 12px; color: var(--text-color-muted, #656d76); }
   table { border-collapse: collapse; width: 100%; margin-top: 12px; }
   td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-color-default, #d0d7de); white-space: nowrap; }
   td.desc { white-space: normal; overflow-wrap: anywhere; }
@@ -24,7 +33,6 @@
   th[data-sort] { cursor: pointer; user-select: none; }
   .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
   tr.cur { outline: 2px solid var(--color-focus-outline, #0969da); outline-offset: -2px; }
-  .pill { padding: 1px 6px; border-radius: 4px; background: var(--border-color-default, #eaeef2); font-size: 12px; }
   kbd { font-family: var(--font-mono, monospace); border: 1px solid var(--border-color-default, #d0d7de); border-radius: 4px; padding: 0 4px; }
   footer { position: sticky; bottom: 0; margin-top: 16px; padding: 8px 0; display: flex; gap: 14px; flex-wrap: wrap;
            background: var(--background-color-default, #fff); border-top: 1px solid var(--border-color-default, #d0d7de); z-index: 1; }
@@ -45,12 +53,8 @@
   .conf.mid i { background: var(--true-color-yellow, #bf8700); }
   .conf.high i { background: var(--true-color-green, #1a7f37); }
   .labeled { font-weight: var(--font-weight-semibold, 600); }
-  .rules { margin: 4px 0 8px; padding: 6px 10px; border-left: 3px solid var(--border-color-default, #d0d7de); }
-  .rules div { margin: 2px 0; }
-  .where { font-size: 12px; padding: 0 5px; border-radius: 4px; background: var(--true-color-blue-muted, #ddf4ff); }
+  .rules { margin: 8px 0 0; font-size: 12px; }
   button.link { background: none; border: 0; padding: 0 4px; color: var(--true-color-blue, #0969da); cursor: pointer; font: inherit; }
-  .pill.ok { background: var(--true-color-green-muted, #dafbe1); }
-  .pill.bad { background: var(--true-color-red-muted, #ffebe9); }
   .miss { color: var(--true-color-red, #cf222e); }
   body.saving main, body.saving #pred, body.saving #audit { opacity: .45; pointer-events: none; }
 </style>
@@ -65,14 +69,11 @@
 <div id="notice" class="notice"></div>
 <main id="main"></main>
 <div id="audit" class="hidden">
-  <select id="a-source">
-    <option value="model">model</option><option value="">any source</option>
-    <option value="user">user</option><option value="merchant">merchant</option><option value="wealthfolio-ui">wealthfolio-ui</option>
-    <option value="account">account</option><option value="cardmember">cardmember</option>
-  </select>
-  confidence <input id="a-min" size="4" value="0"> to <input id="a-max" size="4" value="0.95">
-  <input id="a-q" placeholder="search description or account">
-  <span class="muted">Up and Down select a row, spender keys relabel it, H shows its history.</span>
+  <div class="controls">
+    <select id="a-origin"><option value="">anyone</option></select>
+    <input id="a-q" placeholder="search merchant, description or account">
+    confidence <input id="a-min" size="4" value="0"> to <input id="a-max" size="4" value="1">
+  </div>
   <table id="a-table"></table>
   <pre id="a-history" class="muted"></pre>
 </div>
@@ -107,7 +108,6 @@ const ORDERS = [["impact", "Biggest impact"], ["low-confidence", "Lowest confide
 const store = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
 const pred = { rows: [], total: 0, sort: "confidence", dir: "asc", offset: 0, cur: 0, selected: new Map() };
 let busy = false, pinned = null;  // a write in flight; the card to keep showing after labeling it
-let labeledHere = null;  // the card the user just labeled, the only one that gets the "Labeled" banner
 let confirmSkip = null;  // the incomplete card whose skip was asked about once
 const needWantCell = (r) => (r.category ? esc(r.needWant || "—") : '<span class="miss" title="No category, so no need/want">✗ none</span>');
 function missingText() {
@@ -128,11 +128,17 @@ function flash(text) { $("notice").textContent = text; }
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
 function spenderKeys() { return Object.entries(config.spenders).map(([k, v]) => `<kbd>${k.toUpperCase()}</kbd> ${esc(v)}`).join(" "); }
 
+let allKeys = store.get("labeler.keys") === "all";  // the full legend, toggled with ?
 function legend() {
-  const views = `<span><kbd>Tab</kbd>/<kbd>Shift+Tab</kbd> next/previous view</span> <span><kbd>R</kbd> refresh</span>`;
+  if (!allKeys && (mode === "queue" || mode === "check")) {
+    $("keys").innerHTML = `${spenderKeys()} <span><kbd>Shift</kbd> = whole merchant</span>
+      ${mode === "check" ? "" : "<span><kbd>N</kbd>/<kbd>W</kbd> need/want</span>"} <span><kbd>→</kbd> next</span> <span><kbd>U</kbd> undo</span> <span><kbd>?</kbd> all keys</span>`;
+    return;
+  }
+  const views = `<span><kbd>Tab</kbd>/<kbd>Shift+Tab</kbd> next/previous view</span> <span><kbd>R</kbd> refresh</span>${mode === "queue" || mode === "check" ? " <span><kbd>?</kbd> fewer keys</span>" : ""}`;
   const common = `${spenderKeys()} <span><kbd>Shift</kbd>+key labels the whole merchant, past and future</span>`;
   $("keys").innerHTML = mode === "rules" ? `<span><kbd>↑</kbd><kbd>↓</kbd> rule</span> <span><kbd>X</kbd> twice: remove</span> <span><kbd>U</kbd> undo</span>`
-    : mode === "audit" ? `${spenderKeys()} <span><kbd>H</kbd> history</span>`
+    : mode === "audit" ? `${common} <span><kbd>C</kbd>/<kbd>N</kbd>/<kbd>W</kbd> fix category</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span> <span><kbd>H</kbd> history</span>`
     : mode === "predictions" ? `${common} <span><kbd>Enter</kbd> accept prediction</span> <span><kbd>Space</kbd> select</span>
        <span><kbd>A</kbd> accept selected</span> <span><kbd>U</kbd> undo</span> <span><kbd>↑</kbd><kbd>↓</kbd> row</span> <span><kbd>PgUp</kbd><kbd>PgDn</kbd> page</span>`
     : `${common} <span><kbd>Enter</kbd> accept guess</span> <span><kbd>C</kbd> category</span> <span><kbd>N</kbd>/<kbd>W</kbd> pick a Need/Want category (<kbd>Enter</kbd> accepts the highlighted one)</span>
@@ -160,9 +166,10 @@ async function load() {
   if (pinned && !data.card) { pinned = null; return load(); }
   const c = data.counts;
   seen = c.version;
-  $("counts").textContent = `${c.rows.toLocaleString()} rows (${money(c.amount)}) left in ${c.groups.toLocaleString()} ${mode === "check" ? "check rows" : "merchants"} · ${c.session} labeled this session · model ${config.model}`;
+  $("counts").textContent = mode === "check" ? `${c.rows.toLocaleString()} check rows left`
+    : `${c.groups.toLocaleString()} merchants · ${c.rows.toLocaleString()} rows · ${money(c.amount)} left`;
   $("progress").style.width = `${Math.round(100 * (1 - c.rows / Math.max(c.total, 1)))}%`;
-  if (c.notice && !$("notice").textContent) flash(c.notice);
+  if (c.notice && !/^Synced: 0 set, 0 cleared, 0 edits/.test(c.notice) && !$("notice").textContent) flash(c.notice);
   const same = card && data.card && card.key === data.card.key;
   card = data.card; cur = same ? Math.min(cur, card.rows.length - 1) : 0;
   render();
@@ -174,44 +181,49 @@ function confCell(c) {
   const band = c < 0.65 ? "low" : c < 0.85 ? "mid" : "high";
   return `<span class="conf ${band}" title="${band} confidence"><i style="width:${Math.round(c * 100)}%"></i></span>${Math.round(c * 100)}%`;
 }
-// A row's spender: its label (with source) when it has one, otherwise the model's prediction.
-function spenderCells(r) {
-  if (r.spender) return `<td class="labeled" title="${esc(r.spenderWhy)}">${esc(r.spender)} <span class="muted">· ${esc(r.spenderBy)}</span></td><td class="num">${confCell(r.confidence)}</td><td></td>`;
+// A row's spender: its label (with where it came from), otherwise the model's prediction; reasons on hover.
+function spenderCell(r) {
+  if (r.spender) return `<td class="labeled" title="${esc(r.spenderWhy)}">${esc(r.spender)} <span class="muted">· ${esc(r.spenderBy)}</span></td>`;
   const g = r.guess;
-  return `<td>${esc(g.value)}</td><td class="num">${confCell(g.confidence)}</td><td class="desc muted" title="${esc(g.reasons.join("\n"))}">${esc(g.reasons[0] || "")}</td>`;
+  return `<td title="${esc(g.reasons.join("\n") || "no informative features yet")}">${esc(g.value)}? ${confCell(g.confidence)}</td>`;
+}
+const tally = (values) => [...values.reduce((m, v) => m.set(v, (m.get(v) || 0) + 1), new Map())];
+const listed = (pairs) => (pairs.length === 1 ? esc(pairs[0][0]) : pairs.map(([v, c]) => `${c} ${esc(v)}`).join(" / "));
+const plain = (html) => html.replace(/<[^>]+>/g, "");
+function slot(name, done, body, keys) {
+  return `<div class="slot ${done ? "ok" : "todo"}"><div class="slot-name">${name}${done ? " ✓" : ""}</div>
+    <div class="slot-body">${body}</div>${done ? "" : `<div class="slot-keys">${keys}</div>`}</div>`;
 }
 
 function render() {
   if (!card) { $("main").innerHTML = `<h1>Nothing left to label here.</h1>`; return; }
-  const row = card.rows[cur], s = card.summary, n = card.rows.length + card.more;
+  const rows = card.rows, row = rows[cur], s = card.summary, n = rows.length + card.more, m = card.missing;
   const title = card.merchant || row.notes || `(no description) ${row.type.toLowerCase()}`;
-  const labeled = card.labeled.reduce((sum, [, c]) => sum + c, 0);
-  const m = card.missing, complete = !m.spender && !m.category;
-  const chip = (name, missing) => `<span class="pill ${missing ? "bad" : "ok"}">${name} ${missing ? `✗ ${missing} missing` : "✓"}</span>`;
-  const status = `<p>${chip("Spender", m.spender)} ${card.blind ? "" : chip("Need/Want", m.category)}
-    ${complete ? `<b>Complete.</b>` : `<span class="muted">Rows marked ✗ still need it: ${card.blind ? "a spender key" : "spender keys, then <kbd>N</kbd>/<kbd>W</kbd> or <kbd>C</kbd> (<kbd>Shift</kbd> for the whole merchant)"}.</span>`}</p>`;
-  const done = labeled && labeledHere === card.key && `<p><span class="guess labeled">Labeled ${card.labeled.length === 1 ? `${labeled} row${labeled === 1 ? "" : "s"} ${esc(card.labeled[0][0])}`
-      : card.labeled.map(([v, c]) => `${c} ${esc(v)}`).join(" / ")}</span>
-    <span class="muted"><kbd>→</kbd> or <kbd>Space</kbd> for next · <kbd>←</kbd> previous · <kbd>U</kbd> to undo</span></p>`;
+  const all = card.blind ? "" : ` · <kbd>Shift</kbd> = all ${n}`;
+  const set = rows.filter((r) => r.spender);
+  const spender = slot("Spender", !m.spender,
+    !m.spender ? `<b>${listed(tally(set.map((r) => r.spender)))}</b> <span class="muted">${listed(tally(set.map((r) => r.spenderBy)))}</span>`
+      : card.blind ? "Who spent this?"
+      : `${esc(s.predicted[0][0])}? ${confCell(s.confidence)}${set.length ? ` <span class="muted">· ${m.spender} of ${n} unset</span>` : ""}`,
+    `${spenderKeys()}${all}${card.blind ? "" : " · <kbd>Enter</kbd> accept"}`);
+  const sorted = rows.filter((r) => r.category);
+  const needWant = card.blind ? "" : slot("Need / Want", !m.category,
+    !m.category ? `<b>${listed(tally(sorted.map((r) => r.needWant || "—")))}</b> <span class="muted">${listed(tally(sorted.map((r) => r.category)))}</span>`
+      : `<span class="miss">✗</span> ${m.category} of ${n} without a category`,
+    `<kbd>N</kbd> Need · <kbd>W</kbd> Want${all}`);
+  const rules = card.rules.length ? `<div class="rules muted">Rules: ${card.rules.map((r, i) =>
+    `<span title="${esc(plain(ruleText(r)))}">${esc(r.kind)} → ${esc(r.sets)} (${r.kind === "Category" ? "Wealthfolio" : "labeler"})
+      <button class="link" data-rule="${i}">remove</button></span>`).join(" · ")}</div>` : "";
   $("main").innerHTML = `
     <h1>${esc(title)}</h1>
-    <div class="muted">${n} row(s), ${money(card.total)}${card.labeledElsewhere ? `, ${card.labeledElsewhere} more from this merchant already labeled` : ""}</div>
-    ${card.keys.length > 1 || (card.keys[0] && card.keys[0] !== card.merchant) ? `<div class="muted">includes: ${card.keys.map(esc).join(", ")}
-      · <kbd>Shift</kbd>+<kbd>M</kbd> on a row renames just its raw name, to split it out</div>` : ""}
-    ${status}${card.rules.length ? `<div class="rules"><b>Rules for this merchant</b>
-      ${card.rules.map((r, i) => `<div><kbd>${i + 1}</kbd> ${ruleText(r)} <button class="link" data-rule="${i}">remove</button></div>`).join("")}
-      <div class="muted"><kbd>X</kbd> then a number removes a rule (press the number twice to confirm).</div></div>` : ""}${done || ""}
-    <p>${card.blind ? `<span class="pill">blind check: no guess shown</span>` : labeled >= n ? ""
-      : `<span class="guess">Predicted <b>${esc(s.predicted[0][0])}</b> ${confCell(s.confidence)}</span>
-         <span class="muted">${n} rows: ${s.predicted.map(([v, c]) => `${c} ${esc(v)}`).join(" / ")} predicted · merchant confidence is the amount-weighted mean</span>
-         <div class="muted">Why the highlighted row looks like ${esc(row.guess.value)}:</div>
-         <ul class="reasons muted">${row.guess.reasons.map((r) => `<li>${esc(r)}</li>`).join("") || "<li>no informative features yet</li>"}</ul>`}</p>
+    <div class="meta muted">${n} row${n === 1 ? "" : "s"} · ${money(card.total)}${card.keys.length > 1 ? ` · includes ${card.keys.map(esc).join(", ")}` : ""}${card.labeledElsewhere ? ` · ${card.labeledElsewhere} more already labeled` : ""}</div>
+    <div class="decide">${spender}${needWant}</div>
+    ${!m.spender && !m.category ? `<p class="next"><kbd>→</kbd> next merchant</p>` : ""}${rules}
     ${note ? `<p>Note: <i>${esc(note)}</i></p>` : ""}
-    <table><tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Category</th><th>Need/Want</th>
-      ${card.blind ? "" : "<th>Spender / prediction</th><th class=\"num\">Confidence</th><th>Top reason</th>"}</tr>
-    ${card.rows.map((r, i) => `<tr class="${i === cur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td>
-      <td class="desc">${esc(r.notes)}</td><td title="${esc(r.categoryWhy || "")}">${r.category ? `${esc(r.category)} <span class="muted">· ${esc(r.categoryBy || "")}</span>` : '<span class="miss">✗ none</span>'}</td><td>${r.category ? esc(r.needWant || "—") : ""}</td>
-      ${card.blind ? "" : spenderCells(r)}</tr>`).join("")}
+    <table><tr><th>Date</th><th class="num">Amount</th><th>Description</th>${card.blind ? "" : "<th>Category</th><th>Spender</th>"}</tr>
+    ${rows.map((r, i) => `<tr class="${i === cur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td>
+      <td class="desc">${esc(r.notes)}<div class="sub">${esc(r.account)}</div></td>
+      ${card.blind ? "" : `<td title="${esc(r.categoryWhy || "")}">${r.category ? `${esc(r.category)} <span class="muted">· ${esc(r.needWant || "—")}${r.categoryOrigin && r.categoryOrigin !== "You" ? ` · ${esc(r.categoryOrigin)}` : ""}</span>` : '<span class="miss">✗</span>'}</td>${spenderCell(r)}`}</tr>`).join("")}
     </table>${card.more ? `<p class="muted">and ${card.more} more</p>` : ""}`;
 }
 
@@ -230,7 +242,6 @@ async function act(path, body) {
 }
 
 async function label(value, whole) {
-  labeledHere = card.key;
   const at = cur;
   const ok = whole && card.merchant && !card.blind ? await act("/api/label", { value, merchant: card.merchant, note })
     : await act("/api/label", { value, ids: [card.rows[cur].id], note, check: card.blind });
@@ -287,12 +298,19 @@ $("rn-q").addEventListener("keydown", (e) => {
 });
 
 const categoryName = (c) => `${c.parent ? c.parent + " › " : ""}${c.name}`;
+// What a category or need/want key acts on: the highlighted row, or with Shift its whole merchant.
+function pickTarget(whole) {
+  const row = mode === "audit" ? audit[auditCur] : card?.rows[cur], name = mode === "audit" ? row?.name : card?.merchant;
+  if (!row) return null;
+  return whole && name ? { merchant: name, label: `all ${mode === "audit" ? "" : `${card.rows.length + card.more} `}rows of ${name}` }
+    : { ids: [row.id], label: "this row" };
+}
 // The picker says exactly what Enter will do; N/W pre-select a suggested built-in category.
 async function openPicker(filter, whole) {
-  whole = whole && !!card.merchant;
-  picker = { filter, whole, cur: 0, suggested: null };
-  const n = whole ? card.rows.length + card.more : 1;
-  const action = `Set ${filter || "the category"} for ${whole ? `all ${n} rows of ${card.merchant}` : "this row"}`;
+  const target = pickTarget(whole);
+  if (!target) return;
+  picker = { filter, target, cur: 0, suggested: null };
+  const action = `Set ${filter || "the category"} for ${target.label}`;
   $("p-hint").textContent = `${action} · type to choose · Esc cancel`;
   $("p-q").value = ""; $("p-list").innerHTML = "";
   openOverlay("picker"); $("p-q").focus();
@@ -300,8 +318,8 @@ async function openPicker(filter, whole) {
   const path = (c) => `${c.parent || c.name} › ${c.parent ? c.name : ""}`;
   categories = (await api("/api/categories")).sort((a, b) => path(a).localeCompare(path(b)));
   if (filter) {
-    const target = whole ? `merchant=${encodeURIComponent(card.merchant)}` : `id=${card.rows[cur].id}`;
-    const s = await api(`/api/category-suggest?${target}&needWant=${filter}`);
+    const where = target.merchant ? `merchant=${encodeURIComponent(target.merchant)}` : `id=${target.ids[0]}`;
+    const s = await api(`/api/category-suggest?${where}&needWant=${filter}`);
     const suggested = categories.find((c) => c.id === s.categoryId);
     if (!picker || !suggested) return picker && listPicker();
     picker.suggested = suggested.id;
@@ -322,7 +340,7 @@ function listPicker() {
   $("p-list").querySelector(".cur")?.scrollIntoView({ block: "nearest" });
 }
 async function choose(category) {
-  const body = picker.whole && card.merchant ? { categoryId: category.id, merchant: card.merchant } : { categoryId: category.id, ids: [card.rows[cur].id] };
+  const { merchant, ids } = picker.target, body = merchant ? { categoryId: category.id, merchant } : { categoryId: category.id, ids };
   closeOverlays();
   const result = await act("/api/category", body);
   // Merchant rules only fill empty categories; rows that already had another one are left alone.
@@ -350,18 +368,19 @@ $("order").addEventListener("change", () => { setOrder($("order").value); $("ord
 
 async function loadAudit() {
   seen = (await api("/api/version")).version;
-  const q = new URLSearchParams({ source: $("a-source").value, min: $("a-min").value, max: $("a-max").value, q: $("a-q").value });
-  audit = await api(`/api/audit?${q}`); auditCur = 0; renderAudit();
-  $("counts").textContent = `${audit.length} row(s) shown, lowest confidence first (max 300)`;
+  if ($("a-origin").options.length === 1) (await api("/api/origins")).forEach((o) => $("a-origin").add(new Option(o, o)));
+  const q = new URLSearchParams({ origin: $("a-origin").value, min: $("a-min").value, max: $("a-max").value, q: $("a-q").value });
+  audit = await api(`/api/audit?${q}`); auditCur = Math.min(auditCur, Math.max(audit.length - 1, 0)); renderAudit();
+  $("counts").textContent = `${audit.length}${audit.length === 1000 ? "+" : ""} labeled row(s)${$("a-origin").value ? ` by ${$("a-origin").value}` : ""}`;
 }
 function renderAudit() {
-  $("a-table").innerHTML = `<tr><th>Date</th><th class="num">Amount</th><th>Account</th><th>Description</th><th>Need/Want</th><th>Spender</th><th>Source</th><th class="num">Conf.</th><th>Reasons</th></tr>` +
-    audit.map((r, i) => {
-      const value = r.spender ?? (r.guess ? `${r.guess.value}?` : ""), conf = r.confidence ?? r.guess?.confidence;
-      const why = (r.reasons.length ? r.reasons : r.guess?.reasons || []).join("; ");
-      return `<tr class="${i === auditCur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td><td>${esc(r.account)}</td><td class="desc">${described(r)}</td>
-        <td>${needWantCell(r)}</td><td>${esc(value)}</td><td>${esc(r.source || "")}</td><td class="num">${conf == null ? "" : (conf * 100).toFixed(0) + "%"}</td><td class="desc muted">${esc(why)}${r.note ? ` · note: ${esc(r.note)}` : ""}</td></tr>`;
-    }).join("");
+  const by = (value, origin) => (value ? `${esc(value)} <span class="muted">· ${esc(origin || "")}</span>` : '<span class="miss">✗</span>');
+  $("a-table").innerHTML = `<tr><th>Date</th><th class="num">Amount</th><th>Description</th><th>Category · by</th><th>Spender · by</th><th class="num">Conf.</th></tr>` +
+    audit.map((r, i) => `<tr class="${i === auditCur ? "cur" : ""}"><td>${r.date}</td><td class="num">${money(r.amount)}</td>
+      <td class="desc">${described(r)}<div class="sub">${esc(r.account)}</div></td>
+      <td title="${esc(r.categoryWhy || "")}">${r.category ? `${esc(r.category)} <span class="muted">· ${esc(r.needWant || "—")} · ${esc(r.categoryOrigin || "")}</span>` : '<span class="miss">✗</span>'}</td>
+      <td title="${esc(r.spenderWhy || "")}">${by(r.spender, r.spenderOrigin)}</td>
+      <td class="num">${r.confidence == null ? "" : Math.round(r.confidence * 100) + "%"}</td></tr>`).join("");
 }
 const pct = (x) => (x && x.n ? `${Math.round(x.accuracy * 100)}% (n=${x.n})` : "n/a");
 const COLUMNS = [["date", "Date"], ["description", "Description"], ["account", "Account"], ["amount", "Amount", "num"],
@@ -471,7 +490,7 @@ $("ru-table").addEventListener("click", (e) => {
 });
 $("ru-q").addEventListener("change", () => loadRules().catch((e) => flash(e.message)));
 
-["a-source", "a-min", "a-max", "a-q"].forEach((id) => $(id).addEventListener("change", loadAudit));
+["a-origin", "a-min", "a-max", "a-q"].forEach((id) => $(id).addEventListener("change", () => { auditCur = 0; loadAudit().catch((e) => flash(e.message)); }));
 
 const MODES = [...document.querySelectorAll("nav button")].map((b) => b.dataset.mode);
 function show(next) { mode = next; skip = []; pinned = null; load().catch((e) => flash(e.message)); }
@@ -499,6 +518,7 @@ document.addEventListener("keydown", async (e) => {
     document.activeElement?.blur();
     return show(MODES[(MODES.indexOf(mode) + (e.shiftKey ? MODES.length - 1 : 1)) % MODES.length]);
   }
+  if (e.key === "?") { e.preventDefault(); allKeys = !allKeys; store.set("labeler.keys", allKeys ? "all" : ""); return legend(); }
   const key = e.key.toLowerCase(), spender = config.spenders[key];
   if (key === "r" && !spender) { e.preventDefault(); return refresh(true, true).catch((err) => flash(err.message)); }
   if (mode === "predictions") {
@@ -526,7 +546,9 @@ document.addEventListener("keydown", async (e) => {
     const row = audit[auditCur];
     if (e.key === "ArrowDown") auditCur = Math.min(auditCur + 1, audit.length - 1);
     else if (e.key === "ArrowUp") auditCur = Math.max(auditCur - 1, 0);
-    else if (spender && row) return act("/api/label", { value: spender, ids: [row.id] });
+    else if (spender && row) return act("/api/label", e.shiftKey && row.name ? { value: spender, merchant: row.name } : { value: spender, ids: [row.id] });
+    else if (["c", "n", "w"].includes(key) && row) { e.preventDefault(); return openPicker({ c: null, n: "Need", w: "Want" }[key], e.shiftKey); }
+    else if (key === "u") return act("/api/undo", {});
     else if (key === "h" && row) { $("a-history").textContent = JSON.stringify(await api(`/api/history?id=${row.id}`), null, 1); return; }
     else return;
     e.preventDefault(); return renderAudit();
