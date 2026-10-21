@@ -292,12 +292,29 @@ def test_categories_use_native_rules_and_budget_groups(world):
     assert ws.need_want(ws.rows["shared-hardware-1"]) == "Need"
     ws.undo()
     assert fake.rows["shared-hardware-1"]["assignments"] == []
-    ws.categorize("cat_groceries", merchant="BLUE KETTLE")
+    ws.categorize("cat_groceries", merchant="BLUE KETTLE", note="MCC 5411; name")
     assert [r["categoryId"] for r in fake.rules] == ["cat_groceries"]
+    assert ws.ledger.entries[-1]["note"] == "MCC 5411; name"
     ws.undo()
     assert [r["categoryId"] for r in fake.rules] == ["cat_food_coffee"]
     ws.undo()
     assert fake.rules == [] and fake.rows["ann-0"]["assignments"] == []
+
+
+def test_batched_merchant_categories_share_one_rerun_and_one_undo(world):
+    fake, ws = world
+    calls, post = [], fake.post
+    def counting(path, body):
+        calls.append(path)
+        return post(path, body)
+    fake.post = counting
+    result = ws.categorize_keys([("BLUE KETTLE", "cat_food_coffee", "name; high"), ("HARDWARE STORE", "cat_groceries", "")])
+    assert calls.count("/spending/rules/rerun") == 1 and result["categorized"] == 6
+    assert {r["categoryId"] for r in fake.rules} == {"cat_food_coffee", "cat_groceries"}
+    assert [e.get("note") for e in ws.ledger.entries[-2:]] == ["name; high", None]
+    assert len({e["action"] for e in ws.ledger.entries[-2:]}) == 1
+    ws.undo()
+    assert fake.rules == [] and fake.rows["shared-hardware-1"]["assignments"] == [] and fake.rows["ann-0"]["assignments"] == []
 
 
 def test_issuer_file_cardmembers_label_shared_card_rows(tmp_path, world):

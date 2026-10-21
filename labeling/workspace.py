@@ -486,35 +486,46 @@ class Workspace:
         top = sorted((c for c in self.categories.values() if not c.get("parentId") and fits(c["id"])), key=lambda c: c.get("sortOrder", 0))
         return (top[0]["id"], f"first {need_want} category" if need_want else "first category") if top else (None, "")
 
-    def categorize(self, category_id: str, *, ids=(), merchant: str = "") -> dict:
+    def categorize_keys(self, choices: list[tuple[str, str, str]]) -> dict:
+        """One native rule per raw merchant key, from (key, category, note) choices, then one rerun.
+
+        A key, not a display name, so renaming or merging never changes what a rule matches. `note`
+        records why, for decisions not made by hand (say an agent's evidence and confidence).
+        """
         action = uuid.uuid4().hex[:12]
-        base = {"field": "category", "value": category_id, "by": self.by, "action": action}
+        existing = {r["id"]: r for r in self.client.get("/spending/rules")}
+        patterns = {key: re.compile(merchant_pattern(key)) for key, _, _ in choices}
+        matches = {key: [i for i, r in self.rows.items() if self.merchant[i] == key or pattern.search(r.get("notes") or "")]
+                   for key, pattern in patterns.items()}
+        self.refetch({i for ids in matches.values() for i in ids})
+        entries, touched, kept = [], {}, 0
+        for key, category_id, note in choices:
+            ids = matches[key]
+            previous = {i: None for i in ids if not self.rows[i]["categoryIds"]}
+            # Rules only fill empty categories; say how many of this merchant's rows keep another one.
+            kept += sum(1 for i in ids if self.merchant[i] == key and self.rows[i]["categoryIds"]
+                        and category_id not in self.rows[i]["categoryIds"])
+            rule_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"spending-labeler/{key}"))
+            rule = self.client.post("/spending/rules/upsert", {
+                "id": rule_id, "name": f"Merchant {key}", "pattern": patterns[key].pattern, "matchType": "regex",
+                "taxonomyId": SPENDING, "categoryId": category_id, "priority": 100, "isGlobal": True,
+            })
+            entries.append({"field": "category", "value": category_id, "by": self.by, "action": action,
+                            **({"note": note} if note else {}), "merchant": key, "source": "merchant",
+                            "ruleId": rule["id"], "previousRule": existing.get(rule_id), "previous": previous})
+            touched.update(previous)
+        self.client.post("/spending/rules/rerun", {"onlyUncategorized": True})
+        self.ledger.append(entries)
+        self.refetch(touched)
+        self.match_rules()
+        return {"rules": [e["ruleId"] for e in entries], "kept": kept,
+                "categorized": sum(1 for i in touched if self.rows[i]["categoryIds"])}
+
+    def categorize(self, category_id: str, *, ids=(), merchant: str = "", note: str = "") -> dict:
         if merchant:
-            # One native rule per raw key, so renaming or merging never changes what a rule matches.
-            existing = {r["id"]: r for r in self.client.get("/spending/rules")}
-            entries, touched, kept = [], {}, 0
-            for key in self.keys_of(merchant):
-                pattern = merchant_pattern(key)
-                ids = [i for i, r in self.rows.items() if self.merchant[i] == key or re.search(pattern, r.get("notes") or "")]
-                self.refetch(ids)
-                previous = {i: None for i in ids if not self.rows[i]["categoryIds"]}
-                # Rules only fill empty categories; say how many of this merchant's rows keep another one.
-                kept += sum(1 for i in ids if self.merchant[i] == key and self.rows[i]["categoryIds"]
-                            and category_id not in self.rows[i]["categoryIds"])
-                rule_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"spending-labeler/{key}"))
-                rule = self.client.post("/spending/rules/upsert", {
-                    "id": rule_id, "name": f"Merchant {key}", "pattern": pattern, "matchType": "regex",
-                    "taxonomyId": SPENDING, "categoryId": category_id, "priority": 100, "isGlobal": True,
-                })
-                entries.append({**base, "merchant": key, "source": "merchant", "ruleId": rule["id"],
-                                "previousRule": existing.get(rule_id), "previous": previous})
-                touched.update(previous)
-            self.client.post("/spending/rules/rerun", {"onlyUncategorized": True})
-            self.ledger.append(entries)
-            self.refetch(touched)
-            self.match_rules()
-            return {"rules": [e["ruleId"] for e in entries], "kept": kept,
-                    "categorized": sum(1 for i in touched if self.rows[i]["categoryIds"])}
+            return self.categorize_keys([(key, category_id, note) for key in self.keys_of(merchant)])
+        action = uuid.uuid4().hex[:12]
+        base = {"field": "category", "value": category_id, "by": self.by, "action": action, **({"note": note} if note else {})}
         entries = []
         for row_id in ids:
             previous = (self.rows[row_id]["categoryIds"] or [None])[0]
