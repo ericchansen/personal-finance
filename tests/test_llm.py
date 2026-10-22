@@ -144,3 +144,5 @@ def test_threshold_needs_held_out_precision_on_hand_set_categories():
     assert llm.evaluate(wrong + unsure, truth)["threshold"] is None
     by_rule = {key: (category, "rule") for key, (category, _) in truth.items()}
     assert llm.evaluate(right + unsure, by_rule)["threshold"] is None  # agreement with rules certifies nothing
+    same = [{**a, "p": 1.0} for a in right + unsure]  # a runner whose scores carry no information
+    assert llm.evaluate(same, truth)["all"]["n"] == 200

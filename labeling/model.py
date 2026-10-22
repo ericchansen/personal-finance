@@ -104,6 +104,8 @@ class NaiveBayes:
             if abs(ga) + abs(gb) < 1e-6:
                 break
             det = haa * hbb - hab * hab
+            if det <= 1e-12:  # every score is the same, so there is no slope to fit
+                break
             da, db = (hbb * ga - hab * gb) / det, (haa * gb - hab * ga) / det
             step, slope = 1.0, ga * da + gb * db
             while step > 1e-10 and loss(a - step * da, b - step * db) > current - 1e-4 * step * slope:
