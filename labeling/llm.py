@@ -225,6 +225,21 @@ def proposals(ws) -> dict[str, dict]:
     return found
 
 
+def chosen(ws) -> list[tuple[str, str, str]]:
+    """(key, category, note) for confident proposals whose merchant still has no category on any row.
+
+    Confident means at or above the threshold from the latest evaluation of the same model and prompt.
+    """
+    categorized = {ws.merchant[i] for i, r in ws.rows.items() if r["categoryIds"]} | transfers(ws)
+    found = []
+    for key, p in proposals(ws).items():
+        threshold = (latest_eval(ws, p["model"]) or {}).get("threshold")
+        if p["categoryId"] and threshold and p["confidence"] is not None and p["confidence"] >= threshold \
+                and key not in categorized and any(k == key for k in ws.merchant.values()):
+            found.append((key, p["categoryId"], f"llm {p['model']}@{p['digest']} p={p['confidence']:.2f}: {p['rationale']}"))
+    return sorted(found)
+
+
 def coverage(pairs: list[tuple[str | None, float, str | None]], threshold: float) -> dict:
     """Of category answers (never "none") at or above the threshold: how many, and how many were right."""
     sure = [(p, t) for p, c, t in pairs if p and c >= threshold]
