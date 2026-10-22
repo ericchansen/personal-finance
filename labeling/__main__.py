@@ -15,11 +15,13 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, time
 from pathlib import Path
 
 from labeling.workspace import Locked, Workspace, connect, write_lock
 
 FAR_FUTURE = "2099-12-31"
+SYNC_WINDOW = (time(5, 45), time(6, 30))  # the daily sync's local time, when writes would collide
 
 
 def setup(ws: Workspace) -> dict:
@@ -57,6 +59,32 @@ def latest_eval(ws: Workspace) -> dict | None:
     return json.loads(reports[-1].read_text(encoding="utf-8")) if reports else None
 
 
+def llm_write(ws: Workspace, data_dir: Path, *, undo: bool, dry_run: bool, batch: int = 50) -> dict:
+    """Write confident local-model categories as native rules: one native backup, then a batch per lock."""
+    from labeling import llm
+    if SYNC_WINDOW[0] <= datetime.now(ws.zone).time() <= SYNC_WINDOW[1]:
+        return {"skipped": "the daily sync runs now"}
+    if undo:
+        with write_lock(data_dir, "labeling llm"):
+            ws.ensure_fresh()
+            return ws.undo()
+    todo = llm.chosen(ws)
+    if dry_run:
+        return {"wouldCategorize": len(todo), "choices": todo}
+    results = []
+    for start in range(0, len(todo), batch):
+        with write_lock(data_dir, "labeling llm"):
+            ws.ensure_fresh()
+            if not results:
+                ws.client.post("/utilities/database/backup", {})
+            still = {key for key, _, _ in llm.chosen(ws)}  # someone may have categorized one meanwhile
+            part = [choice for choice in todo[start:start + batch] if choice[0] in still]
+            results.append(ws.categorize_keys(part, prefix="LLM: ") if part else {"rules": [], "categorized": 0})
+            ws.mark_fresh()
+    return {"batches": len(results), "rules": sum(len(r["rules"]) for r in results),
+            "categorized": sum(r["categorized"] for r in results)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m labeling", description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("setup", "apply", "status", "serve", "llm"))
@@ -68,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=os.environ.get("LABELING_MODEL", "qwen3.8:27b"), help="llm: a local Ollama model")
     parser.add_argument("--eval", action="store_true", help="llm: score merchants whose category is known")
     parser.add_argument("--limit", type=int, help="llm: ask about at most this many merchants")
+    parser.add_argument("--apply", action="store_true", help="llm: write confident proposals as native rules")
+    parser.add_argument("--undo", action="store_true", help="llm: undo the last batch written by --apply")
     args = parser.parse_args(argv)
     data_dir = Path(args.data_dir)
     if not (data_dir / "labels" / "config.json").exists():
@@ -83,6 +113,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "status":
         print(json.dumps({**ws.status(), "eval": latest_eval(ws)}, indent=2))
+        return 0
+    if args.command == "llm" and (args.apply or args.undo):
+        try:
+            print(json.dumps(llm_write(ws, data_dir, undo=args.undo, dry_run=args.dry_run), indent=2))
+        except Locked as exc:
+            print(f"skipped: Wealthfolio write lock is held: {exc}", file=sys.stderr)
+            return 3
         return 0
     if args.command == "llm":
         from labeling import llm

@@ -66,6 +66,12 @@ merchant, model, or prompt changes.
    applied automatically.
 2. Run `python -m labeling llm` to propose categories for uncategorized merchants, largest dollars first
    (`--limit` caps a run).
+3. Run `python -m labeling llm --apply --dry-run` to list what would be written, then `--apply`. Only
+   proposals at or above the evaluated threshold are written, and only for merchants with no category
+   on any row. Each becomes a native rule named `LLM: <key>`, recorded in the ledger as **Local LLM**
+   with the model, confidence, and rationale. It takes a native backup first, then holds the write lock
+   for one batch of 50 at a time. It refuses to run during the daily sync (05:45–06:30). `--undo`
+   reverts the last batch.
 
 With **N** or **W**, the labeler pre-selects the local model's category when the merchant has no category
 yet. The hint shows the model, its calibrated confidence, and its rationale.

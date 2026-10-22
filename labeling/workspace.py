@@ -501,11 +501,12 @@ class Workspace:
         top = sorted((c for c in self.categories.values() if not c.get("parentId") and fits(c["id"])), key=lambda c: c.get("sortOrder", 0))
         return (top[0]["id"], f"first {need_want} category" if need_want else "first category") if top else (None, "")
 
-    def categorize_keys(self, choices: list[tuple[str, str, str]]) -> dict:
+    def categorize_keys(self, choices: list[tuple[str, str, str]], prefix: str = "Merchant ") -> dict:
         """One native rule per raw merchant key, from (key, category, note) choices, then one rerun.
 
         A key, not a display name, so renaming or merging never changes what a rule matches. `note`
-        records why, for decisions not made by hand (say an agent's evidence and confidence).
+        records why, for decisions not made by hand (say an agent's evidence and confidence). The rule is
+        named `prefix` plus the key.
         """
         action = uuid.uuid4().hex[:12]
         existing = {r["id"]: r for r in self.client.get("/spending/rules")}
@@ -522,7 +523,7 @@ class Workspace:
                         and category_id not in self.rows[i]["categoryIds"])
             rule_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"spending-labeler/{key}"))
             rule = self.client.post("/spending/rules/upsert", {
-                "id": rule_id, "name": f"Merchant {key}", "pattern": patterns[key].pattern, "matchType": "regex",
+                "id": rule_id, "name": f"{prefix}{key}", "pattern": patterns[key].pattern, "matchType": "regex",
                 "taxonomyId": SPENDING, "categoryId": category_id, "priority": 100, "isGlobal": True,
             })
             entries.append({"field": "category", "value": category_id, "by": self.by, "action": action,

@@ -106,6 +106,33 @@ def test_evaluation_scores_known_merchants_and_calibrates(world):  # noqa: F811
     assert llm.proposals(ws)["HARDWARE STORE"]["confidence"] is not None
 
 
+def test_apply_writes_confident_uncategorized_merchants_in_batches(world, tmp_path, monkeypatch):  # noqa: F811
+    from datetime import time
+    import labeling.__main__ as cli
+    monkeypatch.setattr(cli, "SYNC_WINDOW", (time(23, 59, 59), time(0)))  # never inside the window
+    fake, ws = world
+    ws.by = "labeling llm"
+    ws.categorize("cat_food_coffee", ids=[i for i, key in ws.merchant.items() if key == "BLUE KETTLE"])
+    client = FakeOllama(decide)
+    llm.run(ws, client, evaluate_only=False, limit=None, log=lambda _: None)
+    assert llm.chosen(ws) == []  # nothing is confident before an evaluation
+    (ws.dir / "llm-eval-tiny_1b.json").write_text(json.dumps(
+        {"digest": client.digest, "prompt": llm.PROMPT_VERSION, "calibration": [1.0, 0.0], "threshold": 0.6}))
+
+    keys = [key for key, _, _ in llm.chosen(ws)]
+    assert keys == ["CORNER SHOP", "HARDWARE STORE", "NORTH COFFEE", "SOUTH COFFEE", "WEST COFFEE"]  # not BLUE KETTLE, gyms, or p=0.5
+    assert cli.llm_write(ws, tmp_path, undo=False, dry_run=True)["wouldCategorize"] == 5 and fake.backups == 0
+    result = cli.llm_write(ws, tmp_path, undo=False, dry_run=False, batch=3)
+    assert (result["batches"], result["rules"], fake.backups) == (2, 5, 1)
+    assert sorted(r["name"] for r in fake.rules) == [f"LLM: {k}" for k in keys]
+    entry = ws.ledger.entries[-1]
+    assert entry["by"] == "labeling llm" and entry["note"].startswith(f"llm tiny:1b@{client.digest} p=0.90: ")
+    assert llm.chosen(ws) == []
+
+    cli.llm_write(ws, tmp_path, undo=True, dry_run=False)
+    assert len(fake.rules) == 3  # one batch at a time
+
+
 def test_threshold_needs_held_out_precision_on_hand_set_categories():
     truth = {f"M{i}": (f"cat_{i % 3}", "manual") for i in range(200)}
     right = [{"merchant": f"M{i}", "p": 0.99, "categoryId": f"cat_{i % 3}", "seconds": 1} for i in range(120)]
